@@ -40,6 +40,7 @@ extern int BSIM4v5convTestAvx(GENmodel*, CKTcircuit*);
 extern int BSIM4v5truncAvx(GENmodel*, CKTcircuit*, double*);
 extern int BSIM4v5AvxNeedAosSync;
 #if NGSPICE_OPT_APPLE
-extern void BSIM4v5freeApplePack(BSIM4v5model*);
+struct sBSIM4v5model;
+extern void BSIM4v5freeApplePack(struct sBSIM4v5model*);
 #endif
 #endif

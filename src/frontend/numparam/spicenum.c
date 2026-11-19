@@ -574,9 +574,69 @@ nupa_copy_inst_dico(void)
     NGHASHITER iter;            /* hash iterator - thread safe */
 
     if (dico->inst_symbols) {
-        /* We we perform this operation we should be in global scope */
+        /* We perform this operation we should be in global scope */
         if (dico->stack_depth > 0)
             fprintf(stderr, "stack depth should be zero.\n");
+
+#if NGSPICE_OPT_APPLE
+        if (dico->stack_depth == 0) {
+            NGHASHPTR dst = dico->symbols[0];
+            NGHASHPTR src = dico->inst_symbols;
+            if (!dst) {
+                dico->symbols[0] = src;
+                dico->inst_symbols = NULL;
+                NGHASH_FIRST(&iter);
+                for (entry = (entry_t *) nghash_enumerateRE(src, &iter);
+                     entry;
+                     entry = (entry_t *) nghash_enumerateRE(src, &iter))
+                    entry->level = 0;
+                return;
+            }
+            if (nghash_get_size(dst) < nghash_get_size(src)) {
+                /* Swap-merge: move the smaller global table into the larger inst_symbols
+                 * table (inst_symbols entries take precedence over existing global entries). */
+                nghash_reserve(src, nghash_get_size(src) + nghash_get_size(dst));
+                NGHASH_FIRST(&iter);
+                for (entry = (entry_t *) nghash_enumerateRE(dst, &iter);
+                     entry;
+                     entry = (entry_t *) nghash_enumerateRE(dst, &iter)) {
+                    entry_t *existing = (entry_t *) nghash_insert(src, entry->symbol, entry);
+                    if (existing) {
+                        /* inst_symbols entry overrides global entry */
+                        dico_free_entry(entry);
+                    }
+                }
+                nghash_free(dst, NULL, NULL);
+                dico->symbols[0] = src;
+                dico->inst_symbols = NULL;
+                NGHASH_FIRST(&iter);
+                for (entry = (entry_t *) nghash_enumerateRE(src, &iter);
+                     entry;
+                     entry = (entry_t *) nghash_enumerateRE(src, &iter))
+                    entry->level = 0;
+                return;
+            }
+            nghash_reserve(dst, nghash_get_size(dst) + nghash_get_size(src));
+            NGHASH_FIRST(&iter);
+            for (entry = (entry_t *) nghash_enumerateRE(src, &iter);
+                 entry;
+                 entry = (entry_t *) nghash_enumerateRE(src, &iter)) {
+                entry_t *existing = (entry_t *) nghash_insert(dst, entry->symbol, entry);
+                if (!existing) {
+                    entry->level = 0;
+                } else {
+                    existing->vl = entry->vl;
+                    existing->tp = entry->tp;
+                    existing->ivl = entry->ivl;
+                    existing->sbbase = entry->sbbase;
+                    dico_free_entry(entry);
+                }
+            }
+            nghash_free(src, NULL, NULL);
+            dico->inst_symbols = NULL;
+            return;
+        }
+#endif
 
         NGHASH_FIRST(&iter);
         for (entry = (entry_t *) nghash_enumerateRE(dico->inst_symbols, &iter);

@@ -34,7 +34,62 @@ REVISIONS:
 #define  MINPRIMESIZE 7
 
 /* ********************** STATIC DEFINITIONS ************************* */
+#if !NGSPICE_OPT_APPLE
 static NGTABLEPTR _nghash_find_item(NGHASHPTR hhtable,void *user_key,void *data) ;
+#endif
+
+#if NGSPICE_OPT_APPLE
+static inline unsigned int
+nghash_raw_str(const char *s, size_t *out_len)
+{
+    const unsigned char *p = (const unsigned char *)s;
+    unsigned int h = 2166136261u;
+    while (*p) {
+        h ^= (unsigned int)(*p++);
+        h *= 16777619u;
+    }
+    if (out_len)
+        *out_len = (size_t)(p - (const unsigned char *)s);
+    h ^= h >> 16;
+    return h;
+}
+
+static inline unsigned int
+nghash_raw_key(NGHASHPTR hashtable, void *user_key, size_t *out_len)
+{
+    switch ((intptr_t)hashtable->hash_func) {
+    case NGHASH_FUNC_STR:
+        return nghash_raw_str((const char *)user_key, out_len);
+    case NGHASH_FUNC_PTR: {
+        uintptr_t v = (uintptr_t)user_key >> 4;
+        return (unsigned int)(v ^ (v >> 16));
+    }
+    case NGHASH_FUNC_NUM:
+        return (unsigned int)(intptr_t)user_key;
+    default:
+        return hashtable->hash_func(hashtable, user_key);
+    }
+}
+
+static inline unsigned int
+nghash_bucket_idx(NGHASHPTR hashtable, unsigned int raw_hash)
+{
+    if (hashtable->power_of_two)
+        return raw_hash & (unsigned int)(hashtable->size - 1);
+    return raw_hash % (unsigned int)hashtable->size;
+}
+
+static inline void *
+nghash_alloc_uninit(size_t sz)
+{
+#if !defined(HAVE_LIBGC) && !defined(TCL_MODULE) && !defined(SHARED_MODULE)
+    void *p = malloc(sz);
+    if (p)
+        return p;
+#endif
+    return tmalloc(sz);
+}
+#endif
 
 
 NGHASHPTR nghash_init_with_parms(nghash_compare_func_t *comp_func, nghash_func_t *hash_func, int num,
@@ -76,6 +131,53 @@ NGHASHPTR nghash_init_with_parms(nghash_compare_func_t *comp_func, nghash_func_t
 
 void nghash_resize(NGHASHPTR hashtable, int num)
 {
+#if NGSPICE_OPT_APPLE
+    NGTABLEPTR *oldtable, *newtable, hptr;
+    int newsize;
+
+    oldtable = hashtable->hash_table;
+    if (hashtable->power_of_two) {
+        newsize = nghash_table_size2(num - 1);
+    } else {
+        newsize = nghash_table_size(num);
+    }
+    hashtable->size = newsize;
+    hashtable->need_resize = newsize * hashtable->max_density;
+
+    newtable = NGMALLOC(newsize, NGTABLEPTR);
+    hashtable->hash_table = newtable;
+
+    /* Re-link existing nodes in-place: zero malloc/strdup/free/strcmp,
+     * preserves thread list, num_entries, searchPtr, and enumeratePtr. */
+    if ((intptr_t)hashtable->hash_func == NGHASH_FUNC_STR ||
+        (intptr_t)hashtable->hash_func == NGHASH_FUNC_PTR ||
+        (intptr_t)hashtable->hash_func == NGHASH_FUNC_NUM) {
+        if (hashtable->power_of_two) {
+            unsigned int mask = (unsigned int)(newsize - 1);
+            for (hptr = hashtable->thread; hptr; hptr = hptr->thread_next) {
+                unsigned int hsum = hptr->hash & mask;
+                hptr->next = newtable[hsum];
+                newtable[hsum] = hptr;
+            }
+        } else {
+            unsigned int usize = (unsigned int)newsize;
+            for (hptr = hashtable->thread; hptr; hptr = hptr->thread_next) {
+                unsigned int hsum = hptr->hash % usize;
+                hptr->next = newtable[hsum];
+                newtable[hsum] = hptr;
+            }
+        }
+    } else {
+        for (hptr = hashtable->thread; hptr; hptr = hptr->thread_next) {
+            unsigned int hsum = hashtable->hash_func(hashtable, hptr->key);
+            hptr->hash = hsum;
+            hptr->next = newtable[hsum];
+            newtable[hsum] = hptr;
+        }
+    }
+
+    NGFREE(oldtable);
+#else
     NGTABLEPTR *oldtable, hptr, zapptr ;
     NGTABLEPTR new_hptr ;				/* new hash table entry */
     int i, oldsize ;
@@ -116,7 +218,19 @@ void nghash_resize(NGHASHPTR hashtable, int num)
     }
 
     NGFREE( oldtable );
+#endif
 } /* end nghash_resize() */
+
+#if NGSPICE_OPT_APPLE
+void nghash_reserve(NGHASHPTR hashtable, int min_entries)
+{
+    if (!hashtable || min_entries < hashtable->need_resize)
+        return;
+    int req_buckets = (min_entries / hashtable->max_density) + 1;
+    if (req_buckets > hashtable->size)
+        nghash_resize(hashtable, req_buckets);
+}
+#endif
 
 
 void nghash_reset_stat(NGHASHPTR hashtable)
@@ -127,9 +241,15 @@ void nghash_reset_stat(NGHASHPTR hashtable)
 
 NGHASHPTR nghash_init(int num_entries)
 {
+#if NGSPICE_OPT_APPLE
+    return( nghash_init_with_parms( NGHASH_DEF_CMP(NGHASH_FUNC_STR), NGHASH_DEF_HASH(NGHASH_FUNC_STR),
+                                    num_entries, 2,
+                                    NGHASH_DEF_GROW_FACTOR, NGHASH_UNIQUE_TWO) ) ;
+#else
     return( nghash_init_with_parms( NGHASH_DEF_CMP(NGHASH_FUNC_STR), NGHASH_DEF_HASH(NGHASH_FUNC_STR),
                                     num_entries, NGHASH_DEF_MAX_DENSITY,
                                     NGHASH_DEF_GROW_FACTOR, NGHASH_UNIQUE) ) ;
+#endif
 } /* end nghash_init() */
 
 NGHASHPTR nghash_init_pointer(int num_entries)
@@ -226,6 +346,59 @@ void nghash_free_string_hashtable(NGHASHPTR hashtable)
 ----------------------------------------------------------------- */
 void * _nghash_find(NGHASHPTR hashtable, void * user_key,bool *status)
 {
+#if NGSPICE_OPT_APPLE
+    NGTABLEPTR curPtr;
+    NGTABLEPTR *table = hashtable->hash_table;
+    DS(hashtable->access++;) ;
+
+    if (hashtable->hash_func == NGHASH_DEF_HASH(NGHASH_FUNC_STR) &&
+        hashtable->compare_func == NGHASH_DEF_CMP(NGHASH_FUNC_STR) &&
+        hashtable->power_of_two) {
+        unsigned int raw_h = nghash_raw_str((const char *)user_key, NULL);
+        unsigned int hsum = raw_h & (unsigned int)(hashtable->size - 1);
+        for (curPtr = table[hsum]; curPtr; curPtr = curPtr->next) {
+            if (curPtr->hash == raw_h &&
+                strcmp((char *)curPtr->key, (char *)user_key) == STRINGEQ) {
+                hashtable->searchPtr = curPtr;
+                if (status)
+                    *status = TRUE;
+                return curPtr->data;
+            }
+        }
+        hashtable->searchPtr = NULL;
+        if (status)
+            *status = FALSE;
+        return NULL;
+    }
+
+    {
+        unsigned int raw_h = nghash_raw_key(hashtable, user_key, NULL);
+        unsigned int hsum = nghash_bucket_idx(hashtable, raw_h);
+        for (curPtr = table[hsum]; curPtr; curPtr = curPtr->next) {
+            int ret_code;
+            if (curPtr->hash != raw_h)
+                continue;
+            if (hashtable->compare_func == NGHASH_DEF_CMP(NGHASH_FUNC_STR)) {
+                ret_code = strcmp((char *)curPtr->key, (char *)user_key);
+            } else if (hashtable->compare_func == NGHASH_DEF_CMP(NGHASH_FUNC_PTR) ||
+                       hashtable->compare_func == NGHASH_DEF_CMP(NGHASH_FUNC_NUM)) {
+                ret_code = NGHASH_PTR_COMPARE_FUNC(curPtr->key, user_key);
+            } else {
+                ret_code = hashtable->compare_func(curPtr->key, user_key);
+            }
+            if (ret_code == STRINGEQ) {
+                hashtable->searchPtr = curPtr;
+                if (status)
+                    *status = TRUE;
+                return curPtr->data;
+            }
+        }
+        hashtable->searchPtr = NULL;
+        if (status)
+            *status = FALSE;
+        return NULL;
+    }
+#else
     int  ret_code ;
     unsigned int hsum ;
     NGTABLEPTR curPtr ;
@@ -283,6 +456,7 @@ void * _nghash_find(NGHASHPTR hashtable, void * user_key,bool *status)
         *status = FALSE ;
     }
     return( NULL ) ;
+#endif
 
 } /* end nghash_find() */
 
@@ -350,6 +524,9 @@ void * nghash_delete(NGHASHPTR hashtable, void * user_key)
     /* -----------------------------------------------------------------
      * Process the hash function.
     ----------------------------------------------------------------- */
+#if NGSPICE_OPT_APPLE
+    hsum = nghash_bucket_idx(hashtable, nghash_raw_key(hashtable, user_key, NULL));
+#else
     switch( (intptr_t) hashtable->hash_func ) {
     case NGHASH_FUNC_STR:
         NGHASH_STR_TO_HASH( user_key, hsum, hashtable->size);
@@ -363,6 +540,7 @@ void * nghash_delete(NGHASHPTR hashtable, void * user_key)
     default:
         hsum = hashtable->hash_func (hashtable, user_key);
     }
+#endif
 
     /* insert into table only if distinct number */
     curPtr = table[hsum] ;
@@ -424,6 +602,9 @@ void * nghash_delete_special(NGHASHPTR hashtable, void* user_key)
     /* -----------------------------------------------------------------
      * Process the hash function.
       ----------------------------------------------------------------- */
+#if NGSPICE_OPT_APPLE
+    hsum = nghash_bucket_idx(hashtable, nghash_raw_key(hashtable, user_key, NULL));
+#else
     switch ((intptr_t)hashtable->hash_func) {
     case NGHASH_FUNC_STR:
         NGHASH_STR_TO_HASH(user_key, hsum, hashtable->size);
@@ -437,6 +618,7 @@ void * nghash_delete_special(NGHASHPTR hashtable, void* user_key)
     default:
         hsum = hashtable->hash_func(hashtable, user_key);
     }
+#endif
 
     /* insert into table only if distinct number */
     curPtr = table[hsum];
@@ -486,6 +668,119 @@ void * nghash_delete_special(NGHASHPTR hashtable, void* user_key)
 
 void * nghash_insert(NGHASHPTR hashtable, void * user_key, void * data)
 {
+#if NGSPICE_OPT_APPLE
+    NGTABLEPTR curPtr, temptr, curTable;
+    NGTABLEPTR *table = hashtable->hash_table;
+    DS(hashtable->access++;)
+
+    if (hashtable->hash_func == NGHASH_DEF_HASH(NGHASH_FUNC_STR) &&
+        hashtable->compare_func == NGHASH_DEF_CMP(NGHASH_FUNC_STR) &&
+        hashtable->power_of_two) {
+        size_t key_len = 0;
+        unsigned int raw_h = nghash_raw_str((const char *)user_key, &key_len);
+        unsigned int hsum = raw_h & (unsigned int)(hashtable->size - 1);
+        temptr = table[hsum];
+        if (temptr) {
+            for (curPtr = temptr; curPtr; curPtr = curPtr->next) {
+                DS(hashtable->collision++;) ;
+                if (curPtr->hash == raw_h &&
+                    strcmp((char *)curPtr->key, (char *)user_key) == STRINGEQ) {
+                    if (hashtable->unique) {
+                        hashtable->searchPtr = curPtr;
+                        return curPtr->data;
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+        hashtable->num_entries++;
+        curTable = (NGTABLEPTR)nghash_alloc_uninit(sizeof(NGTABLEBOX));
+        {
+            char *kdup = (char *)nghash_alloc_uninit(key_len + 1);
+            memcpy(kdup, user_key, key_len + 1);
+            curTable->key = kdup;
+        }
+        curTable->data = data;
+        curTable->hash = raw_h;
+        curTable->next = temptr;
+        table[hsum] = curTable;
+        if (hashtable->last_entry) {
+            hashtable->last_entry->thread_next = curTable;
+            curTable->thread_prev = hashtable->last_entry;
+            hashtable->last_entry = curTable;
+        } else {
+            hashtable->thread = hashtable->last_entry = curTable;
+            curTable->thread_prev = NULL;
+        }
+        curTable->thread_next = NULL;
+
+        if (hashtable->num_entries >= hashtable->need_resize) {
+            int newsize = (int)(hashtable->size * hashtable->growth_factor);
+            nghash_resize(hashtable, newsize);
+        }
+        return NULL;
+    }
+
+    {
+        size_t key_len = 0;
+        unsigned int raw_h = nghash_raw_key(hashtable, user_key, &key_len);
+        unsigned int hsum = nghash_bucket_idx(hashtable, raw_h);
+        temptr = table[hsum];
+        if (temptr) {
+            for (curPtr = temptr; curPtr; curPtr = curPtr->next) {
+                int ret_code;
+                DS(hashtable->collision++;) ;
+                if (curPtr->hash != raw_h)
+                    continue;
+                if (hashtable->compare_func == NGHASH_DEF_CMP(NGHASH_FUNC_STR)) {
+                    ret_code = strcmp((char *)curPtr->key, (char *)user_key);
+                } else if (hashtable->compare_func == NGHASH_DEF_CMP(NGHASH_FUNC_PTR) ||
+                           hashtable->compare_func == NGHASH_DEF_CMP(NGHASH_FUNC_NUM)) {
+                    ret_code = NGHASH_PTR_COMPARE_FUNC(curPtr->key, user_key);
+                } else {
+                    ret_code = hashtable->compare_func(curPtr->key, user_key);
+                }
+                if (ret_code == STRINGEQ) {
+                    if (hashtable->unique) {
+                        hashtable->searchPtr = curPtr;
+                        return curPtr->data;
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+        hashtable->num_entries++;
+        curTable = (NGTABLEPTR)nghash_alloc_uninit(sizeof(NGTABLEBOX));
+        curTable->data = data;
+        curTable->hash = raw_h;
+        if (hashtable->hash_func == NGHASH_DEF_HASH(NGHASH_FUNC_STR)) {
+            char *kdup = (char *)nghash_alloc_uninit(key_len + 1);
+            memcpy(kdup, user_key, key_len + 1);
+            curTable->key = kdup;
+        } else {
+            curTable->key = user_key;
+        }
+        curTable->next = temptr;
+        table[hsum] = curTable;
+        if (hashtable->last_entry) {
+            hashtable->last_entry->thread_next = curTable;
+            curTable->thread_prev = hashtable->last_entry;
+            hashtable->last_entry = curTable;
+        } else {
+            hashtable->thread = hashtable->last_entry = curTable;
+            curTable->thread_prev = NULL;
+        }
+        curTable->thread_next = NULL;
+
+        if (hashtable->num_entries >= hashtable->need_resize) {
+            int newsize = (int)(hashtable->size * hashtable->growth_factor);
+            nghash_resize(hashtable, newsize);
+        }
+        return NULL;
+    }
+#else
     int  ret_code ;
     unsigned int hsum ;
     NGTABLEPTR curPtr, temptr, curTable ;
@@ -569,9 +864,11 @@ void * nghash_insert(NGHASHPTR hashtable, void * user_key, void * data)
     }
 
     return( NULL ) ; /* no conflict on a enter */
+#endif
 
 } /* end nghash_insert() */
 
+#if !NGSPICE_OPT_APPLE
 /* returns the pointer with the item */
 static NGTABLEPTR _nghash_find_item(NGHASHPTR htable,void * user_key,void * data)
 {
@@ -626,6 +923,7 @@ static NGTABLEPTR _nghash_find_item(NGHASHPTR htable,void * user_key,void * data
     return( NULL ) ; /* no matching item */
 
 } /* end _nghash_find_item() */
+#endif
 
 
 
@@ -819,6 +1117,9 @@ bool nghash_deleteItem(NGHASHPTR hashtable, void * user_key, void * data)
     /* -----------------------------------------------------------------
      * Process the hash function.
     ----------------------------------------------------------------- */
+#if NGSPICE_OPT_APPLE
+    hsum = nghash_bucket_idx(hashtable, nghash_raw_key(hashtable, user_key, NULL));
+#else
     switch( (intptr_t) hashtable->hash_func ) {
     case NGHASH_FUNC_STR:
         NGHASH_STR_TO_HASH( user_key, hsum, hashtable->size);
@@ -832,6 +1133,7 @@ bool nghash_deleteItem(NGHASHPTR hashtable, void * user_key, void * data)
     default:
         hsum = hashtable->hash_func (hashtable, user_key);
     }
+#endif
 
     /* insert into table only if distinct number */
     temptr = table[hsum] ;
@@ -946,7 +1248,7 @@ int nghash_table_size2(int minEntries)
         minEntries = minEntries >> 1 ;
         power++ ;
     }
-    power = MIN( power, 32 ) ;
+    power = MIN( power, 30 ) ;
     table_size = 1 << power ;
     table_size = MAX( NGHASH_MIN_SIZE, table_size ) ;
     return( table_size ) ;
