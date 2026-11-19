@@ -83,6 +83,10 @@ double kvsat, wlod, sceff, Wdrn;
 int Size_Not_Found, i;
 
     /*  loop through all the BSIM4v5 device models */
+#if defined(__AVX512F__) && defined(__GNUC__)
+    if (model)
+        model->BSIM4v5AvxBuilt = 0;
+#endif
     for (; model != NULL; model = BSIM4v5nextModel(model))
     {    Temp = ckt->CKTtemp;
          if (model->BSIM4v5SbulkJctPotential < 0.1)

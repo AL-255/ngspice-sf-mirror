@@ -98,6 +98,14 @@ void BSIM4v5LoadRhsMat(GENmodel *inModel, CKTcircuit *ckt);
 
 static inline int BSIM4v5polyDepletion(double phi, double ngate,double coxe, double Vgs, double *Vgs_eff, double *dVgs_eff_dVg);
 
+#if defined(__AVX512F__) && defined(__GNUC__)
+#define B4P(x) BSIM4v5##x
+#define B4_IS_V6 0
+#include "ngspice/bsim4_avx512_glue.h"
+#undef B4P
+#undef B4_IS_V6
+#endif
+
 #if defined(KLU) && defined(USE_OMP)
 static inline int
 b4v5_ptr_to_klu_off(const double *ptr, uintptr_t ax_addr, size_t ax_bytes, int nz)
@@ -178,6 +186,10 @@ BSIM4v5kluPrep(GENmodel *inModel, CKTcircuit *ckt)
         head->BSIM4v5KluAxBase = ax;
         head->BSIM4v5KluNz = nz;
     }
+#if defined(__AVX512F__) && defined(__GNUC__)
+    if (head->BSIM4v5KluAll4Term && BSIM4v5isAvxEligibleTran(ckt))
+        BSIM4v5ensureAvxPack(head, ckt);
+#endif
     return head->BSIM4v5KluAll4Term ? 1 : 0;
 }
 
@@ -189,6 +201,41 @@ BSIM4v5loadKluPar(GENmodel *inModel, CKTcircuit *ckt, double *my_ax, double *my_
     const BSIM4v5KluOff *koffArr = head->BSIM4v5KluOffArr;
     int count = head->BSIM4v5InstCount;
     int error = 0;
+
+#if defined(__AVX512F__) && defined(__GNUC__)
+    if (head->BSIM4v5AvxBuilt && BSIM4v5isAvxEligibleTran(ckt)) {
+        const BSIM4Avx512Block *blocks = (const BSIM4Avx512Block *)head->BSIM4v5AvxBlocks;
+        int nBlocks = head->BSIM4v5AvxBlockCount;
+        const int *fbIdx = head->BSIM4v5AvxFallbackIdx;
+        int nFb = head->BSIM4v5AvxFallbackCount;
+        if (omp_in_parallel()) {
+            #pragma omp for schedule(static) nowait
+            for (int bi = 0; bi < nBlocks; bi++) {
+                BSIM4v5evalAvxBlock(&blocks[bi], InstArray, ckt, my_ax, my_rhs, 0);
+            }
+            if (nFb > 0) {
+                #pragma omp for schedule(static) nowait
+                for (int fi = 0; fi < nFb; fi++) {
+                    int idx = fbIdx[fi];
+                    int local_error = BSIM4v5LoadOMP_core(InstArray[idx], ckt, my_ax, my_rhs, &koffArr[idx]);
+                    if (local_error)
+                        error = local_error;
+                }
+            }
+            return error;
+        }
+        for (int bi = 0; bi < nBlocks; bi++) {
+            BSIM4v5evalAvxBlock(&blocks[bi], InstArray, ckt, my_ax, my_rhs, 0);
+        }
+        for (int fi = 0; fi < nFb; fi++) {
+            int idx = fbIdx[fi];
+            int local_error = BSIM4v5LoadOMP_core(InstArray[idx], ckt, my_ax, my_rhs, &koffArr[idx]);
+            if (local_error)
+                error = local_error;
+        }
+        return error;
+    }
+#endif
 
     if (omp_in_parallel()) {
         #pragma omp for schedule(static) nowait
@@ -220,6 +267,37 @@ CKTcircuit *ckt)
     BSIM4v5instance **InstArray;
     InstArray = model->BSIM4v5InstanceArray;
     int count = model->BSIM4v5InstCount;
+
+#if defined(__AVX512F__) && defined(__GNUC__)
+    if (BSIM4v5isAvxEligibleTran(ckt)) {
+        BSIM4v5ensureAvxPack(model, ckt);
+        const BSIM4Avx512Block *blocks = (const BSIM4Avx512Block *)model->BSIM4v5AvxBlocks;
+        int nBlocks = model->BSIM4v5AvxBlockCount;
+        const int *fbIdx = model->BSIM4v5AvxFallbackIdx;
+        int nFb = model->BSIM4v5AvxFallbackCount;
+        if (omp_get_max_threads() == 1 && nFb == 0) {
+            double *rhs = ckt->CKTrhs;
+            for (int bi = 0; bi < nBlocks; bi++) {
+                BSIM4v5evalAvxBlock(&blocks[bi], InstArray, ckt, NULL, rhs, 1);
+            }
+            return OK;
+        }
+        #pragma omp parallel for schedule(static)
+        for (int bi = 0; bi < nBlocks; bi++) {
+            BSIM4v5evalAvxBlock(&blocks[bi], InstArray, ckt, NULL, NULL, 2);
+        }
+        if (nFb > 0) {
+            #pragma omp parallel for schedule(static)
+            for (int fi = 0; fi < nFb; fi++) {
+                int local_error = BSIM4v5LoadOMP_core(InstArray[fbIdx[fi]], ckt, NULL, NULL, NULL);
+                if (local_error)
+                    error = local_error;
+            }
+        }
+        BSIM4v5LoadRhsMat(inModel, ckt);
+        return error;
+    }
+#endif
 
     if (omp_get_max_threads() == 1 && !ckt->CKTbypass) {
         if (!model->BSIM4v5All4TermChecked) {

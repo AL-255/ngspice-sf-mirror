@@ -90,6 +90,10 @@ double vtfbphi2eot, phieot, TempRatioeot, Vtm0eot, Vtmeot,vbieot;
 int Size_Not_Found, i;
 
     /*  loop through all the BSIM4v6 device models */
+#if defined(__AVX512F__) && defined(__GNUC__)
+    if (model)
+        model->BSIM4v6AvxBuilt = 0;
+#endif
     for (; model != NULL; model = BSIM4v6nextModel(model))
     {    Temp = ckt->CKTtemp;
          if (model->BSIM4v6SbulkJctPotential < 0.1)

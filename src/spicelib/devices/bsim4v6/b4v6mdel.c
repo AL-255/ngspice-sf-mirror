@@ -27,6 +27,12 @@ BSIM4v6mDelete(GENmodel *gen_model)
 #ifdef KLU
     FREE(model->BSIM4v6KluOffArr);
 #endif
+#if defined(__AVX512F__) && defined(__GNUC__)
+    free(model->BSIM4v6AvxBlocks);
+    model->BSIM4v6AvxBlocks = NULL;
+    FREE(model->BSIM4v6AvxFallbackIdx);
+    model->BSIM4v6AvxBuilt = 0;
+#endif
 
     struct bsim4v6SizeDependParam *p = model->pSizeDependParamKnot;
     while (p) {

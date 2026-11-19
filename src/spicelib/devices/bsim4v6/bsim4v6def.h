@@ -1824,6 +1824,16 @@ typedef struct sBSIM4v6model
     unsigned int BSIM4v6KluNz;
     int BSIM4v6KluAll4Term;
 #endif
+#if defined(__AVX512F__) && defined(__GNUC__)
+    void *BSIM4v6AvxBlocks;
+    int   BSIM4v6AvxBlockCount;
+    int  *BSIM4v6AvxFallbackIdx;
+    int   BSIM4v6AvxFallbackCount;
+    double BSIM4v6AvxBuiltTemp;
+    double *BSIM4v6AvxKluAxBase;
+    unsigned int BSIM4v6AvxKluNz;
+    int   BSIM4v6AvxBuilt;
+#endif
 
     /* Flags */
     unsigned  BSIM4v6mobModGiven :1;
