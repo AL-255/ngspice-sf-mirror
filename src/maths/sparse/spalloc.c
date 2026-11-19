@@ -317,11 +317,20 @@ spcGetElement(MatrixPtr Matrix)
 #if !COMBINE || STRIP || LINT
     /* Allocate block of MatrixElements if necessary. */
     if (Matrix->ElementsRemaining == 0) {
+        struct ElementListNodeStruct *pListNode;
         pElements = SP_MALLOC(struct MatrixElement, ELEMENTS_PER_ALLOCATION);
         RecordAllocation( Matrix, pElements );
         if (Matrix->Error == spNO_MEMORY) return NULL;
         Matrix->ElementsRemaining = ELEMENTS_PER_ALLOCATION;
         Matrix->NextAvailElement = pElements;
+        pListNode = SP_MALLOC(struct ElementListNodeStruct, 1);
+        RecordAllocation( Matrix, pListNode );
+        if (Matrix->Error == spNO_MEMORY) return NULL;
+        pListNode->pElementList = pElements;
+        pListNode->NumberOfElementsInList = ELEMENTS_PER_ALLOCATION;
+        pListNode->Next = NULL;
+        Matrix->LastElementListNode->Next = pListNode;
+        Matrix->LastElementListNode = pListNode;
     }
 #endif
 

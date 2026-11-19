@@ -259,6 +259,9 @@ typedef struct sBSIM4v5instance
     double BSIM4v5DswTempRevSatCur;
     double BSIM4v5SswgTempRevSatCur;
     double BSIM4v5DswgTempRevSatCur;
+    double BSIM4v5SourceSatCurrent;
+    double BSIM4v5DrainSatCurrent;
+    int    BSIM4v5hasTrapTunnel;
 
     struct bsim4v5SizeDependParam  *pParam;
 
@@ -822,7 +825,12 @@ struct bsim4v5SizeDependParam
     double BSIM4v5sqrtPhi;   
     double BSIM4v5phis3;   
     double BSIM4v5Xdep0;          
-    double BSIM4v5sqrtXdep0;          
+    double BSIM4v5sqrtXdep0;
+    double BSIM4v5xdep0OverSqrtPhi;
+    double BSIM4v5lpe0Factor;
+    double BSIM4v5lpebFactor;
+    double BSIM4v5vthNarrowW;
+    double BSIM4v5sqrtLeff;          
     double BSIM4v5theta0vb0;
     double BSIM4v5thetaRout; 
     double BSIM4v5mstar;

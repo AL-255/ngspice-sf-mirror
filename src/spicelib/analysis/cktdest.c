@@ -92,6 +92,7 @@ CKTdestroy(CKTcircuit *ckt)
 
 #ifdef PREDICTOR
     if(ckt->CKTpred) FREE(ckt->CKTpred);
+    if(ckt->CKTnodeIsVolt) FREE(ckt->CKTnodeIsVolt);
     for( i=0;i<8;i++) {
         if(ckt->CKTsols[i]) FREE(ckt->CKTsols[i]);
     }

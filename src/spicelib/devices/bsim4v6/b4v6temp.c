@@ -2014,6 +2014,35 @@ int Size_Not_Found, i;
                 here->BSIM4v6SswgTempRevSatCur = T5 * T10 * T11 * model->BSIM4v6jtsswgs;
                 here->BSIM4v6DswgTempRevSatCur = T6 * T10 * T11 * model->BSIM4v6jtsswgd;
 
+                here->BSIM4v6hasTrapTunnel =
+                    (here->BSIM4v6SjctTempRevSatCur != 0.0) ||
+                    (here->BSIM4v6DjctTempRevSatCur != 0.0) ||
+                    (here->BSIM4v6SswTempRevSatCur != 0.0) ||
+                    (here->BSIM4v6DswTempRevSatCur != 0.0) ||
+                    (here->BSIM4v6SswgTempRevSatCur != 0.0) ||
+                    (here->BSIM4v6DswgTempRevSatCur != 0.0);
+
+                if ((here->BSIM4v6Aseff <= 0.0) && (here->BSIM4v6Pseff <= 0.0))
+                    here->BSIM4v6SourceSatCurrent = 0.0;
+                else
+                    here->BSIM4v6SourceSatCurrent = here->BSIM4v6Aseff * model->BSIM4v6SjctTempSatCurDensity
+                        + here->BSIM4v6Pseff * model->BSIM4v6SjctSidewallTempSatCurDensity
+                        + T10 * model->BSIM4v6SjctGateSidewallTempSatCurDensity;
+
+                if ((here->BSIM4v6Adeff <= 0.0) && (here->BSIM4v6Pdeff <= 0.0))
+                    here->BSIM4v6DrainSatCurrent = 0.0;
+                else
+                    here->BSIM4v6DrainSatCurrent = here->BSIM4v6Adeff * model->BSIM4v6DjctTempSatCurDensity
+                        + here->BSIM4v6Pdeff * model->BSIM4v6DjctSidewallTempSatCurDensity
+                        + T10 * model->BSIM4v6DjctGateSidewallTempSatCurDensity;
+
+                pParam->BSIM4v6xdep0OverSqrtPhi = pParam->BSIM4v6Xdep0 / pParam->BSIM4v6sqrtPhi;
+                pParam->BSIM4v6lpe0Factor = sqrt(1.0 + pParam->BSIM4v6lpe0 / pParam->BSIM4v6leff);
+                pParam->BSIM4v6lpebFactor = sqrt(1.0 + pParam->BSIM4v6lpeb / pParam->BSIM4v6leff);
+                pParam->BSIM4v6vthNarrowW = (model->BSIM4v6mtrlMod ? model->BSIM4v6eot : model->BSIM4v6toxe)
+                    * pParam->BSIM4v6phi / (pParam->BSIM4v6weff + pParam->BSIM4v6w0);
+                pParam->BSIM4v6sqrtLeff = sqrt(pParam->BSIM4v6leff);
+
                 /*high k*/
                 /*Calculate VgsteffVth for mobMod=3*/
                 if(model->BSIM4v6mobMod==3)

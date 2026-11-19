@@ -28,12 +28,73 @@ CAPload(GENmodel *inModel, CKTcircuit *ckt)
 
     /* check if capacitors are in the circuit or are open circuited */
     if(ckt->CKTmode & (MODETRAN|MODEAC|MODETRANOP) ) {
+        long mode = ckt->CKTmode;
+        int is_tran_ac = (mode & (MODETRAN | MODEAC)) != 0;
+        int is_init_tran = (mode & MODEINITTRAN) != 0;
+        int is_init_pred = (mode & MODEINITPRED) != 0;
         /* evaluate device independent analysis conditions */
-        cond1=
-            ( ( (ckt->CKTmode & MODEDC) &&
-                (ckt->CKTmode & MODEINITJCT) )
-              || ( ( ckt->CKTmode & MODEUIC) &&
-                   ( ckt->CKTmode & MODEINITTRAN) ) ) ;
+        cond1 =
+            ( ( (mode & MODEDC) && (mode & MODEINITJCT) )
+              || ( (mode & MODEUIC) && is_init_tran ) );
+
+        /* Fast hoisted path for standard transient iterations (Gear 1/2, Trap 1/2) */
+        if (is_tran_ac && !cond1 && !is_init_tran &&
+            (ckt->CKTintegrateMethod == GEAR || ckt->CKTintegrateMethod == TRAPEZOIDAL) &&
+            (ckt->CKTorder == 1 || ckt->CKTorder == 2))
+        {
+            const double * restrict rhsOld = ckt->CKTrhsOld;
+            double * restrict rhs = ckt->CKTrhs;
+            double * restrict s0 = ckt->CKTstate0;
+            const double * restrict s1 = ckt->CKTstate1;
+            const double * restrict s2 = ckt->CKTstate2;
+            double ag0 = ckt->CKTag[0];
+            double ag1 = ckt->CKTag[1];
+            double ag2 = ckt->CKTag[2];
+            int is_gear2 = (ckt->CKTintegrateMethod == GEAR && ckt->CKTorder == 2);
+            int is_trap2 = (ckt->CKTintegrateMethod == TRAPEZOIDAL && ckt->CKTorder == 2);
+
+            for ( ; model != NULL; model = CAPnextModel(model)) {
+                for (here = CAPinstances(model); here != NULL;
+                        here = CAPnextInstance(here)) {
+                    int qidx = here->CAPqcap;
+                    double q0;
+                    double ccap_val;
+                    m = here->CAPm;
+#ifndef PREDICTOR
+                    if (is_init_pred) {
+                        q0 = s1[qidx];
+                        s0[qidx] = q0;
+                    } else {
+#endif
+                        vcap = rhsOld[here->CAPposNode] - rhsOld[here->CAPnegNode];
+                        q0 = here->CAPcapac * vcap;
+                        s0[qidx] = q0;
+#ifndef PREDICTOR
+                    }
+#endif
+                    if (is_gear2) {
+                        ccap_val = ag2 * s2[qidx] + ag1 * s1[qidx] + ag0 * q0;
+                    } else if (is_trap2) {
+                        ccap_val = -s1[qidx + 1] * ag1 + ag0 * (q0 - s1[qidx]);
+                    } else {
+                        ccap_val = ag0 * q0 + ag1 * s1[qidx];
+                    }
+                    s0[qidx + 1] = ccap_val;
+                    ceq = ccap_val - ag0 * q0;
+                    geq = ag0 * here->CAPcapac;
+                    double mgeq = m * geq;
+                    double mceq = m * ceq;
+                    *(here->CAPposPosPtr) += mgeq;
+                    *(here->CAPnegNegPtr) += mgeq;
+                    *(here->CAPposNegPtr) -= mgeq;
+                    *(here->CAPnegPosPtr) -= mgeq;
+                    rhs[here->CAPposNode] -= mceq;
+                    rhs[here->CAPnegNode] += mceq;
+                }
+            }
+            return(OK);
+        }
+
         /*  loop through all the capacitor models */
         for( ; model != NULL; model = CAPnextModel(model)) {
 

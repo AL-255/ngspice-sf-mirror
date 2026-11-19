@@ -159,6 +159,17 @@ struct CKTcircuit {
     CKTnode *CKTlastNode;       /* ??? */
     CKTnode *prev_CKTlastNode;  /* just before model setup */
 
+    /* Cached flat node-type array for fast NIconvTest */
+    unsigned char *CKTnodeIsVolt;
+    int CKTnodeIsVoltSize;
+
+    /* Per-timepoint cached divided-difference coefficients for fast CKTterr */
+    int CKTterrCacheValid;
+    double CKTterrWeights[8];
+    double CKTterrFactor;
+    double CKTterrInvDelta;
+    double CKTterrReltolInvDelta;
+
     /* This define should be somewhere else ??? */
 #define NODENAME(ckt,nodenum) CKTnodName(ckt,nodenum)
     int CKTnumStates;           /* Number of states summed up over all device instances */

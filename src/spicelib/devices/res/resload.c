@@ -16,6 +16,23 @@ int
 RESload(GENmodel *inModel, CKTcircuit *ckt)
 {
     RESmodel *model = (RESmodel *)inModel;
+    int need_current = (ckt->CKTmode & MODEDC) != 0;
+
+    if (!need_current) {
+        /* Transient/AC fast path: REScurrent is only read by DC noise analysis. */
+        for ( ; model != NULL; model = RESnextModel(model)) {
+            RESinstance *here;
+            for (here = RESinstances(model); here != NULL;
+                    here = RESnextInstance(here)) {
+                double g = here->RESconduct;
+                *(here->RESposPosPtr) += g;
+                *(here->RESnegNegPtr) += g;
+                *(here->RESposNegPtr) -= g;
+                *(here->RESnegPosPtr) -= g;
+            }
+        }
+        return(OK);
+    }
 
     /*  loop through all the resistor models */
     for( ; model != NULL; model = RESnextModel(model)) {

@@ -100,29 +100,52 @@ spClear(MatrixPtr Matrix)
     /* Begin `spClear'. */
     assert( IS_SPARSE( Matrix ) );
 
-    /* Clear matrix. */
+    /* Clear matrix linearly across contiguous element & fill-in slabs. */
     if (Matrix->PreviousMatrixWasComplex || Matrix->Complex)
     {
-        for (I = Matrix->Size; I > 0; I--)
-        {
-            pElement = Matrix->FirstInCol[I];
-            while (pElement != NULL)
-           {
-                pElement->Real = 0.0;
-                pElement->Imag = 0.0;
-                pElement = pElement->NextInCol;
-           }
+        struct ElementListNodeStruct *eNode;
+        struct FillinListNodeStruct *fNode;
+        for (eNode = Matrix->FirstElementListNode; eNode != NULL; eNode = eNode->Next) {
+            ElementPtr p = eNode->pElementList;
+            int n = eNode->NumberOfElementsInList;
+            if (eNode == Matrix->LastElementListNode)
+                n -= Matrix->ElementsRemaining;
+            for (I = 0; I < n; I++) {
+                p[I].Real = 0.0;
+                p[I].Imag = 0.0;
+            }
+        }
+        for (fNode = Matrix->FirstFillinListNode; fNode != NULL; fNode = fNode->Next) {
+            ElementPtr p = fNode->pFillinList;
+            int n = fNode->NumberOfFillinsInList;
+            if (fNode == Matrix->LastFillinListNode)
+                n -= Matrix->FillinsRemaining;
+            for (I = 0; I < n; I++) {
+                p[I].Real = 0.0;
+                p[I].Imag = 0.0;
+            }
         }
     }
     else
     {
-        for (I = Matrix->Size; I > 0; I--)
-        {
-            pElement = Matrix->FirstInCol[I];
-            while (pElement != NULL)
-            {
-                pElement->Real = 0.0;
-                pElement = pElement->NextInCol;
+        struct ElementListNodeStruct *eNode;
+        struct FillinListNodeStruct *fNode;
+        for (eNode = Matrix->FirstElementListNode; eNode != NULL; eNode = eNode->Next) {
+            ElementPtr p = eNode->pElementList;
+            int n = eNode->NumberOfElementsInList;
+            if (eNode == Matrix->LastElementListNode)
+                n -= Matrix->ElementsRemaining;
+            for (I = 0; I < n; I++) {
+                p[I].Real = 0.0;
+            }
+        }
+        for (fNode = Matrix->FirstFillinListNode; fNode != NULL; fNode = fNode->Next) {
+            ElementPtr p = fNode->pFillinList;
+            int n = fNode->NumberOfFillinsInList;
+            if (fNode == Matrix->LastFillinListNode)
+                n -= Matrix->FillinsRemaining;
+            for (I = 0; I < n; I++) {
+                p[I].Real = 0.0;
             }
         }
     }

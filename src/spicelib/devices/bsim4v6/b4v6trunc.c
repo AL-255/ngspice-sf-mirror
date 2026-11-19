@@ -26,6 +26,32 @@ double *timeStep)
 BSIM4v6model *model = (BSIM4v6model*)inModel;
 BSIM4v6instance *here;
 
+#ifdef USE_OMP
+    int InstCount = model->BSIM4v6InstCount;
+    BSIM4v6instance **InstArray = model->BSIM4v6InstanceArray;
+    if (InstCount > 0 && InstArray != NULL) {
+        double minStep = *timeStep;
+        int idx;
+#pragma omp parallel for reduction(min:minStep) if(InstCount > 256)
+        for (idx = 0; idx < InstCount; idx++) {
+            BSIM4v6instance *inst = InstArray[idx];
+            CKTterr(inst->BSIM4v6qb, ckt, &minStep);
+            CKTterr(inst->BSIM4v6qg, ckt, &minStep);
+            CKTterr(inst->BSIM4v6qd, ckt, &minStep);
+            if (inst->BSIM4v6trnqsMod)
+                CKTterr(inst->BSIM4v6qcdump, ckt, &minStep);
+            if (inst->BSIM4v6rbodyMod) {
+                CKTterr(inst->BSIM4v6qbs, ckt, &minStep);
+                CKTterr(inst->BSIM4v6qbd, ckt, &minStep);
+            }
+            if (inst->BSIM4v6rgateMod == 3)
+                CKTterr(inst->BSIM4v6qgmid, ckt, &minStep);
+        }
+        *timeStep = minStep;
+        return(OK);
+    }
+#endif
+
 #ifdef STEPDEBUG
     double debugtemp;
 #endif /* STEPDEBUG */

@@ -30,6 +30,44 @@ CKTtrunc(CKTcircuit *ckt, double *timeStep)
 
         startTime = SPfrontEnd->IFseconds();
 
+        /* Precompute divided-difference linear weights once per timepoint for CKTterr */
+        {
+            static const double gearCoeff[] = {
+                .5, .2222222222, .1363636364, .096, .07299270073, .05830903790
+            };
+            static const double trapCoeff[] = { .5, .08333333333 };
+            int ord = ckt->CKTorder;
+            int k, m, j;
+            double deltmp[8];
+            double diff[8];
+            if (ord >= 1 && ord <= 6 &&
+                (ckt->CKTintegrateMethod == GEAR || ckt->CKTintegrateMethod == TRAPEZOIDAL))
+            {
+                for (k = 0; k <= ord + 1; k++) {
+                    for (m = 0; m <= ord + 1; m++)
+                        diff[m] = (m == k) ? 1.0 : 0.0;
+                    for (m = 0; m <= ord; m++)
+                        deltmp[m] = ckt->CKTdeltaOld[m];
+                    j = ord;
+                    for (;;) {
+                        for (m = 0; m <= j; m++)
+                            diff[m] = (diff[m] - diff[m + 1]) / deltmp[m];
+                        if (--j < 0) break;
+                        for (m = 0; m <= j; m++)
+                            deltmp[m] = deltmp[m + 1] + ckt->CKTdeltaOld[m];
+                    }
+                    ckt->CKTterrWeights[k] = diff[0];
+                }
+                ckt->CKTterrFactor = (ckt->CKTintegrateMethod == GEAR)
+                    ? gearCoeff[ord - 1] : trapCoeff[ord - 1];
+                ckt->CKTterrInvDelta = 1.0 / ckt->CKTdelta;
+                ckt->CKTterrReltolInvDelta = ckt->CKTreltol * ckt->CKTterrInvDelta;
+                ckt->CKTterrCacheValid = 1;
+            } else {
+                ckt->CKTterrCacheValid = 0;
+            }
+        }
+
         timetemp = HUGE;
         for (i = 0; i < DEVmaxnum; i++) {
             if (DEVices[i] && DEVices[i]->DEVtrunc && ckt->CKThead[i]) {
@@ -38,6 +76,7 @@ CKTtrunc(CKTcircuit *ckt, double *timeStep)
 #endif /* STEPDEBUG */
                 error = DEVices[i]->DEVtrunc(ckt->CKThead[i], ckt, &timetemp);
                 if (error) {
+                    ckt->CKTterrCacheValid = 0;
                     ckt->CKTstat->STATtranTruncTime += SPfrontEnd->IFseconds()
                         - startTime;
                     return(error);
@@ -50,6 +89,7 @@ CKTtrunc(CKTcircuit *ckt, double *timeStep)
 #endif /* STEPDEBUG */
             }
         }
+        ckt->CKTterrCacheValid = 0;
         *timeStep = MIN(2 * *timeStep, timetemp);
 
         ckt->CKTstat->STATtranTruncTime += SPfrontEnd->IFseconds() - startTime;

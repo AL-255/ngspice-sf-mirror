@@ -1821,6 +1821,35 @@ int Size_Not_Found, i;
                 here->BSIM4v5SswgTempRevSatCur = T5 * T10 * model->BSIM4v5jtsswgs;
                 here->BSIM4v5DswgTempRevSatCur = T6 * T10 * model->BSIM4v5jtsswgd;
 
+                here->BSIM4v5hasTrapTunnel =
+                    (here->BSIM4v5SjctTempRevSatCur != 0.0) ||
+                    (here->BSIM4v5DjctTempRevSatCur != 0.0) ||
+                    (here->BSIM4v5SswTempRevSatCur != 0.0) ||
+                    (here->BSIM4v5DswTempRevSatCur != 0.0) ||
+                    (here->BSIM4v5SswgTempRevSatCur != 0.0) ||
+                    (here->BSIM4v5DswgTempRevSatCur != 0.0);
+
+                if ((here->BSIM4v5Aseff <= 0.0) && (here->BSIM4v5Pseff <= 0.0))
+                    here->BSIM4v5SourceSatCurrent = 1.0e-14;
+                else
+                    here->BSIM4v5SourceSatCurrent = here->BSIM4v5Aseff * model->BSIM4v5SjctTempSatCurDensity
+                        + here->BSIM4v5Pseff * model->BSIM4v5SjctSidewallTempSatCurDensity
+                        + T10 * model->BSIM4v5SjctGateSidewallTempSatCurDensity;
+
+                if ((here->BSIM4v5Adeff <= 0.0) && (here->BSIM4v5Pdeff <= 0.0))
+                    here->BSIM4v5DrainSatCurrent = 1.0e-14;
+                else
+                    here->BSIM4v5DrainSatCurrent = here->BSIM4v5Adeff * model->BSIM4v5DjctTempSatCurDensity
+                        + here->BSIM4v5Pdeff * model->BSIM4v5DjctSidewallTempSatCurDensity
+                        + T10 * model->BSIM4v5DjctGateSidewallTempSatCurDensity;
+
+                pParam->BSIM4v5xdep0OverSqrtPhi = pParam->BSIM4v5Xdep0 / pParam->BSIM4v5sqrtPhi;
+                pParam->BSIM4v5lpe0Factor = sqrt(1.0 + pParam->BSIM4v5lpe0 / pParam->BSIM4v5leff);
+                pParam->BSIM4v5lpebFactor = sqrt(1.0 + pParam->BSIM4v5lpeb / pParam->BSIM4v5leff);
+                pParam->BSIM4v5vthNarrowW = model->BSIM4v5toxe * pParam->BSIM4v5phi
+                    / (pParam->BSIM4v5weff + pParam->BSIM4v5w0);
+                pParam->BSIM4v5sqrtLeff = sqrt(pParam->BSIM4v5leff);
+
 
               if (BSIM4v5checkModel(model, here, ckt))
               {

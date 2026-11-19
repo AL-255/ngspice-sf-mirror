@@ -28,8 +28,18 @@ NIconvTest(CKTcircuit *ckt)
     double tol;
     static int nancount = 0;
 
-    node = ckt->CKTnodes;
     size = SMPmatSize(ckt->CKTmatrix);
+    if (!ckt->CKTnodeIsVolt || ckt->CKTnodeIsVoltSize != size) {
+        FREE(ckt->CKTnodeIsVolt);
+        ckt->CKTnodeIsVolt = TMALLOC(unsigned char, size + 1);
+        ckt->CKTnodeIsVoltSize = size;
+        node = ckt->CKTnodes;
+        ckt->CKTnodeIsVolt[0] = 0;
+        for (i = 1; i <= size; i++) {
+            node = node->next;
+            ckt->CKTnodeIsVolt[i] = (node->type == SP_VOLTAGE) ? 1 : 0;
+        }
+    }
 #ifdef STEPDEBUG
     for (i=1;i<=size;i++) {
         new =  ckt->CKTrhs [i] ;
@@ -37,41 +47,33 @@ NIconvTest(CKTcircuit *ckt)
         printf("chk for convergence:   %s    new: %g    old: %g\n",CKTnodName(ckt,i),new,old);
     }
 #endif /* STEPDEBUG */
-    for (i=1;i<=size;i++) {
-        node = node->next;
-        new =  ckt->CKTrhs [i] ;
-        old =  ckt->CKTrhsOld [i] ;
-        if (isnan(new)) {
-            if (ft_ngdebug && nancount < 10) {
-                fprintf(stderr, "Warning: non-convergence, node %s is nan\n", CKTnodName(ckt, i));
-                nancount++;
-            }
-            else if (ft_ngdebug && nancount == 10) {
-                fprintf(stderr, "    non-convergence warnings (nan) limited to 10 node %s\n", CKTnodName(ckt, i));
-                nancount++;
-            }
-            return 1;
-        }
-        if(node->type == SP_VOLTAGE) {
-            tol =  ckt->CKTreltol * (MAX(fabs(old),fabs(new))) +
-                    ckt->CKTvoltTol;
-            if (fabs(new-old) >tol ) {
-#ifdef STEPDEBUG
-                printf(" non-convergence at node (type=3) %s (fabs(new-old)>tol --> fabs(%g-%g)>%g)\n",CKTnodName(ckt,i),new,old,tol);
-                printf("    reltol: %g    voltTol: %g   (tol=reltol*(MAX(fabs(old),fabs(new))) + voltTol)\n",ckt->CKTreltol,ckt->CKTvoltTol);
-#endif /* STEPDEBUG */
-                ckt->CKTtroubleNode = i;
-                ckt->CKTtroubleElt = NULL;
-                return(1);
-            }
-        } else {
-            tol =  ckt->CKTreltol * (MAX(fabs(old),fabs(new))) +
-                    ckt->CKTabstol;
-            if (fabs(new-old) >tol ) {
-#ifdef STEPDEBUG
-                printf(" non-convergence at node (type=%d) %s (fabs(new-old)>tol --> fabs(%g-%g)>%g)\n",node->type,CKTnodName(ckt,i),new,old,tol);
-                printf("    reltol: %g    abstol: %g   (tol=reltol*(MAX(fabs(old),fabs(new))) + abstol)\n",ckt->CKTreltol,ckt->CKTabstol);
-#endif /* STEPDEBUG */
+    {
+        const double * restrict rhs = ckt->CKTrhs;
+        const double * restrict rhsOld = ckt->CKTrhsOld;
+        const unsigned char * restrict isVolt = ckt->CKTnodeIsVolt;
+        double reltol = ckt->CKTreltol;
+        double voltTol = ckt->CKTvoltTol;
+        double abstol = ckt->CKTabstol;
+
+        for (i = 1; i <= size; i++) {
+            new = rhs[i];
+            old = rhsOld[i];
+            double abs_tol = isVolt[i] ? voltTol : abstol;
+            double aold = fabs(old);
+            double anew = fabs(new);
+            tol = reltol * (aold > anew ? aold : anew) + abs_tol;
+            if (!(fabs(new - old) <= tol)) {
+                if (isnan(new)) {
+                    if (ft_ngdebug && nancount < 10) {
+                        fprintf(stderr, "Warning: non-convergence, node %s is nan\n", CKTnodName(ckt, i));
+                        nancount++;
+                    }
+                    else if (ft_ngdebug && nancount == 10) {
+                        fprintf(stderr, "    non-convergence warnings (nan) limited to 10 node %s\n", CKTnodName(ckt, i));
+                        nancount++;
+                    }
+                    return 1;
+                }
                 ckt->CKTtroubleNode = i;
                 ckt->CKTtroubleElt = NULL;
                 return(1);

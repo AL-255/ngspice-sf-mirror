@@ -466,13 +466,11 @@ SMPmakeEltKLUforCIDER (SMPmatrix *Matrix, int Row, int Col)
 void
 SMPcClear (SMPmatrix *Matrix)
 {
-    unsigned int i ;
-
     if (Matrix->CKTkluMODE)
     {
-        for (i = 0 ; i < 2 * Matrix->SMPkluMatrix->KLUmatrixNZ ; i++) {
-            Matrix->SMPkluMatrix->KLUmatrixAxComplex [i] = 0 ;
-        }
+        if (Matrix->SMPkluMatrix->KLUmatrixNZ > 0)
+            memset (Matrix->SMPkluMatrix->KLUmatrixAxComplex, 0,
+                    2 * (size_t) Matrix->SMPkluMatrix->KLUmatrixNZ * sizeof (double)) ;
     } else {
         spClear (Matrix->SPmatrix) ;
     }
@@ -485,13 +483,11 @@ SMPcClear (SMPmatrix *Matrix)
 void
 SMPclear (SMPmatrix *Matrix)
 {
-    unsigned int i ;
-
     if (Matrix->CKTkluMODE)
     {
-        for (i = 0 ; i < Matrix->SMPkluMatrix->KLUmatrixNZ ; i++) {
-            Matrix->SMPkluMatrix->KLUmatrixAx [i] = 0 ;
-        }
+        if (Matrix->SMPkluMatrix->KLUmatrixNZ > 0)
+            memset (Matrix->SMPkluMatrix->KLUmatrixAx, 0,
+                    (size_t) Matrix->SMPkluMatrix->KLUmatrixNZ * sizeof (double)) ;
     } else {
         spClear (Matrix->SPmatrix) ;
     }
