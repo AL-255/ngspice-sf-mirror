@@ -219,6 +219,35 @@ void KLU_lsolve
     {
 
         case 1:
+#ifndef COMPLEX
+        {
+            double * restrict Xr = X ;
+            for (k = 0 ; k < n ; k++)
+            {
+                double xk = Xr [k] ;
+                if (xk == 0.0) continue ;
+                GET_POINTER (LU, Lip, Llen, Li, Lx, k, len) ;
+                const Int * restrict Lir = Li ;
+                const double * restrict Lxr = Lx ;
+                /* unit diagonal of L is not stored*/
+                for (p = 0 ; p + 3 < len ; p += 4)
+                {
+                    Int i0 = Lir [p] ;
+                    Int i1 = Lir [p + 1] ;
+                    Int i2 = Lir [p + 2] ;
+                    Int i3 = Lir [p + 3] ;
+                    Xr [i0] -= Lxr [p] * xk ;
+                    Xr [i1] -= Lxr [p + 1] * xk ;
+                    Xr [i2] -= Lxr [p + 2] * xk ;
+                    Xr [i3] -= Lxr [p + 3] * xk ;
+                }
+                for ( ; p < len ; p++)
+                {
+                    Xr [Lir [p]] -= Lxr [p] * xk ;
+                }
+            }
+        }
+#else
             for (k = 0 ; k < n ; k++)
             {
                 x [0] = X [k] ;
@@ -230,6 +259,7 @@ void KLU_lsolve
                     MULT_SUB (X [Li [p]], Lx [p], x [0]) ;
                 }
             }
+#endif
             break ;
 
         case 2:
@@ -323,7 +353,36 @@ void KLU_usolve
     {
 
         case 1:
-
+#ifndef COMPLEX
+        {
+            double * restrict Xr = X ;
+            const double * restrict Udr = Udiag ;
+            for (k = n-1 ; k >= 0 ; k--)
+            {
+                double xk = Xr [k] / Udr [k] ;
+                Xr [k] = xk ;
+                if (xk == 0.0) continue ;
+                GET_POINTER (LU, Uip, Ulen, Ui, Ux, k, len) ;
+                const Int * restrict Uir = Ui ;
+                const double * restrict Uxr = Ux ;
+                for (p = 0 ; p + 3 < len ; p += 4)
+                {
+                    Int i0 = Uir [p] ;
+                    Int i1 = Uir [p + 1] ;
+                    Int i2 = Uir [p + 2] ;
+                    Int i3 = Uir [p + 3] ;
+                    Xr [i0] -= Uxr [p] * xk ;
+                    Xr [i1] -= Uxr [p + 1] * xk ;
+                    Xr [i2] -= Uxr [p + 2] * xk ;
+                    Xr [i3] -= Uxr [p + 3] * xk ;
+                }
+                for ( ; p < len ; p++)
+                {
+                    Xr [Uir [p]] -= Uxr [p] * xk ;
+                }
+            }
+        }
+#else
             for (k = n-1 ; k >= 0 ; k--)
             {
                 GET_POINTER (LU, Uip, Ulen, Ui, Ux, k, len) ;
@@ -337,7 +396,7 @@ void KLU_usolve
 
                 }
             }
-
+#endif
             break ;
 
         case 2:

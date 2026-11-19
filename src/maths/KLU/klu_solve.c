@@ -269,7 +269,35 @@ Int KLU_solve
                 {
 
                     case 1:
-
+#ifndef COMPLEX
+                    {
+                        double * restrict Xr = X ;
+                        const Int * restrict Oir = Offi ;
+                        const double * restrict Oxr = Offx ;
+                        for (k = k1 ; k < k2 ; k++)
+                        {
+                            double xk = Xr [k] ;
+                            if (xk == 0.0) continue ;
+                            pend = Offp [k+1] ;
+                            p = Offp [k] ;
+                            for ( ; p + 3 < pend ; p += 4)
+                            {
+                                Int i0 = Oir [p] ;
+                                Int i1 = Oir [p + 1] ;
+                                Int i2 = Oir [p + 2] ;
+                                Int i3 = Oir [p + 3] ;
+                                Xr [i0] -= Oxr [p] * xk ;
+                                Xr [i1] -= Oxr [p + 1] * xk ;
+                                Xr [i2] -= Oxr [p + 2] * xk ;
+                                Xr [i3] -= Oxr [p + 3] * xk ;
+                            }
+                            for ( ; p < pend ; p++)
+                            {
+                                Xr [Oir [p]] -= Oxr [p] * xk ;
+                            }
+                        }
+                    }
+#else
                         for (k = k1 ; k < k2 ; k++)
                         {
                             pend = Offp [k+1] ;
@@ -279,6 +307,7 @@ Int KLU_solve
                                 MULT_SUB (X [Offi [p]], Offx [p], x [0]) ;
                             }
                         }
+#endif
                         break ;
 
                     case 2:

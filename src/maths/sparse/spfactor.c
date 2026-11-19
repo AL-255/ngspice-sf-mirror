@@ -387,9 +387,12 @@ spFactor(MatrixPtr Matrix)
             pColumn = Matrix->FirstInCol[Step];
             while (pColumn->Row < Step) {
                 pElement = Matrix->Diag[pColumn->Row];
-                pColumn->Real = Dest[pColumn->Row] * pElement->Real;
-                while ((pElement = pElement->NextInCol) != NULL)
-                    Dest[pElement->Row] -= pColumn->Real * pElement->Real;
+                Mult = Dest[pColumn->Row] * pElement->Real;
+                pColumn->Real = Mult;
+                if (Mult != 0.0) {
+                    while ((pElement = pElement->NextInCol) != NULL)
+                        Dest[pElement->Row] -= Mult * pElement->Real;
+                }
                 pColumn = pColumn->NextInCol;
             }
 
@@ -419,8 +422,10 @@ spFactor(MatrixPtr Matrix)
             while (pColumn->Row < Step) {
                 pElement = Matrix->Diag[pColumn->Row];
                 Mult = (*pDest[pColumn->Row] *= pElement->Real);
-                while ((pElement = pElement->NextInCol) != NULL)
-                    *pDest[pElement->Row] -= Mult * pElement->Real;
+                if (Mult != 0.0) {
+                    while ((pElement = pElement->NextInCol) != NULL)
+                        *pDest[pElement->Row] -= Mult * pElement->Real;
+                }
                 pColumn = pColumn->NextInCol;
             }
 

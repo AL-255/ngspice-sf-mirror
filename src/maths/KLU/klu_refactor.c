@@ -298,11 +298,32 @@ Int KLU_refactor        /* returns TRUE if successful, FALSE otherwise */
                         if (IS_NONZERO (ujk))
                         {
                             GET_POINTER (LU, Lip, Llen, Li, Lx, j, llen) ;
+#ifndef COMPLEX
+                            double * restrict Xr = X ;
+                            const Int * restrict Lir = Li ;
+                            const double * restrict Lxr = Lx ;
+                            for (p = 0 ; p + 3 < llen ; p += 4)
+                            {
+                                Int i0 = Lir [p] ;
+                                Int i1 = Lir [p + 1] ;
+                                Int i2 = Lir [p + 2] ;
+                                Int i3 = Lir [p + 3] ;
+                                Xr [i0] -= Lxr [p] * ujk ;
+                                Xr [i1] -= Lxr [p + 1] * ujk ;
+                                Xr [i2] -= Lxr [p + 2] * ujk ;
+                                Xr [i3] -= Lxr [p + 3] * ujk ;
+                            }
+                            for ( ; p < llen ; p++)
+                            {
+                                Xr [Lir [p]] -= Lxr [p] * ujk ;
+                            }
+#else
                             for (p = 0 ; p < llen ; p++)
                             {
                                 /* X [Li [p]] -= Lx [p] * ujk */
                                 MULT_SUB (X [Li [p]], Lx [p], ujk) ;
                             }
+#endif
                         }
                     }
                     /* get the diagonal entry of U */
@@ -332,11 +353,29 @@ Int KLU_refactor        /* returns TRUE if successful, FALSE otherwise */
                     if (llen > 0 && !IS_ZERO (ukk))
                     {
                         double inv_ukk = 1.0 / ukk ;
-                        for (p = 0 ; p < llen ; p++)
+                        double * restrict Xr = X ;
+                        const Int * restrict Lir = Li ;
+                        double * restrict Lxr = Lx ;
+                        for (p = 0 ; p + 3 < llen ; p += 4)
                         {
-                            i = Li [p] ;
-                            Lx [p] = X [i] * inv_ukk ;
-                            X [i] = 0.0 ;
+                            Int i0 = Lir [p] ;
+                            Int i1 = Lir [p + 1] ;
+                            Int i2 = Lir [p + 2] ;
+                            Int i3 = Lir [p + 3] ;
+                            Lxr [p]     = Xr [i0] * inv_ukk ;
+                            Lxr [p + 1] = Xr [i1] * inv_ukk ;
+                            Lxr [p + 2] = Xr [i2] * inv_ukk ;
+                            Lxr [p + 3] = Xr [i3] * inv_ukk ;
+                            Xr [i0] = 0.0 ;
+                            Xr [i1] = 0.0 ;
+                            Xr [i2] = 0.0 ;
+                            Xr [i3] = 0.0 ;
+                        }
+                        for ( ; p < llen ; p++)
+                        {
+                            i = Lir [p] ;
+                            Lxr [p] = Xr [i] * inv_ukk ;
+                            Xr [i] = 0.0 ;
                         }
                     }
                     else
@@ -478,11 +517,32 @@ Int KLU_refactor        /* returns TRUE if successful, FALSE otherwise */
                         if (IS_NONZERO (ujk))
                         {
                             GET_POINTER (LU, Lip, Llen, Li, Lx, j, llen) ;
+#ifndef COMPLEX
+                            double * restrict Xr = X ;
+                            const Int * restrict Lir = Li ;
+                            const double * restrict Lxr = Lx ;
+                            for (p = 0 ; p + 3 < llen ; p += 4)
+                            {
+                                Int i0 = Lir [p] ;
+                                Int i1 = Lir [p + 1] ;
+                                Int i2 = Lir [p + 2] ;
+                                Int i3 = Lir [p + 3] ;
+                                Xr [i0] -= Lxr [p] * ujk ;
+                                Xr [i1] -= Lxr [p + 1] * ujk ;
+                                Xr [i2] -= Lxr [p + 2] * ujk ;
+                                Xr [i3] -= Lxr [p + 3] * ujk ;
+                            }
+                            for ( ; p < llen ; p++)
+                            {
+                                Xr [Lir [p]] -= Lxr [p] * ujk ;
+                            }
+#else
                             for (p = 0 ; p < llen ; p++)
                             {
                                 /* X [Li [p]] -= Lx [p] * ujk */
                                 MULT_SUB (X [Li [p]], Lx [p], ujk) ;
                             }
+#endif
                         }
                     }
                     /* get the diagonal entry of U */
@@ -512,11 +572,29 @@ Int KLU_refactor        /* returns TRUE if successful, FALSE otherwise */
                     if (llen > 0 && !IS_ZERO (ukk))
                     {
                         double inv_ukk = 1.0 / ukk ;
-                        for (p = 0 ; p < llen ; p++)
+                        double * restrict Xr = X ;
+                        const Int * restrict Lir = Li ;
+                        double * restrict Lxr = Lx ;
+                        for (p = 0 ; p + 3 < llen ; p += 4)
                         {
-                            i = Li [p] ;
-                            Lx [p] = X [i] * inv_ukk ;
-                            X [i] = 0.0 ;
+                            Int i0 = Lir [p] ;
+                            Int i1 = Lir [p + 1] ;
+                            Int i2 = Lir [p + 2] ;
+                            Int i3 = Lir [p + 3] ;
+                            Lxr [p]     = Xr [i0] * inv_ukk ;
+                            Lxr [p + 1] = Xr [i1] * inv_ukk ;
+                            Lxr [p + 2] = Xr [i2] * inv_ukk ;
+                            Lxr [p + 3] = Xr [i3] * inv_ukk ;
+                            Xr [i0] = 0.0 ;
+                            Xr [i1] = 0.0 ;
+                            Xr [i2] = 0.0 ;
+                            Xr [i3] = 0.0 ;
+                        }
+                        for ( ; p < llen ; p++)
+                        {
+                            i = Lir [p] ;
+                            Lxr [p] = Xr [i] * inv_ukk ;
+                            Xr [i] = 0.0 ;
                         }
                     }
                     else
