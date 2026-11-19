@@ -15,6 +15,7 @@ INPmodel *modtab = NULL;
 /* Global input model hash table.
    The modelname is the key, the return value is the pointer to the model. */
 NGHASHPTR modtabhash = NULL;
+unsigned long modtab_gen = 0;
 
 /*--------------------------------------------------------------
  * This fcn takes the model name and looks to see if it is already
@@ -60,6 +61,7 @@ int INPmakeMod(char *token, int type, struct card *line)
    nghash_insert(modtabhash, token, newm);
 
    modtab = newm;
+   modtab_gen++;
 
    return (OK);
 }

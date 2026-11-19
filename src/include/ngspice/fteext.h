@@ -198,6 +198,9 @@ extern void inp_casefix(char *string);
 extern void inp_list(FILE *file, struct card *deck, struct card *extras, int type);
 struct card *inp_readall(FILE *fp, const char *dir_name, const char* file_name,
         bool comfile, bool intfile, bool *expr_w_temper_p);
+extern int nglib_precompile(const char *in_file, const char *out_file);
+extern struct card *nglib_load_blob(const char *blob_path, int *line_num_io);
+extern void com_precompile(wordlist *wl);
 extern FILE *inp_pathopen(const char *name, const char *mode);
 extern char *search_identifier(char *str, const char *identifier, char *str_begin);
 extern char *find_assignment(const char *s);

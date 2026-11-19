@@ -946,9 +946,11 @@ int main(int argc, char **argv)
     cp_vset("osdi_enabled", CP_BOOL, &t);
 #endif
 
+    const char *precompile_out = NULL;
+
     /* --- Process command line options --- */
     for (;;) {
-        enum { soa_log = 1001, };
+        enum { soa_log = 1001, precompile_opt = 1002 };
 
         static struct option long_options[] = {
             {"define",       required_argument, NULL, 'D'},
@@ -968,6 +970,7 @@ int main(int argc, char **argv)
             {"server",       no_argument,       NULL, 's'},
             {"terminal",     required_argument, NULL, 't'},
             {"soa-log",      required_argument, NULL, soa_log},
+            {"precompile",   required_argument, NULL, precompile_opt},
             {NULL,           0,                 NULL, 0}
         };
 
@@ -1103,6 +1106,11 @@ int main(int argc, char **argv)
                 sprintf(soa_log_file, "%s", optarg);
                 srflag = TRUE;
             }
+            break;
+
+        case precompile_opt:
+            precompile_out = optarg;
+            ft_batchmode = TRUE;
             break;
 
         case '?':
@@ -1379,6 +1387,15 @@ int main(int argc, char **argv)
                 fprintf(stdout, " %s", argv[ni]);
             }
             fprintf(stdout, "\n\n");
+        }
+
+        if (precompile_out) {
+            if (optind >= argc) {
+                fprintf(stderr, "Error: --precompile <out.nglib> requires an input PDK file\n");
+                sp_shutdown(EXIT_BAD);
+            }
+            int pc_rc = nglib_precompile(argv[optind], precompile_out);
+            sp_shutdown(pc_rc == 0 ? EXIT_NORMAL : EXIT_BAD);
         }
 
         if (!ft_servermode) {

@@ -1045,6 +1045,8 @@ void inp_get_w_l_x(struct card* card) {
   remove the 'level' entries from each card
   *-------------------------------------------------------------------------*/
 
+static int nglib_precompiling = 0;
+
 struct card *inp_readall(FILE *fp, const char *dir_name, const char* file_name,
         bool comfile, bool intfile, bool *expr_w_temper_p)
 {
@@ -1116,6 +1118,11 @@ struct card *inp_readall(FILE *fp, const char *dir_name, const char* file_name,
             tfree(ft_codemodelerror);
         }
 
+        if (nglib_precompiling) {
+            delete_names(subckt_w_params);
+            return cc;
+        }
+
         struct nscope *root = inp_add_levels(working);
 
         inp_probe(working);
@@ -1134,7 +1141,7 @@ struct card *inp_readall(FILE *fp, const char *dir_name, const char* file_name,
            cannot yet decide here which model we finally will need.
            There is another trial using these functions in inpc,
            when the netlist is expanded and flattened.*/
-        if (!has_if) {
+        if (!has_if && !nglib_precompiling) {
             comment_out_unused_subckt_models(working);
             inp_rem_unused_models(root, working);
         }
@@ -1142,7 +1149,8 @@ struct card *inp_readall(FILE *fp, const char *dir_name, const char* file_name,
         if (newcompat.lt || newcompat.ps)
             rem_mfg_from_models(working);
 
-        subckt_params_to_param(working);
+        if (!nglib_precompiling)
+            subckt_params_to_param(working);
 
         rv.line_number = inp_split_multi_param_lines(working, rv.line_number);
 
@@ -1485,6 +1493,51 @@ static struct inp_read_t inp_read(FILE* fp, int call_depth, const char* dir_name
                 fprintf(cp_err, "Warning: Dot command .biaschk is not supported, ingnored\n");
                 fprintf(cp_err, "    This message will be posted only once!\n\n");
                 biaswarn = TRUE;
+            }
+            tfree(buffer);
+            continue;
+        }
+        /* now handle .uselib statements (load precompiled binary .nglib blob) */
+        if (ciprefix(".uselib", buffer)) {
+            char *y = NULL;
+            char *s;
+            inp_stripcomments_line(buffer, FALSE, TRUE);
+            s = skip_non_ws(buffer);
+            s = get_quoted_token(s, &y);
+            if (!y) {
+                fprintf(cp_err, "Error: .uselib filename missing\n");
+                tfree(buffer);
+                controlled_exit(EXIT_FAILURE);
+            }
+            char *y_resolved = inp_pathresolve_at(y, dir_name);
+            if (!y_resolved) {
+                fprintf(cp_err, "Error: .uselib could not resolve library path '%s'\n", y);
+                tfree(buffer);
+                controlled_exit(EXIT_FAILURE);
+            }
+            char *src_tag = copy(y_resolved);
+            wl_append_word(&sourceinfo, &sourceinfo, src_tag);
+            struct card *newcard = nglib_load_blob(y_resolved, &line_number);
+            tfree(y_resolved);
+            if (!newcard) {
+                tfree(buffer);
+                controlled_exit(EXIT_FAILURE);
+            }
+            *buffer = '*';
+            if (end)
+                end = insert_new_line(end, copy(buffer), line_number++, end->linenum_orig, end->linesource);
+            else
+                end = insert_new_line(end, copy(buffer), line_number++, 1, (char *)file_name);
+            if (!cc)
+                cc = end;
+            end->nextcard = newcard;
+            for (end = newcard; end && end->nextcard; end = end->nextcard) {
+                end->linenum = line_number++;
+                end->linesource = src_tag;
+            }
+            if (end) {
+                end->linenum = line_number++;
+                end->linesource = src_tag;
             }
             tfree(buffer);
             continue;
@@ -10224,3 +10277,5 @@ char* get_windows_canonical_path(const char* input_path) {
     return utf8PathOutput;
 }
 #endif
+
+#include "nglib_cache.h"

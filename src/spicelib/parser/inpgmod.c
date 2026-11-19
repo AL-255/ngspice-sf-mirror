@@ -198,17 +198,84 @@ create_model(CKTcircuit *ckt, INPmodel *modtmp, INPtables *tab)
 }
 
 
+static void
+scan_net_tok(char **line, const char **tok_start, size_t *tok_len)
+{
+    char *point = *line;
+    char separator;
+    int signstate;
+
+    for (; *point != '\0'; point++) {
+        char c = *point;
+        if (c == ' ' || c == '\t' || c == '=' || c == '(' || c == ')' || c == ',')
+            continue;
+        break;
+    }
+
+    if (*point == '"' || *point == '\'') {
+        separator = *point++;
+    } else {
+        separator = '\0';
+    }
+
+    *line = point;
+    signstate = 0;
+    for (; *point != '\0'; point++) {
+        char c = *point;
+        if (separator) {
+            if (c == separator)
+                break;
+            continue;
+        }
+        if (c == ' ' || c == '\t' || c == '=' || c == '(' || c == ')' || c == ',' ||
+            c == '*' || c == '/' || c == '^')
+            break;
+        if (c == '+' || c == '-') {
+            if (signstate == 1 || signstate == 3)
+                break;
+            signstate += 1;
+            continue;
+        }
+        if (isdigit_c(c) || c == '.') {
+            signstate = (signstate > 1) ? 3 : 1;
+        } else if (tolower_c(c) == 'e' && signstate == 1) {
+            signstate = 2;
+        } else {
+            signstate = 3;
+        }
+    }
+
+    if (separator && *point == separator)
+        point--;
+    if (point == *line && *point)
+        point++;
+
+    *tok_start = *line;
+    *tok_len = (size_t)(point - *line);
+
+    for (; *point != '\0'; point++) {
+        char c = *point;
+        if (c == separator || c == ' ' || c == '\t' || c == '=' || c == ',')
+            continue;
+        break;
+    }
+    *line = point;
+}
+
+
 static bool
 parse_line(char *line, char *tokens[], int num_tokens, double values[], bool found[])
 {
     int get_index = -1;
     int i;
+    size_t tok_lens[8];
 
-    for (i = 0; i < num_tokens; i++)
+    for (i = 0; i < num_tokens; i++) {
         found[i] = FALSE;
+        tok_lens[i] = strlen(tokens[i]);
+    }
 
     while (*line) {
-
         if (get_index != -1) {
             int error;
             values[get_index] = INPevaluate(&line, &error, 1);
@@ -217,14 +284,16 @@ parse_line(char *line, char *tokens[], int num_tokens, double values[], bool fou
             continue;
         }
 
-        char *token = NULL;
-        INPgetNetTok(&line, &token, 1);
+        const char *ts = NULL;
+        size_t tl = 0;
+        scan_net_tok(&line, &ts, &tl);
 
-        for (i = 0; i < num_tokens; i++)
-            if (strcmp(tokens[i], token) == 0)
+        for (i = 0; i < num_tokens; i++) {
+            if (tl == tok_lens[i] && memcmp(tokens[i], ts, tl) == 0) {
                 get_index = i;
-
-        txfree(token);
+                break;
+            }
+        }
     }
 
     for (i = 0; i < num_tokens; i++)
@@ -232,6 +301,146 @@ parse_line(char *line, char *tokens[], int num_tokens, double values[], bool fou
             return FALSE;
 
     return TRUE;
+}
+
+
+typedef struct {
+    INPmodel *mod;
+    double lmin, lmax, wmin, wmax;
+    int illegal;
+} INPModBinEntry;
+
+typedef struct {
+    INPModBinEntry *entries;
+    int count;
+    int cap;
+} INPModBinList;
+
+static NGHASHPTR modbin_hash = NULL;
+static unsigned long modbin_gen = (unsigned long)-1;
+
+static void
+free_modbin_list(void *ptr)
+{
+    INPModBinList *bl = (INPModBinList *)ptr;
+    if (bl) {
+        FREE(bl->entries);
+        FREE(bl);
+    }
+}
+
+void
+INPkillModBinCache(void)
+{
+    if (modbin_hash) {
+        nghash_free(modbin_hash, free_modbin_list, NULL);
+        modbin_hash = NULL;
+    }
+    modbin_gen = (unsigned long)-1;
+}
+
+static bool
+is_binnable_type(int modtype)
+{
+    static int init = 0;
+    static int types[11];
+    if (!init) {
+        types[0]  = INPtypelook("BSIM3");
+        types[1]  = INPtypelook("BSIM3v32");
+        types[2]  = INPtypelook("BSIM3v0");
+        types[3]  = INPtypelook("BSIM3v1");
+        types[4]  = INPtypelook("BSIM4");
+        types[5]  = INPtypelook("BSIM4v5");
+        types[6]  = INPtypelook("BSIM4v6");
+        types[7]  = INPtypelook("BSIM4v7");
+        types[8]  = INPtypelook("HiSIM2");
+        types[9]  = INPtypelook("HiSIMHV1");
+        types[10] = INPtypelook("HiSIMHV2");
+        init = 1;
+    }
+    for (int i = 0; i < 11; i++)
+        if (modtype == types[i])
+            return TRUE;
+    return FALSE;
+}
+
+static void
+ensure_modbin_cache(void)
+{
+    if (modbin_hash && modbin_gen == modtab_gen)
+        return;
+
+    INPkillModBinCache();
+    modbin_hash = nghash_init(NGHASH_MIN_SIZE);
+    nghash_unique(modbin_hash, TRUE);
+    modbin_gen = modtab_gen;
+
+    static char *model_tokens[] = { "lmin", "lmax", "wmin", "wmax" };
+    double parse_values[4];
+    bool parse_found[4];
+
+    for (INPmodel *modtmp = modtab; modtmp; modtmp = modtmp->INPnextModel) {
+        const char *mname = modtmp->INPmodName;
+        if (!mname)
+            continue;
+        const char *dot = strrchr(mname, '.');
+        if (!dot || dot[1] == '\0')
+            continue;
+        bool all_digits = TRUE;
+        for (const char *p = dot + 1; *p; p++) {
+            if (!isdigit_c(*p)) {
+                all_digits = FALSE;
+                break;
+            }
+        }
+        if (!all_digits)
+            continue;
+
+        if (!is_binnable_type(modtmp->INPmodType) && modtmp->INPmodType >= 0)
+            continue;
+
+        int illegal = (modtmp->INPmodType < 0) ? 1 : 0;
+        if (!illegal) {
+            if (!modtmp->INPmodLine || !modtmp->INPmodLine->line)
+                continue;
+            if (!parse_line(modtmp->INPmodLine->line, model_tokens, 4, parse_values, parse_found))
+                continue;
+        }
+
+        size_t base_len = (size_t)(dot - mname);
+        char base_buf[256];
+        char *base_key = (base_len < sizeof(base_buf)) ? base_buf : TMALLOC(char, base_len + 1);
+        memcpy(base_key, mname, base_len);
+        base_key[base_len] = '\0';
+
+        INPModBinList *bl = (INPModBinList *)nghash_find(modbin_hash, base_key);
+        if (!bl) {
+            bl = TMALLOC(INPModBinList, 1);
+            bl->entries = NULL;
+            bl->count = 0;
+            bl->cap = 0;
+            nghash_insert(modbin_hash, base_key, bl);
+        }
+        if (base_key != base_buf)
+            FREE(base_key);
+
+        if (bl->count == bl->cap) {
+            int ncap = bl->cap ? bl->cap * 2 : 16;
+            bl->entries = TREALLOC(INPModBinEntry, bl->entries, ncap);
+            bl->cap = ncap;
+        }
+        INPModBinEntry *e = &bl->entries[bl->count++];
+        e->mod = modtmp;
+        e->illegal = illegal;
+        if (!illegal) {
+            e->lmin = parse_values[0];
+            e->lmax = parse_values[1];
+            e->wmin = parse_values[2];
+            e->wmax = parse_values[3];
+        } else {
+            e->lmin = e->lmax = e->wmin = e->wmax = 0.0;
+        }
+    }
 }
 
 
@@ -253,12 +462,10 @@ in_range(double value, double min, double max)
 char *
 INPgetModBin(CKTcircuit *ckt, char *name, INPmodel **model, INPtables *tab, char *line)
 {
-    INPmodel    *modtmp;
-    double       l, w, lmin, lmax, wmin, wmax;
-    double       parse_values[4];
-    bool         parse_found[4];
+    double       l, w;
+    double       parse_values[4] = { 0.0, 0.0, 1.0, 0.0 };
+    bool         parse_found[4]  = { FALSE, FALSE, FALSE, FALSE };
     static char *instance_tokens[] = { "l", "w", "nf", "wnflag" };
-    static char *model_tokens[]    = { "lmin", "lmax", "wmin", "wmax" };
     double       scale;
     int          wnflag;
 
@@ -274,74 +481,44 @@ INPgetModBin(CKTcircuit *ckt, char *name, INPmodel **model, INPtables *tab, char
 
     *model = NULL;
 
-    /* read W and L. If not on the instance line, leave */
-    if (!parse_line(line, instance_tokens, 2, parse_values, parse_found))
+    /* Single-pass extraction of l, w, nf, wnflag from instance line */
+    (void)parse_line(line, instance_tokens, 4, parse_values, parse_found);
+    if (!parse_found[0] || !parse_found[1])
         return NULL;
 
-    /* This is for reading nf. If nf is not available, set to 1 if in HSPICE or Spectre compatibility mode */
-    if (!parse_line(line, instance_tokens, 3, parse_values, parse_found)) {
-        parse_values[2] = 1.; /* divisor */
-    }
-    /* This is for reading wnflag from instance. If it is not available, no change.
-       If instance wnflag == 0, set divisor to 1, else use instance nf */
-    else if (parse_line(line, instance_tokens, 4, parse_values, parse_found)) {
-        /* wnflag from instance overrules: no use of nf */
-        if (parse_values[3] == 0) {
-            parse_values[2] = 1.; /* divisor */
-        }
-    }
-    /* We do have nf, but no wnflag on the instance. Now it depends on the default
-       wnflag or on the .options wnflag */
-    else {
+    if (!parse_found[2]) {
+        parse_values[2] = 1.;
+    } else if (parse_found[3]) {
+        if (parse_values[3] == 0)
+            parse_values[2] = 1.;
+    } else {
         if (wnflag == 0)
-            parse_values[2] = 1.; /* divisor */
+            parse_values[2] = 1.;
     }
-
 
     l = parse_values[0] * scale;
     w = parse_values[1] / parse_values[2] * scale;
 
-    for (modtmp = modtab; modtmp; modtmp = modtmp->INPnextModel) {
+    ensure_modbin_cache();
 
-        if (model_name_match(name, modtmp->INPmodName) < 2)
-            continue;
+    INPModBinList *bl = modbin_hash ? (INPModBinList *)nghash_find(modbin_hash, name) : NULL;
+    if (!bl)
+        return NULL;
 
-        /* skip if not binnable */
-        if (modtmp->INPmodType != INPtypelook("BSIM3") &&
-            modtmp->INPmodType != INPtypelook("BSIM3v32") &&
-            modtmp->INPmodType != INPtypelook("BSIM3v0") &&
-            modtmp->INPmodType != INPtypelook("BSIM3v1") &&
-            modtmp->INPmodType != INPtypelook("BSIM4") &&
-            modtmp->INPmodType != INPtypelook("BSIM4v5") &&
-            modtmp->INPmodType != INPtypelook("BSIM4v6") &&
-            modtmp->INPmodType != INPtypelook("BSIM4v7") &&
-            modtmp->INPmodType != INPtypelook("HiSIM2") &&
-            modtmp->INPmodType != INPtypelook("HiSIMHV1") &&
-            modtmp->INPmodType != INPtypelook("HiSIMHV2"))
-        {
-            continue;
-        }
-
-        /* if illegal device type */
-        if (modtmp->INPmodType < 0) {
+    for (int bi = 0; bi < bl->count; bi++) {
+        INPModBinEntry *e = &bl->entries[bi];
+        if (e->illegal) {
             *model = NULL;
             return tprintf("Unknown device type for model %s\n", name);
         }
-
-        if (!parse_line(modtmp->INPmodLine->line, model_tokens, 4, parse_values, parse_found))
-            continue;
-
-        lmin = parse_values[0]; lmax = parse_values[1];
-        wmin = parse_values[2]; wmax = parse_values[3];
-
-        if (in_range(l, lmin, lmax) && in_range(w, wmin, wmax)) {
+        if (in_range(l, e->lmin, e->lmax) && in_range(w, e->wmin, e->wmax)) {
+            INPmodel *modtmp = e->mod;
             /* create unless model is already defined */
             if (!modtmp->INPmodfast) {
                 int error = create_model(ckt, modtmp, tab);
                 if (error)
                     return NULL;
             }
-
             *model = modtmp;
             return NULL;
         }

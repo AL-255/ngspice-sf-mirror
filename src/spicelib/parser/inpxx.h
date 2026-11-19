@@ -78,6 +78,9 @@ double PTlt0(double arg);
 double PTge0(double arg);
 double PTle0(double arg);
 double PTceil(double arg);
+
+extern unsigned long modtab_gen;
+void INPkillModBinCache(void);
 double PTfloor(double arg);
 double PTnint(double arg);
 double PTddt(double arg, void* data);

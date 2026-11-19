@@ -34,4 +34,6 @@ void INPkillMods(void)
         modtabhash = NULL;
     }
     ft_curckt->ci_modtabhash = NULL;
+    modtab_gen++;
+    INPkillModBinCache();
 }
