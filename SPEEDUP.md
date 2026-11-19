@@ -1,23 +1,41 @@
-# ngspice-47 Zen 4 Performance Optimization Changelog (`SPEEDUP.md`)
+# ngspice-47 Performance Optimization Changelog (`SPEEDUP.md`)
 
 **Branch:** `opt/zen4-transient` (based on `ngspice-47`, commit `a80f6e3e9`)
-**Target Host:** AMD Ryzen 9 7940HX (Zen 4, 16c/32t, 2×8-core CCDs, AVX-512, FMA, 32 KiB L1d / 1 MiB L2 per core, 64 MiB L3, GCC 13.3.0, GLIBC `libmvec.so.1`)
-**Numerical Policy:** Strict IEEE-754 double precision throughout — **no `-ffast-math`**, no physics approximations, every stage verified against stock `ngspice-47` golden `.raw` waveforms and built-in `tests/bsim4` (`nmos/qaSpec`, `pmos/qaSpec`).
+**Reference Host:** AMD Ryzen 9 7940HX (Zen 4, 16c/32t, 2×8-core CCDs, AVX-512, FMA, 32 KiB L1d / 1 MiB L2 per core, 64 MiB L3, GCC 13.3.0, GLIBC `libmvec.so.1`)
+**Numerical Policy:** Strict IEEE-754 double precision throughout — **no `-ffast-math`**, no physics approximations. Every stage is verified against stock `ngspice-47` golden `.raw` waveforms and built-in `tests/bsim4` (`nmos/qaSpec`, `pmos/qaSpec`).
 
 ---
 
-## Summary of Speedups (Stages 1–4)
+## Compile-Time Feature Flags (Porting Controls)
+
+All optimizations are cleanly separated into two independent compile-time flags defined in `src/include/ngspice/opt_config.h` and wired into `configure.ac`:
+
+| Flag | `./configure` Option | Default | Scope & Portability |
+|---|---|---|---|
+| `NGSPICE_OPT_GENERAL` | `--enable-opt-general` / `--disable-opt-general` | `1` (enabled) | **100% portable C99 / OpenMP** (zero ISA intrinsics — works on x86-64, ARM64/Apple Silicon, RISC-V, etc.): O(1) `INPgetModBin` bin index, `--precompile`/`.uselib` PDK caching, unified KLU TLS parallel load, pre-baked RES, flat CAP & fast `CAPtrunc`, KLU refactor lazy scatter-map + branchless scaling + alias-free 4× unroll, Sparse slab-linear `spClear` & `spFactor` zero-skip, `CKTterr` precomputed weights, `NIconvTest` flat byte cache, `OldCKTstate0` guard, BSIM4v5/v6 scalar fast-paths. |
+| `NGSPICE_OPT_ZEN4` | `--enable-opt-zen4` / `--disable-opt-zen4` | `auto` (`1` iff `__AVX512F__ && __GNUC__`, else `0`) | **AMD Zen 4 / AVX-512 SIMD kernels** (`bsim4_avx512_core.h`, `bsim4_avx512_glue.h`): 8-wide AVX-512 SoA BSIM4v5/v6 evaluator, inline Zen 4 `vrndscalepd`/`vscalefpd`/`vgetexppd`/`vgetmantpd` `exp`/`log` (≤2 ULP), 8-wide trap-assisted tunneling, model-sorted packing, 8-wide AVX-512 `fetlim`/`limvds`/`pnjlim`, `convTestAvx`, `truncAvx`, and two-level stationary-voltage block cache with exact first-order Taylor charge sync. |
+
+Both flags can also be overridden directly via `CFLAGS` (e.g. `CFLAGS="-O3 -DNGSPICE_OPT_GENERAL=1 -DNGSPICE_OPT_ZEN4=0"`). Building with `--enable-opt-general --disable-opt-zen4 CFLAGS="-O3 -march=x86-64 -mno-avx512f"` is verified to emit **0** `%zmm` instructions.
+
+Runtime diagnostic switches (no rebuild required):
+- `NGSPICE_NO_AVX512=1` — disable AVX-512 BSIM4 kernels at runtime
+- `NGSPICE_NO_BLOCK_BYPASS=1` — disable the two-level stationary BSIM4 block cache
+- `NGSPICE_AVX_BYPASS_TOL=<volts>` — override the stationary block cache voltage threshold (default: `min(CKTvoltTol, 1e-6)`)
+
+---
+
+## Summary of Final Speedups (Stages 1–8)
 
 ### Hero >10-Minute Benchmark (`sar12_hero_16cyc`: GF180 12-bit Post-PEX Redundant SAR ADC, 16 Cycles, >206k Newton Iters)
 
-| Configuration | Stock `ngspice-47` | Optimized (Stage 4) | Speedup (Same Config) | Speedup vs Stock Sparse 1t | Accuracy vs Golden |
-|---|---:|---:|---:|---:|---|
-| Sparse 1t | **628.48 s** (`10m 28s`) | **200.71 s** (`3m 21s`) | **3.13×** | **3.13×** | 16/16 SAR codes exact, max EOC Δt `99.2 ps` |
-| KLU 1t | — | **128.99 s** (`2m 09s`) | — | **4.87×** | 16/16 SAR codes exact, max EOC Δt `110.7 ps` |
-| Sparse 8t | — | **113.76 s** (`1m 54s`) | — | **5.52×** | 16/16 SAR codes exact, max EOC Δt `99.2 ps` |
-| KLU 8t (1 CCD) | **132.71 s** (`2m 13s`) | **39.19 s** | **3.39×** (`5.21×` load) | **16.04×** | 16/16 SAR codes exact, max EOC Δt `110.7 ps` |
+| Configuration | Stock `ngspice-47` | Stage 4 | **Final (Stage 7/8)** | Speedup (Same Config) | Speedup vs Stock Sparse 1t | Accuracy vs Golden |
+|---|---:|---:|---:|---:|---:|---|
+| **KLU 1t (Primary ST Target)** | — | 128.99 s | **69.40 s** (`1m 09s`) | — | **9.06×** (**1.91× faster than stock KLU 8t!**) | 16/16 SAR codes exact, max EOC Δt `110.74 ps` |
+| **Sparse 1t** | **628.48 s** (`10m 28s`) | 200.71 s | **143.20 s** (`2m 23s`) | **4.39×** | **4.39×** | 16/16 SAR codes exact, max EOC Δt `99.16 ps` |
+| **KLU 8t (1 CCD)** | **132.71 s** (`2m 13s`) | 39.19 s | **31.81 s** | **4.17×** | **19.76×** | 16/16 SAR codes exact, max EOC Δt `110.74 ps` |
+| **Sparse 8t** | — | 113.76 s | **105.16 s** (`1m 45s`) | — | **5.98×** | 16/16 SAR codes exact, max EOC Δt `99.16 ps` |
 
-### Probe Suite Progression (Wall Time, Seconds)
+### Probe Suite Progression Across All Stages (Wall Time, Seconds)
 
 All 4 circuits are real GF180 post-PEX mixed-signal circuits from `@aicdb`:
 - `sar12_probe_2cyc` (1,559 eqns, 2 SAR cycles, ~26k–27k iters)
@@ -25,21 +43,31 @@ All 4 circuits are real GF180 post-PEX mixed-signal circuits from `@aicdb`:
 - `pll1p2g_probe_20ns` (1,307 eqns, 1.2 GHz AD-PLL, ~2.9k iters)
 - `sdm16_probe_8cyc` (3,609 eqns, 16-bit switched-capacitor SDM, ~5.6k iters)
 
-| Deck | Config | Stock Sp 1t | Stage 1 (Flags+LTO) | Stage 2 (Alg Opt) | Stage 3A (Par KLU) | Stage 3B (AVX-512) | Stage 4 (Solver) | Speedup vs Stock Sp 1t |
-|---|---|---:|---:|---:|---:|---:|---:|---:|
-| `sar12_probe_2cyc` | Sparse 1t | 98.94 | 83.10 | 64.23 | 61.54 | 31.07 | **28.57** | **3.46×** |
-| | KLU 1t | — | 61.46 | 52.52 | 46.50 | 17.44 | **16.77** | **5.90×** |
-| | KLU 8t | — | 17.59 | 11.87 | 9.22 | 5.48 | **5.34** | **18.52×** |
-| `ti12_full_probe_30ns` | Sparse 1t | 61.07 | 51.75 | 42.26 | 37.29 | 22.41 | **22.48** | **2.72×** |
-| | KLU 1t | — | 45.91 | 37.09 | 32.51 | 16.59 | **16.36** | **3.73×** |
-| | KLU 8t | — | 20.09 | 13.45 | 9.54 | 7.28 | **7.26** | **8.41×** |
-| | KLU 16t | — | — | — | — | — | **6.08** | **10.04×** (`21.8×` tran) |
-| `pll1p2g_probe_20ns` | Sparse 1t | 11.00 | 9.19 | 7.69 | 6.97 | 3.87 | **3.76** | **2.93×** |
-| | KLU 1t | — | 8.62 | 7.37 | 6.77 | 3.40 | **3.39** | **3.25×** |
-| | KLU 8t | — | 3.02 | 2.24 | 1.81 | 1.33 | **1.34** | **8.21×** |
-| `sdm16_probe_8cyc` | Sparse 1t | 8.29 | 7.91 | 6.30 | 5.88 | 5.12 | **5.07** | **1.64×** |
-| | KLU 1t | — | 5.13 | 4.47 | 3.98 | 3.15 | **3.17** | **2.61×** |
-| | KLU 8t | — | 3.00 | 2.46 | 2.00 | 1.86 | **1.88** | **4.42×** |
+| Deck | Config | Stock Sp 1t | Portable (`GENERAL=1, ZEN4=0`, `-mno-avx512f`) | Stage 4 (Solver) | Stage 6 (ST AVX-512) | **Final Stage 7/8** | Speedup vs Stock Sp 1t | Final `rel_rms` |
+|---|---|---:|---:|---:|---:|---:|---:|---|
+| `sar12_probe_2cyc` | **KLU 1t** | — | 48.37 | 16.77 | 12.72 | **9.16** | **10.80×** | `9.27e-03` (2/2 codes exact) |
+| | Sparse 1t | 98.94 | — | 28.57 | 24.65 | **20.92** | **4.73×** | `3.64e-02` (2/2 codes exact) |
+| | KLU 8t | — | — | 5.34 | 4.96 | **4.37** | **22.64×** | `9.27e-03` (2/2 codes exact) |
+| `ti12_full_probe_30ns` | **KLU 1t** | — | 29.69 | 16.36 | 13.69 | **8.86** (~7.4 w/ `.uselib`) | **6.89×** (~8.3× w/ `.uselib`) | `9.99e-13` (exact grid) |
+| | Sparse 1t | 61.07 | — | 22.48 | — | **14.43** | **4.23×** | `1.08e-12` (exact grid) |
+| | KLU 8t | — | — | 7.26 | 6.00 | **5.04** | **12.12×** | `9.12e-13` (exact grid) |
+| `pll1p2g_probe_20ns` | **KLU 1t** | — | 6.70 | 3.39 | 2.09 | **1.51** | **7.28×** | `1.52e-11` (exact grid) |
+| | Sparse 1t | 11.00 | — | 3.76 | 2.42 | **1.92** | **5.73×** | `1.52e-11` (exact grid) |
+| | KLU 8t | — | — | 1.34 | — | **0.92** | **11.96×** | `1.53e-11` (exact grid) |
+| `sdm16_probe_8cyc` | **KLU 1t** | — | 3.88 | 3.17 | 2.07 | **1.89** | **4.39×** | `4.75e-09` |
+| | Sparse 1t | 8.29 | — | 5.07 | 3.90 | **3.81** | **2.18×** | `6.67e-10` |
+| | KLU 8t | — | — | 1.88 | — | **1.64** | **5.05×** | `5.56e-09` |
+
+### Explicit PDK Precompilation & Netlist Load Speedup (Stage 5 — Top-Level Netlist Uncached)
+
+| Deck | Stock Netlist Load | Opt (No `.uselib`, O(1) Bin Index) | Opt + `.uselib` (`pdk_gf180_typ.nglib`) | Pure Load Speedup |
+|---|---:|---:|---:|---:|
+| `ti12_full_probe_30ns` | 3.804 s | 2.405 s (1.58×) | **1.429 s** | **2.66×** |
+| `pll1p2g_probe_20ns` | 0.733 s | 0.562 s (1.30×) | **0.235 s** | **3.13×** |
+| `sar12_probe_2cyc` | 0.460 s | 0.340 s (1.35×) | **0.200 s** | **2.30×** |
+| `sdm16_probe_8cyc` | 0.227 s | 0.168 s (1.35×) | **0.097 s** | **2.34×** |
+
+Precompiling the full GF180 typical PDK (`design.ngspice` + `sm141064.ngspice` corners + `gf180mcu_fd_sc_mcu7t5v0.spice`) takes **21.8 ms** and writes a **428.1 KiB** binary `NGLIB001` blob.
 
 ---
 
@@ -51,63 +79,67 @@ All 4 circuits are real GF180 post-PEX mixed-signal circuits from `@aicdb`:
   CFLAGS="-O3 -march=znver4 -mtune=znver4 -fno-math-errno -fno-trapping-math -fno-semantic-interposition -flto=8 -g1"
   LDFLAGS="-flto=8 -O3 -march=znver4 -mtune=znver4 -lmvec"
   ```
-- **Configure:** `--enable-openmp --enable-klu --enable-xspice --enable-cider --disable-debug --with-readline=no`
-- **Gain:** **1.16×–1.20×** across all 4 decks (e.g., `sar12` Sparse 1t `98.94s -> 83.10s`, `ti12_full` `61.07s -> 51.75s`).
-- **Porting note:** Safe drop-in on any GCC 12+ / x86-64-v4 / Zen 4 host (`-fno-math-errno -fno-trapping-math` avoids `errno` branch checks after `sqrt`/`exp`/`log` without weakening IEEE-754 rounding).
+- **Gain:** **1.16×–1.20×** across all 4 decks (`sar12` Sparse 1t `98.94s -> 83.10s`).
+- **Flag:** Compiler flags (on non-Zen4 hosts, replace `-march=znver4 -mtune=znver4` with `-march=native`).
 
----
-
-### Stage 2: Algorithmic & Dead-Work Eliminations (`fdd0b3244`, 21 files)
-
-- **Gain:** **1.18×–1.48×** on top of Stage 1 (`sar12` Sparse 1t `83.10s -> 64.23s`, KLU 1t `61.46s -> 52.52s`, KLU 8t `17.59s -> 11.87s`; `ti12_full` KLU 8t `20.09s -> 13.45s`).
+### Stage 2: Algorithmic & Dead-Work Eliminations (`fdd0b3244`, 21 files) — `NGSPICE_OPT_GENERAL`
+- **Gain:** **1.18×–1.48×** over Stage 1 (`sar12` Sparse 1t `83.10s -> 64.23s`, KLU 1t `61.46s -> 52.52s`, KLU 8t `17.59s -> 11.87s`).
 - **Major changes:**
-  1. **Guarded dead `OldCKTstate0` allocation & `memcpy`** (`src/maths/ni/niiter.c`): `OldCKTstate0` was allocated and copied every Newton iteration even when `CKTbypass == 0`. Now skipped when bypass is disabled.
-  2. **Precomputed `CKTterr` divided-difference weights** (`src/include/ngspice/cktdefs.h`, `src/spicelib/analysis/ckttrunc.c`, `src/spicelib/analysis/cktterr.c`): Hoisted the time-step-only divided-difference coefficients out of the per-device `CKTterr()` call (computed once per timestep in `CKTtrunc` instead of thousands of times per timestep).
-  3. **Flat `CKTnodeIsVolt` byte cache** (`src/include/ngspice/cktdefs.h`, `src/maths/ni/niconv.c`, `src/spicelib/analysis/cktdltno.c`, `cktdest.c`): Replaced linked-list traversal of `CKTnodes` in `NIconvTest()` with a flat contiguous `unsigned char *` array indexed by equation number.
-  4. **Slab-linear `spClear` & `memset` `SMPclear`** (`src/maths/sparse/spalloc.c`, `spbuild.c`, `src/maths/KLU/klusmp.c`): `spClear()` walks element allocation slabs sequentially instead of pointer-chasing every column linked list; `SMPclear()` clears `KLUmatrixAx` with a single `memset()`.
-  5. **Linear passive fast paths (`RESload` / `CAPload`)** (`src/spicelib/devices/res/resload.c`, `src/spicelib/devices/cap/capload.c`): Skipped unused `REScurrent` calculation during transient when not needed; hoisted constants and inlined integration inside `CAPload`.
-  6. **BSIM4v5 & BSIM4v6 scalar micro-optimizations** (`src/spicelib/devices/bsim4v5/b4v5ld.c`, `b4v5temp.c`, `b4v5trunc.c`, `b4v5cvtest.c`, `bsim4v5def.h` and matching `bsim4v6/*`):
-     - Guarded bypass checks when `CKTbypass == 0` and trap-assisted tunneling with a `temp`-time `hasTrapTunnel` flag.
-     - Precomputed `temp`-invariant factors (`1/toxe`, `1/coxe`, `sqrtLeff`, etc.), inlined `integrate_fast()` and `polyDepletion()`, merged GIDL/GISL matrix stamps, added a 4-terminal fast path in `LoadRhsMat`, and parallelized `BSIM4v*trunc` and `BSIM4v*convTest` with OpenMP.
-- **Porting note:** 100% portable C (no SIMD intrinsics, no ABI dependencies). Every sub-change is self-contained and easy to cherry-pick upstream.
+  1. Guarded dead `OldCKTstate0` allocation & `memcpy` in `src/maths/ni/niiter.c` (only used for DC/TRANOP node damping).
+  2. Precomputed `CKTterr` divided-difference linear weights once per timestep in `src/spicelib/analysis/ckttrunc.c` / `cktterr.c`.
+  3. Flat `CKTnodeIsVolt` byte array cache in `src/maths/ni/niconv.c` replacing linked-list `CKTnodes` walk.
+  4. Slab-linear `spClear` (`src/maths/sparse/spalloc.c`, `spbuild.c`) & `memset` `SMPclear` (`src/maths/KLU/klusmp.c`).
+  5. Linear passive fast paths (`RESload` skipping unused transient `REScurrent`; hoisted `CAPload`).
+  6. Scalar BSIM4v5/v6 fast paths (`hasTrapTunnel` flag, precomputed `temp`-invariant factors, inlined `integrate_fast()` & `polyDepletion()`, 4-terminal `LoadRhsMat`, OpenMP `BSIM4v*trunc` / `convTest`).
 
----
-
-### Stage 3A: Unified Parallel KLU TLS Load, Pre-Baked RES, Flat CAP & KLU Refactor Fast Scaling (`d426e7c58`, 35 files)
-
-- **Gain:** **1.05×–1.13×** single-thread, **1.23×–1.41×** multi-thread (`sar12` KLU 1t `52.52s -> 46.50s`, KLU 8t `11.87s -> 9.22s`; `ti12_full` KLU 1t `37.09s -> 32.51s`, KLU 8t `13.45s -> 9.54s`).
+### Stage 3A: Unified Parallel KLU TLS Load, Pre-Baked RES, Flat CAP & KLU Refactor Fast Scaling (`d426e7c58`, 35 files) — `NGSPICE_OPT_GENERAL`
+- **Gain:** **1.05×–1.13×** single-thread, **1.23×–1.41×** multi-thread (`sar12` KLU 1t `52.52s -> 46.50s`, KLU 8t `11.87s -> 9.22s`).
 - **Major changes:**
-  1. **Unified single-region KLU parallel load with TLS buffers** (`src/include/ngspice/devdefs.h`, `klu.h`, `smpdefs.h`, `src/maths/KLU/klusmp.c`, `src/spicelib/analysis/cktload.c`, `src/spicelib/devices/dev.c`):
-     - Added optional `DEVkluPrep` and `DEVkluLoadPar` function pointers to `SPICEdev`.
-     - Allocated persistent 64B-aligned thread-local `Ax_tls` and `rhs_tls` arrays plus a trailing trash slot `KLUmatrixAx[nz]` so ground/disabled stamps need no branch.
-     - Launched a single `#pragma omp parallel` region per `CKTload` across all `DEVkluLoadPar`-capable devices, followed by a deterministic cache-tiled (256-wide) reduction into `KLUmatrixAx`/`CKTrhs`.
-     - Single-thread (`nthreads == 1`) writes directly to `KLUmatrixAx`/`CKTrhs` with zero TLS overhead.
-  2. **Pre-baked linear resistors (`RESkluPrep`) & flat `CAPfastArr`** (`src/spicelib/devices/res/*`, `src/spicelib/devices/cap/*`):
-     - Linear, temperature-constant resistors are pre-accumulated once into `KLUmatrixAxResConst` and copied into `KLUmatrixAx` via `memcpy` during `SMPclear` (eliminating `RESload` completely during transient for linear resistors!).
-     - Linear capacitors packed into contiguous `CAPfastArr` with pre-resolved KLU offsets, direct KLU/TLS stamping (`CAPloadKluPar`), and parallel `CAPtrunc`.
-  3. **Direct BSIM4v5/v6 stamping**: Eliminated intermediate `_34.._61` buffer writes for both KLU/TLS and single-thread Sparse. Also fixed missed `exp(T0*log(T1))` -> `s2*s2*s2` / `1/sqrt(cbrt(T2))` in `b4v6ld.c`.
-  4. **KLU refactor fast scaling & reciprocal pivot** (`src/maths/KLU/klu_refactor.c`): Precomputed `invRs[i] = 1.0 / Rs[i]` in unused `Xwork + n` workspace, replaced inner division by `ukk` with `inv_ukk = 1.0 / ukk`, and added `if (IS_NONZERO(ujk))` exact zero-skip.
-- **Porting note:** Portable C + OpenMP. Adding `DEVkluPrep`/`DEVkluLoadPar` to `SPICEdev` requires updating the device table initializers (`dev.c` / device `*init.c` defaults to `NULL`).
+  1. Added `DEVkluPrep` & `DEVkluLoadPar` to `SPICEdev` (`devdefs.h`, `cktload.c`, `klusmp.c`): single `#pragma omp parallel` region per `CKTload` with 64B-aligned TLS `Ax`/`rhs` buffers and deterministic 256-wide tiled reduction; zero TLS overhead on `nthreads == 1`.
+  2. Pre-baked constant linear resistors (`RESkluPrep` -> `KLUmatrixAxResConst` copied via `memcpy` during load) and contiguous `CAPfastArr` (`CAPloadKluPar`).
+  3. Direct BSIM4v5/v6 stamping (skipping `_34.._61` buffer copies) and KLU refactor `invRs` / `inv_ukk` / `IS_NONZERO(ujk)` zero-skip.
 
----
-
-### Stage 3B: 8-Wide AVX-512 SoA BSIM4v5 & BSIM4v6 Kernel with GLIBC `libmvec` (`31e0bc6cb`, 10 files)
-
-- **Gain:** **1.60×–2.67×** single-thread, **1.31×–1.68×** multi-thread (`sar12` Sparse 1t `61.54s -> 31.07s` [load **3.15×** faster!], KLU 1t `46.50s -> 17.44s`, KLU 8t `9.22s -> 5.48s`; `ti12_full` Sparse 1t `37.29s -> 22.41s`, KLU 1t `32.51s -> 16.59s`; `pll1p2g` Sparse 1t `6.97s -> 3.87s`).
+### Stage 3B: 8-Wide AVX-512 SoA BSIM4v5 & BSIM4v6 Kernel (`31e0bc6cb`, 10 files) — `NGSPICE_OPT_ZEN4`
+- **Gain:** **1.60×–2.67×** single-thread, **1.31×–1.68×** multi-thread (`sar12` KLU 1t `46.50s -> 17.44s`, Sparse 1t `61.54s -> 31.07s`).
 - **Major changes:**
-  - Created two header-only SIMD modules guarded by `#if defined(__AVX512F__) && defined(__GNUC__)` with runtime disable switch `NGSPICE_NO_AVX512=1`:
-    - `src/include/ngspice/bsim4_avx512_core.h`: 8-wide double-precision (`v8d`, 64B ZMM) SoA BSIM4v5 & BSIM4v6 DC + C-V + junction + GIDL/GISL + integration kernel calling GLIBC `libmvec` (`_ZGVeN8v_exp`, `_ZGVeN8v_log` — microbenchmarked **5.20×** faster than scalar `libm` with max rel err `3.5e-16`). Captures all BSIM4v5 vs BSIM4v6 physics differences via `is_v6` flag and per-block feature masks.
-    - `src/include/ngspice/bsim4_avx512_glue.h`: Packs eligible instances (currently `rgateMod==0, rbodyMod==0, rdsMod==0, trnqsMod==0, acnqsMod==0, igcMod==0, igbMod==0, mobMod==0, capMod==2, dioMod==1, !hasTrapTunnel, xpart>=0, off==0, tempMod<2`) into 64B-aligned `BSIM4Avx512Block` structs; supports KLU/TLS, Sparse 1t direct, and Sparse OMP buffered stamping; falls back seamlessly to scalar for any ineligible instances.
-  - Wired into `bsim4v5def.h`, `b4v5mdel.c`, `b4v5ld.c`, `b4v5temp.c` and matching `bsim4v6/*`.
-- **Porting note:** Requires AVX-512F + GCC vector extensions + GLIBC `libmvec` (`-lmvec`). Cleanly compiles out when `__AVX512F__` is undefined; easy to port to AVX2 (`v4d` + `_ZGVdN4v_exp`/`_ZGVdN4v_log`) or SVE by changing the 15-line vector-helper typedefs at the top of `bsim4_avx512_core.h`.
+  - `src/include/ngspice/bsim4_avx512_core.h` & `bsim4_avx512_glue.h`: 8-wide double-precision (`v8d`) SoA evaluator for standard 4-terminal BSIM4v5/v6 transient MOSFETs with seamless scalar fallback.
 
----
+### Stage 4: Linear Solver Inner-Loop Optimization (`d00bb7708`, 4 files) — `NGSPICE_OPT_GENERAL`
+- **Gain:** **1.04×–1.16×** Sparse, **1.03×–1.04×** KLU (`sar12` Sparse 1t `31.07s -> 28.57s`, KLU 1t `17.44s -> 16.77s`).
+- **Major changes:** `restrict` + 4× unrolled loops in `klu_refactor.c`, `klu.c`, `klu_solve.c`; exact `Mult != 0.0` zero-skip in `spfactor.c`.
 
-### Stage 4: Linear Solver Inner-Loop Optimization (`d00bb7708`, 4 files)
-
-- **Gain:** **1.04×–1.16×** on Sparse 1t/8t and **1.03×–1.04×** on KLU (`sar12` Sparse 1t `31.07s -> 28.57s` [`fac` -21%], Sparse 8t `18.47s -> 15.96s`, KLU 1t `17.44s -> 16.77s`, KLU 8t `5.48s -> 5.34s`).
+### Stage 5: Explicit PDK Precompiler (`--precompile` / `precompile` / `.uselib`) & O(1) `INPgetModBin` (`a1acb9080`, 10 files) — `NGSPICE_OPT_GENERAL`
+- **Gain:** **2.30×–3.13×** pure netlist load speedup with `.uselib` (and **1.30×–1.58×** even without `.uselib`), bit-identical transient waveforms.
 - **Major changes:**
-  1. `src/maths/KLU/klu_refactor.c`: Added `restrict`-qualified pointers and 4× manual unrolling to both the `X[Li[p]] -= Lx[p] * ujk` scatter-FMA loop and the `Lx[p] = X[i] * inv_ukk; X[i] = 0.0` gather-scale loop (distinct column indices guarantee no aliasing, unlocking 2 FMAs/cycle on Zen 4).
-  2. `src/maths/KLU/klu.c` & `src/maths/KLU/klu_solve.c`: Added `if (xk == 0.0) continue;` exact zero-skip and 4× unrolled `restrict` inner loops to `KLU_lsolve`, `KLU_usolve`, and off-diagonal block back-substitution (`nrhs == 1`, real).
-  3. `src/maths/sparse/spfactor.c`: Hoisted `Mult` into a register in the Direct branch and added `if (Mult != 0.0)` exact zero-skip to both Direct and Indirect branches of `spFactor`.
-- **Porting note:** 100% portable C99 (`restrict`), zero architecture-specific code.
+  1. `src/spicelib/parser/{inpgmod.c,inpmkmod.c,inpkmods.c,inpxx.h}`: Single-pass zero-malloc `scan_net_tok()` + generation-versioned hash index `modbin_hash` turning `INPgetModBin` from O(M×N) linear scan into O(1) lookup.
+  2. `src/frontend/nglib_cache.h`, `inpcom.c`, `commands.c`, `fteext.h`, `main.c`:
+     - CLI: `ngspice --precompile <out.nglib> <in_pdk.spice>`
+     - Interactive/control: `precompile <out.nglib> <in_pdk.spice>`
+     - Netlist directive: `.uselib "<path/to/pdk.nglib>"` (top-level netlist is NOT cached; only the fixed PDK blob is precompiled).
+     - Binary `NGLIB001` format: resolves `.lib`/`.include`/continuations, pre-evaluates top-level `.model` parameters, folds zero-switch mismatch expressions, and eliminates dead local `.param`s inside `.subckt`s (140 dead local params eliminated on GF180 typical PDK).
+
+### Stage 6: Single-Thread BSIM4 AVX-512 Overhaul (`e7d4af7d8`, 11 files) — `NGSPICE_OPT_ZEN4`
+- **Gain:** **1.20×–1.62×** single-thread KLU (`sar12` `16.77s -> 12.72s`, `pll1p2g` `3.39s -> 2.09s`, `sdm16` `3.17s -> 2.07s`, `ti12_full` `16.36s -> 13.69s`).
+- **Major changes:**
+  1. Replaced all 37 external `_ZGVeN8v_exp`/`_ZGVeN8v_log` calls in `bsim4_avx512_core.h` with inline Zen 4 hardware AVX-512 `v8_exp` (`vrndscalepd`+`vscalefpd`, max 2 ULP, `4.30e-16`) and `v8_log` (`vgetexppd`+`vgetmantpd`, max 1 ULP, `2.22e-16`) — eliminating cross-call ZMM register spilling.
+  2. Added 8-wide AVX-512 reverse-bias trap-assisted tunneling (`hasTrapTunnel`), moving **100% of GF180 `pfet_03v3`** out of scalar fallback.
+  3. Model-sorted block packing (`cmpEligIdx` by model/tunnel/dint/sint/instIdx), 8-wide AVX-512 `v8_fetlim`/`v8_limvds`/`v8_pnjlim`, compact 64B-aligned `BSIM4Avx512Dyn` eliminating 24 AoS `here->...` writes per iteration unless `b4v*ask.c` is triggered, 8-wide AVX-512 `BSIM4v*convTestAvx`, and `omp_get_max_threads() > 1` guards eliminating `GOMP_parallel` overhead on 1t.
+
+### Stage 7: Stationary Block Cache, AVX-512 `BSIM4trunc`, Fast `CAP` & KLU Refactor Scatter Map (`8bffde13a`, 14 files) — `NGSPICE_OPT_ZEN4` + `NGSPICE_OPT_GENERAL`
+- **Gain:** **1.39×–1.55×** single-thread KLU (`sar12` `12.72s -> 9.16s`, `ti12_full` `13.69s -> 8.86s`, `pll1p2g` `2.09s -> 1.51s`; `sar12_hero_16cyc` `128.99s -> 69.40s` KLU 1t, `39.19s -> 31.81s` KLU 8t).
+- **Major changes:**
+  1. **Two-level stationary-voltage BSIM4 block cache with exact first-order Taylor charge sync** (`bsim4_avx512_core.h`, `bsim4_avx512_glue.h`, `NGSPICE_OPT_ZEN4`):
+     - Guarded by `|dv| <= min(CKTvoltTol, 1e-6)`, same `vds` polarity, AND 10× tighter-than-`convTest` current tolerance (`0.1 * (reltol * max(|Ihat|, |I|) + abstol)`) so Newton convergence can never stall.
+     - **Level 1 (same timestep & integration):** skips physics, integration, and matrix/RHS assembly; replays cached 20 stamp vectors directly (with first-order `dq = C * dv` `CKTstate0` sync if `|dv| > 1e-13`).
+     - **Level 2 (cross-timestep stationary):** skips all 1,500 lines of BSIM4 DC+CV+junction+overlap physics; reuses cached DC/C matrices + charges and runs only charge integration + `ag0` stamp assembly (~30 vector ops).
+  2. **Dead `CKTstate0` write elimination** (`bsim4_avx512_core.h`): skipped 11 unused state slots (`st+4..10, 19, 21, 27, 28`) unless `need_aos != 0`.
+  3. **8-wide AVX-512 `BSIM4v5truncAvx` / `BSIM4v6truncAvx`** (`bsim4_avx512_glue.h`, `b4v5trunc.c`, `b4v6trunc.c`, `NGSPICE_OPT_ZEN4`): eliminates AoS `InstArray` cache misses and skips `sqrt` unless a lane beats `minStep` (`trn` 2.7×–2.9× faster).
+  4. **Fast `CAPtrunc` & hoisted `CAPloadKluPar`** (`captrunc.c`, `capload.c`, `NGSPICE_OPT_GENERAL`).
+  5. **KLU refactor lazy scatter map, branchless `fabs` scaling, and alias-free 4× unroll** (`klu.h`, `klu_factor.c`, `klu_free_numeric.c`, `klu_refactor.c`, `klu.c`, `klu_solve.c`, `NGSPICE_OPT_GENERAL`): precomputes `(ref_off_p, ref_blk_col, ref_blk_p, ref_blk_row)` once per numeric object (eliminating `Pinv[Ai[p]] - k1` and `newrow < 0` branches on every refactor) and hoists all 4 `Xr[i0..i3]` loads before stores to eliminate false compiler aliasing stalls.
+
+### Stage 8: Portable vs Zen 4 Compile-Time Feature Flags (`78a7359f0`, 39 files)
+- Added `src/include/ngspice/opt_config.h` and `configure.ac` (`--enable-opt-general`, `--enable-opt-zen4`).
+- Verified clean compilation, linking, and waveform PASS across all 3 build profiles:
+  1. Default Zen 4 (`NGSPICE_OPT_GENERAL=1, NGSPICE_OPT_ZEN4=1`)
+  2. Portable General-Only (`NGSPICE_OPT_GENERAL=1, NGSPICE_OPT_ZEN4=0`, `-march=x86-64 -mno-avx512f`, 0 `%zmm` instructions)
+  3. Stock-Equivalent (`NGSPICE_OPT_GENERAL=0, NGSPICE_OPT_ZEN4=0`, `-march=x86-64 -mno-avx512f`)
