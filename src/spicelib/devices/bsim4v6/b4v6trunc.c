@@ -15,6 +15,9 @@
 #include "bsim4v6def.h"
 #include "ngspice/sperror.h"
 #include "ngspice/suffix.h"
+#ifdef USE_OMP
+#include <omp.h>
+#endif
 
 
 int
@@ -32,7 +35,7 @@ BSIM4v6instance *here;
     if (InstCount > 0 && InstArray != NULL) {
         double minStep = *timeStep;
         int idx;
-#pragma omp parallel for reduction(min:minStep) if(InstCount > 256)
+#pragma omp parallel for reduction(min:minStep) if(InstCount > 256 && omp_get_max_threads() > 1)
         for (idx = 0; idx < InstCount; idx++) {
             BSIM4v6instance *inst = InstArray[idx];
             CKTterr(inst->BSIM4v6qb, ckt, &minStep);

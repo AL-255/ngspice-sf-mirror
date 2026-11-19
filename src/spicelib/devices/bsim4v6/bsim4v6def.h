@@ -1826,6 +1826,8 @@ typedef struct sBSIM4v6model
 #endif
 #if defined(__AVX512F__) && defined(__GNUC__)
     void *BSIM4v6AvxBlocks;
+    void *BSIM4v6AvxDyn;
+    int   BSIM4v6AvxDynValid;
     int   BSIM4v6AvxBlockCount;
     int  *BSIM4v6AvxFallbackIdx;
     int   BSIM4v6AvxFallbackCount;

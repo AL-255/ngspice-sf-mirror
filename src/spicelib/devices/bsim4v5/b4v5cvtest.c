@@ -19,6 +19,9 @@
 #include "ngspice/devdefs.h"
 #include "ngspice/sperror.h"
 #include "ngspice/suffix.h"
+#ifdef USE_OMP
+#include <omp.h>
+#endif
 
 
 static int
@@ -166,16 +169,35 @@ GENmodel *inModel,
 CKTcircuit *ckt)
 {
     BSIM4v5model *model = (BSIM4v5model*)inModel;
+#if defined(__AVX512F__) && defined(__GNUC__)
+    {
+        int avx_rc = BSIM4v5convTestAvx(inModel, ckt);
+        if (avx_rc >= 0) {
+            if (avx_rc > 0)
+                ckt->CKTnoncon++;
+            return(OK);
+        }
+    }
+#endif
 #ifdef USE_OMP
     int InstCount = model->BSIM4v5InstCount;
     BSIM4v5instance **InstArray = model->BSIM4v5InstanceArray;
     if (InstCount > 0 && InstArray != NULL) {
         int noncon = 0;
         int idx;
-#pragma omp parallel for reduction(|:noncon) if(InstCount > 256)
-        for (idx = 0; idx < InstCount; idx++) {
-            if (!noncon && BSIM4v5convTestInst(InstArray[idx], ckt))
-                noncon = 1;
+        if (InstCount > 256 && omp_get_max_threads() > 1) {
+#pragma omp parallel for reduction(|:noncon)
+            for (idx = 0; idx < InstCount; idx++) {
+                if (!noncon && BSIM4v5convTestInst(InstArray[idx], ckt))
+                    noncon = 1;
+            }
+        } else {
+            for (idx = 0; idx < InstCount; idx++) {
+                if (BSIM4v5convTestInst(InstArray[idx], ckt)) {
+                    noncon = 1;
+                    break;
+                }
+            }
         }
         if (noncon)
             ckt->CKTnoncon++;

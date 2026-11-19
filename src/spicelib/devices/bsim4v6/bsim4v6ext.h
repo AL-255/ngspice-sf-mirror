@@ -35,3 +35,7 @@ extern int BSIM4v6bindCSCComplexToReal (GENmodel*, CKTcircuit*) ;
 extern int BSIM4v6kluPrep (GENmodel*, CKTcircuit*) ;
 extern int BSIM4v6loadKluPar (GENmodel*, CKTcircuit*, double*, double*) ;
 #endif
+#if defined(__AVX512F__) && defined(__GNUC__)
+extern int BSIM4v6convTestAvx(GENmodel*, CKTcircuit*);
+extern int BSIM4v6AvxNeedAosSync;
+#endif

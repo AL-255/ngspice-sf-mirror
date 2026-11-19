@@ -32,6 +32,11 @@ BSIM4v5instance *here = (BSIM4v5instance*)inst;
 
     NG_IGNORE(select);
 
+#if defined(__AVX512F__) && defined(__GNUC__)
+    if (ckt && (ckt->CKTmode & MODETRAN))
+        BSIM4v5AvxNeedAosSync = 1;
+#endif
+
     switch(which) 
     {   case BSIM4v5_L:
             value->rValue = here->BSIM4v5l;

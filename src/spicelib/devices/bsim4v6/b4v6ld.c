@@ -198,8 +198,12 @@ BSIM4v6kluPrep(GENmodel *inModel, CKTcircuit *ckt)
         head->BSIM4v6KluNz = nz;
     }
 #if defined(__AVX512F__) && defined(__GNUC__)
-    if (head->BSIM4v6KluAll4Term && BSIM4v6isAvxEligibleTran(ckt))
+    if (head->BSIM4v6KluAll4Term && BSIM4v6isAvxEligibleTran(ckt)) {
         BSIM4v6ensureAvxPack(head, ckt);
+        BSIM4v6syncAvxDynFromInst(head);
+    } else {
+        head->BSIM4v6AvxDynValid = 0;
+    }
 #endif
     return head->BSIM4v6KluAll4Term ? 1 : 0;
 }
@@ -216,13 +220,14 @@ BSIM4v6loadKluPar(GENmodel *inModel, CKTcircuit *ckt, double *my_ax, double *my_
 #if defined(__AVX512F__) && defined(__GNUC__)
     if (head->BSIM4v6AvxBuilt && BSIM4v6isAvxEligibleTran(ckt)) {
         const BSIM4Avx512Block *blocks = (const BSIM4Avx512Block *)head->BSIM4v6AvxBlocks;
+        BSIM4Avx512Dyn *dyn = (BSIM4Avx512Dyn *)head->BSIM4v6AvxDyn;
         int nBlocks = head->BSIM4v6AvxBlockCount;
         const int *fbIdx = head->BSIM4v6AvxFallbackIdx;
         int nFb = head->BSIM4v6AvxFallbackCount;
         if (omp_in_parallel()) {
             #pragma omp for schedule(static) nowait
             for (int bi = 0; bi < nBlocks; bi++) {
-                BSIM4v6evalAvxBlock(&blocks[bi], InstArray, ckt, my_ax, my_rhs, 0);
+                BSIM4v6evalAvxBlock(&blocks[bi], &dyn[bi], InstArray, ckt, my_ax, my_rhs, 0);
             }
             if (nFb > 0) {
                 #pragma omp for schedule(static) nowait
@@ -236,7 +241,7 @@ BSIM4v6loadKluPar(GENmodel *inModel, CKTcircuit *ckt, double *my_ax, double *my_
             return error;
         }
         for (int bi = 0; bi < nBlocks; bi++) {
-            BSIM4v6evalAvxBlock(&blocks[bi], InstArray, ckt, my_ax, my_rhs, 0);
+            BSIM4v6evalAvxBlock(&blocks[bi], &dyn[bi], InstArray, ckt, my_ax, my_rhs, 0);
         }
         for (int fi = 0; fi < nFb; fi++) {
             int idx = fbIdx[fi];
@@ -282,23 +287,25 @@ CKTcircuit *ckt)
 #if defined(__AVX512F__) && defined(__GNUC__)
     if (BSIM4v6isAvxEligibleTran(ckt)) {
         BSIM4v6ensureAvxPack(model, ckt);
+        BSIM4v6syncAvxDynFromInst(model);
         const BSIM4Avx512Block *blocks = (const BSIM4Avx512Block *)model->BSIM4v6AvxBlocks;
+        BSIM4Avx512Dyn *dyn = (BSIM4Avx512Dyn *)model->BSIM4v6AvxDyn;
         int nBlocks = model->BSIM4v6AvxBlockCount;
         const int *fbIdx = model->BSIM4v6AvxFallbackIdx;
         int nFb = model->BSIM4v6AvxFallbackCount;
         if (omp_get_max_threads() == 1 && nFb == 0) {
             double *rhs = ckt->CKTrhs;
             for (int bi = 0; bi < nBlocks; bi++) {
-                BSIM4v6evalAvxBlock(&blocks[bi], InstArray, ckt, NULL, rhs, 1);
+                BSIM4v6evalAvxBlock(&blocks[bi], &dyn[bi], InstArray, ckt, NULL, rhs, 1);
             }
             return OK;
         }
-        #pragma omp parallel for schedule(static)
+        #pragma omp parallel for schedule(static) if(omp_get_max_threads() > 1)
         for (int bi = 0; bi < nBlocks; bi++) {
-            BSIM4v6evalAvxBlock(&blocks[bi], InstArray, ckt, NULL, NULL, 2);
+            BSIM4v6evalAvxBlock(&blocks[bi], &dyn[bi], InstArray, ckt, NULL, NULL, 2);
         }
         if (nFb > 0) {
-            #pragma omp parallel for schedule(static)
+            #pragma omp parallel for schedule(static) if(omp_get_max_threads() > 1)
             for (int fi = 0; fi < nFb; fi++) {
                 int local_error = BSIM4v6LoadOMP_core(InstArray[fbIdx[fi]], ckt, NULL, NULL, NULL);
                 if (local_error)
@@ -308,6 +315,7 @@ CKTcircuit *ckt)
         BSIM4v6LoadRhsMat(inModel, ckt);
         return error;
     }
+    model->BSIM4v6AvxDynValid = 0;
 #endif
 
     if (omp_get_max_threads() == 1 && !ckt->CKTbypass) {

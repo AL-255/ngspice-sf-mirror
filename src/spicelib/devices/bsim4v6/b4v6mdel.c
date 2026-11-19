@@ -30,6 +30,9 @@ BSIM4v6mDelete(GENmodel *gen_model)
 #if defined(__AVX512F__) && defined(__GNUC__)
     free(model->BSIM4v6AvxBlocks);
     model->BSIM4v6AvxBlocks = NULL;
+    free(model->BSIM4v6AvxDyn);
+    model->BSIM4v6AvxDyn = NULL;
+    model->BSIM4v6AvxDynValid = 0;
     FREE(model->BSIM4v6AvxFallbackIdx);
     model->BSIM4v6AvxBuilt = 0;
 #endif
