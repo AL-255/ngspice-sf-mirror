@@ -169,7 +169,7 @@ GENmodel *inModel,
 CKTcircuit *ckt)
 {
     BSIM4v5model *model = (BSIM4v5model*)inModel;
-#if NGSPICE_OPT_ZEN4
+#if NGSPICE_OPT_BSIM4_SIMD
     {
         int avx_rc = BSIM4v5convTestAvx(inModel, ckt);
         if (avx_rc >= 0) {

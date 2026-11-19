@@ -35,7 +35,7 @@ extern int BSIM4v6bindCSCComplexToReal (GENmodel*, CKTcircuit*) ;
 extern int BSIM4v6kluPrep (GENmodel*, CKTcircuit*) ;
 extern int BSIM4v6loadKluPar (GENmodel*, CKTcircuit*, double*, double*) ;
 #endif
-#if NGSPICE_OPT_ZEN4
+#if NGSPICE_OPT_BSIM4_SIMD
 extern int BSIM4v6convTestAvx(GENmodel*, CKTcircuit*);
 extern int BSIM4v6truncAvx(GENmodel*, CKTcircuit*, double*);
 extern int BSIM4v6AvxNeedAosSync;

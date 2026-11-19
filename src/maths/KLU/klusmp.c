@@ -156,6 +156,17 @@ void SMPconvertCOOtoCSC (SMPmatrix *Matrix)
         Matrix->SMPkluMatrix->KLUmatrixAxResConst = NULL ;
         Matrix->SMPkluMatrix->KLUmatrixResConstValid = 0 ;
         Matrix->SMPkluMatrix->KLUmatrixResVersion = 0 ;
+        Matrix->SMPkluMatrix->KLUmatrixAxCapUnit = NULL ;
+        Matrix->SMPkluMatrix->KLUmatrixCapUnitValid = 0 ;
+        Matrix->SMPkluMatrix->KLUmatrixCapVersion = 0 ;
+        Matrix->SMPkluMatrix->KLUmatrixAxResCapBase = NULL ;
+        Matrix->SMPkluMatrix->KLUmatrixResCapAg0 = 0.0 ;
+        Matrix->SMPkluMatrix->KLUmatrixResCapValid = 0 ;
+        Matrix->SMPkluMatrix->KLUmatrixResCapHasRes = 0 ;
+        Matrix->SMPkluMatrix->KLUmatrixRhsCapCache = NULL ;
+        Matrix->SMPkluMatrix->KLUmatrixRhsCapLen = 0 ;
+        Matrix->SMPkluMatrix->KLUmatrixRhsCapValid = 0 ;
+        Matrix->SMPkluMatrix->KLUmatrixIdentityMap = -1 ;
 
         /* Allocate the temporary COO Column Index */
         Ap_COO = NULL ;
@@ -976,6 +987,37 @@ SMPsolve (SMPmatrix *Matrix, double RHS[], double Spare[])
           return ;
         }
 
+#if NGSPICE_OPT_APPLE
+        {
+            KLUmatrix *km = Matrix->SMPkluMatrix ;
+            unsigned int n = km->KLUmatrixN ;
+            if (km->KLUmatrixIdentityMap < 0) {
+                int is_id = 1 ;
+                const unsigned int *map = km->KLUmatrixNodeCollapsingNewToOld ;
+                for (i = 0 ; i < n ; i++) {
+                    if (map [i + 1] != i + 1) {
+                        is_id = 0 ;
+                        break ;
+                    }
+                }
+                km->KLUmatrixIdentityMap = is_id ;
+            }
+            if (km->KLUmatrixIdentityMap == 1) {
+                ret = klu_solve (km->KLUmatrixSymbolic, km->KLUmatrixNumeric, (int)n, 1,
+                                 RHS + 1, km->KLUmatrixCommon) ;
+                if (ret == 0) {
+                    if (km->KLUmatrixCommon == NULL)
+                        fprintf (stderr, "Error (Solve): KLUcommon object is NULL. A problem occurred\n") ;
+                    else if (km->KLUmatrixCommon->status == KLU_SINGULAR && ft_ngdebug)
+                        fprintf(stderr, "Warning (Solve): KLU Matrix is SINGULAR\n") ;
+                }
+                RHS [0] = 0.0 ;
+                if (km->KLUmatrixNrhs > n + 1)
+                    memset (RHS + n + 1, 0, (size_t)(km->KLUmatrixNrhs - (n + 1)) * sizeof (double)) ;
+                return ;
+            }
+        }
+#endif
         for (i = 0 ; i < Matrix->SMPkluMatrix->KLUmatrixN ; i++) {
             if (Matrix->SMPkluMatrix->KLUmatrixNodeCollapsingNewToOld [i + 1] != 0) {
                 Matrix->SMPkluMatrix->KLUmatrixIntermediate [i] = RHS [Matrix->SMPkluMatrix->KLUmatrixNodeCollapsingNewToOld [i + 1]] ;
@@ -1173,6 +1215,17 @@ SMPnewMatrix (SMPmatrix *Matrix, int size)
         Matrix->SMPkluMatrix->KLUmatrixAxResConst = NULL ;
         Matrix->SMPkluMatrix->KLUmatrixResConstValid = 0 ;
         Matrix->SMPkluMatrix->KLUmatrixResVersion = 0 ;
+        Matrix->SMPkluMatrix->KLUmatrixAxCapUnit = NULL ;
+        Matrix->SMPkluMatrix->KLUmatrixCapUnitValid = 0 ;
+        Matrix->SMPkluMatrix->KLUmatrixCapVersion = 0 ;
+        Matrix->SMPkluMatrix->KLUmatrixAxResCapBase = NULL ;
+        Matrix->SMPkluMatrix->KLUmatrixResCapAg0 = 0.0 ;
+        Matrix->SMPkluMatrix->KLUmatrixResCapValid = 0 ;
+        Matrix->SMPkluMatrix->KLUmatrixResCapHasRes = 0 ;
+        Matrix->SMPkluMatrix->KLUmatrixRhsCapCache = NULL ;
+        Matrix->SMPkluMatrix->KLUmatrixRhsCapLen = 0 ;
+        Matrix->SMPkluMatrix->KLUmatrixRhsCapValid = 0 ;
+        Matrix->SMPkluMatrix->KLUmatrixIdentityMap = -1 ;
 
         /* Initialize the KLU Common Data Structure */
         klu_defaults (Matrix->SMPkluMatrix->KLUmatrixCommon) ;
@@ -1226,6 +1279,17 @@ SMPnewMatrixKLUforCIDER (SMPmatrix *Matrix, int size, unsigned int KLUmatrixIsCo
         Matrix->SMPkluMatrix->KLUmatrixAxResConst = NULL ;
         Matrix->SMPkluMatrix->KLUmatrixResConstValid = 0 ;
         Matrix->SMPkluMatrix->KLUmatrixResVersion = 0 ;
+        Matrix->SMPkluMatrix->KLUmatrixAxCapUnit = NULL ;
+        Matrix->SMPkluMatrix->KLUmatrixCapUnitValid = 0 ;
+        Matrix->SMPkluMatrix->KLUmatrixCapVersion = 0 ;
+        Matrix->SMPkluMatrix->KLUmatrixAxResCapBase = NULL ;
+        Matrix->SMPkluMatrix->KLUmatrixResCapAg0 = 0.0 ;
+        Matrix->SMPkluMatrix->KLUmatrixResCapValid = 0 ;
+        Matrix->SMPkluMatrix->KLUmatrixResCapHasRes = 0 ;
+        Matrix->SMPkluMatrix->KLUmatrixRhsCapCache = NULL ;
+        Matrix->SMPkluMatrix->KLUmatrixRhsCapLen = 0 ;
+        Matrix->SMPkluMatrix->KLUmatrixRhsCapValid = 0 ;
+        Matrix->SMPkluMatrix->KLUmatrixIdentityMap = -1 ;
 
         /* Initialize the KLU Common Data Structure */
         klu_defaults (Matrix->SMPkluMatrix->KLUmatrixCommon) ;
@@ -1286,6 +1350,9 @@ SMPdestroy (SMPmatrix *Matrix)
         free (Matrix->SMPkluMatrix->KLUmatrixAxTls) ;
         free (Matrix->SMPkluMatrix->KLUmatrixRhsTls) ;
         free (Matrix->SMPkluMatrix->KLUmatrixAxResConst) ;
+        free (Matrix->SMPkluMatrix->KLUmatrixAxCapUnit) ;
+        free (Matrix->SMPkluMatrix->KLUmatrixAxResCapBase) ;
+        free (Matrix->SMPkluMatrix->KLUmatrixRhsCapCache) ;
         free (Matrix->SMPkluMatrix->KLUmatrixCommon) ;
         free (Matrix->SMPkluMatrix) ;
     } else {
@@ -1323,6 +1390,9 @@ SMPdestroyKLUforCIDER (SMPmatrix *Matrix)
         free (Matrix->SMPkluMatrix->KLUmatrixAxTls) ;
         free (Matrix->SMPkluMatrix->KLUmatrixRhsTls) ;
         free (Matrix->SMPkluMatrix->KLUmatrixAxResConst) ;
+        free (Matrix->SMPkluMatrix->KLUmatrixAxCapUnit) ;
+        free (Matrix->SMPkluMatrix->KLUmatrixAxResCapBase) ;
+        free (Matrix->SMPkluMatrix->KLUmatrixRhsCapCache) ;
         free (Matrix->SMPkluMatrix->KLUmatrixCommon) ;
         free (Matrix->SMPkluMatrix) ;
     } else {

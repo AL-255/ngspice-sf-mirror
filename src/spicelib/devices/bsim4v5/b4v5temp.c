@@ -83,7 +83,7 @@ double kvsat, wlod, sceff, Wdrn;
 int Size_Not_Found, i;
 
     /*  loop through all the BSIM4v5 device models */
-#if NGSPICE_OPT_ZEN4
+#if NGSPICE_OPT_BSIM4_SIMD
     if (model)
         model->BSIM4v5AvxBuilt = 0;
 #endif

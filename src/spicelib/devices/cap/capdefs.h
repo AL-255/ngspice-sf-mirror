@@ -90,6 +90,13 @@ typedef struct sCAPinstance {
 
 typedef struct {
     double capac;
+    int posNode;
+    int negNode;
+    int qcap;
+} CAPhotEntry;
+
+typedef struct {
+    double capac;
     double m;
     int posNode;
     int negNode;
@@ -143,6 +150,14 @@ typedef struct sCAPmodel {      /* model structure for a capacitor */
     unsigned CAPbv_maxGiven    : 1;    /* flags indicates maximum voltage is given */
 
     CAPfastEntry *CAPfastArr;
+    CAPhotEntry  *CAPhotArr;
+    double       *CAPceqCache;
+    double        CAPcacheTime;
+    double        CAPcacheAg0, CAPcacheAg1, CAPcacheAg2;
+    const double *CAPcacheS1;
+    const double *CAPcacheS2;
+    int           CAPcacheIntMode;
+    int           CAPcacheValid;
     int CAPfastCount;
     unsigned long long CAPfastVer;
     double *CAPfastKluAxBase;

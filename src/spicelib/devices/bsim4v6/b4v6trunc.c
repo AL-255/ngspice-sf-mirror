@@ -29,7 +29,7 @@ double *timeStep)
 BSIM4v6model *model = (BSIM4v6model*)inModel;
 BSIM4v6instance *here;
 
-#if NGSPICE_OPT_ZEN4 && !defined(STEPDEBUG)
+#if NGSPICE_OPT_BSIM4_SIMD && !defined(STEPDEBUG)
     if (BSIM4v6truncAvx(inModel, ckt, timeStep) == 0)
         return(OK);
 #endif

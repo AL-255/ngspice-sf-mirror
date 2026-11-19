@@ -159,7 +159,20 @@ Int KLU_solve
             {
 
                 case 1:
-
+#if !defined(COMPLEX) && NGSPICE_OPT_APPLE
+                    if (Numeric->invValid && Numeric->invRs_perm != NULL)
+                    {
+                        double * restrict Xr = X ;
+                        const double * restrict Bzr = Bz ;
+                        const Int * restrict Pnr = Pnum ;
+                        const double * restrict iRsP = Numeric->invRs_perm ;
+                        for (k = 0 ; k < n ; k++)
+                        {
+                            Xr [k] = Bzr [Pnr [k]] * iRsP [k] ;
+                        }
+                    }
+                    else
+#endif
                     for (k = 0 ; k < n ; k++)
                     {
                         SCALE_DIV_ASSIGN (X [k], Bz  [Pnum [k]], Rs [k]) ;
@@ -228,6 +241,11 @@ Int KLU_solve
                 {
 
                     case 1:
+#if !defined(COMPLEX) && NGSPICE_OPT_APPLE
+                        if (Numeric->invValid && Numeric->invUdiag != NULL)
+                            X [k1] *= Numeric->invUdiag [k1] ;
+                        else
+#endif
                         DIV (X [k1], X [k1], s) ;
                         break ;
 
@@ -253,10 +271,69 @@ Int KLU_solve
             }
             else
             {
-                KLU_lsolve (nk, Lip + k1, Llen + k1, LUbx [block], nr,
-                        X + nr*k1) ;
-                KLU_usolve (nk, Uip + k1, Ulen + k1, LUbx [block],
-                        Udiag + k1, nr, X + nr*k1) ;
+#if !defined(COMPLEX) && NGSPICE_OPT_APPLE
+                if (nr == 1 && Numeric->invValid && Numeric->invUdiag != NULL)
+                {
+                    /* Inlined zero-division real L + U triangular solve for nrhs=1 */
+                    double * restrict Xr = X + k1 ;
+                    Unit *LUb = LUbx [block] ;
+                    const Int * restrict Lip_b = Lip + k1 ;
+                    const Int * restrict Llen_b = Llen + k1 ;
+                    const Int * restrict Uip_b = Uip + k1 ;
+                    const Int * restrict Ulen_b = Ulen + k1 ;
+                    const double * restrict invUdr = Numeric->invUdiag + k1 ;
+                    Int *Li_b, *Ui_b, len_b ;
+                    double *Lx_b, *Ux_b ;
+                    for (k = 0 ; k < nk ; k++)
+                    {
+                        double xk = Xr [k] ;
+                        if (xk == 0.0) continue ;
+                        GET_POINTER (LUb, Lip_b, Llen_b, Li_b, Lx_b, k, len_b) ;
+                        const Int * restrict Lir = Li_b ;
+                        const double * restrict Lxr = Lx_b ;
+                        for (p = 0 ; p + 3 < len_b ; p += 4)
+                        {
+                            Int i0 = Lir [p], i1 = Lir [p + 1], i2 = Lir [p + 2], i3 = Lir [p + 3] ;
+                            double x0 = Xr [i0], x1 = Xr [i1], x2 = Xr [i2], x3 = Xr [i3] ;
+                            x0 -= Lxr [p] * xk ;
+                            x1 -= Lxr [p + 1] * xk ;
+                            x2 -= Lxr [p + 2] * xk ;
+                            x3 -= Lxr [p + 3] * xk ;
+                            Xr [i0] = x0 ; Xr [i1] = x1 ; Xr [i2] = x2 ; Xr [i3] = x3 ;
+                        }
+                        for ( ; p < len_b ; p++)
+                            Xr [Lir [p]] -= Lxr [p] * xk ;
+                    }
+                    for (k = nk - 1 ; k >= 0 ; k--)
+                    {
+                        double xk = Xr [k] * invUdr [k] ;
+                        Xr [k] = xk ;
+                        if (xk == 0.0) continue ;
+                        GET_POINTER (LUb, Uip_b, Ulen_b, Ui_b, Ux_b, k, len_b) ;
+                        const Int * restrict Uir = Ui_b ;
+                        const double * restrict Uxr = Ux_b ;
+                        for (p = 0 ; p + 3 < len_b ; p += 4)
+                        {
+                            Int i0 = Uir [p], i1 = Uir [p + 1], i2 = Uir [p + 2], i3 = Uir [p + 3] ;
+                            double x0 = Xr [i0], x1 = Xr [i1], x2 = Xr [i2], x3 = Xr [i3] ;
+                            x0 -= Uxr [p] * xk ;
+                            x1 -= Uxr [p + 1] * xk ;
+                            x2 -= Uxr [p + 2] * xk ;
+                            x3 -= Uxr [p + 3] * xk ;
+                            Xr [i0] = x0 ; Xr [i1] = x1 ; Xr [i2] = x2 ; Xr [i3] = x3 ;
+                        }
+                        for ( ; p < len_b ; p++)
+                            Xr [Uir [p]] -= Uxr [p] * xk ;
+                    }
+                }
+                else
+#endif
+                {
+                    KLU_lsolve (nk, Lip + k1, Llen + k1, LUbx [block], nr,
+                            X + nr*k1) ;
+                    KLU_usolve (nk, Uip + k1, Ulen + k1, LUbx [block],
+                            Udiag + k1, nr, X + nr*k1) ;
+                }
             }
 
             /* -------------------------------------------------------------- */

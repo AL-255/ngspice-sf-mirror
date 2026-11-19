@@ -90,7 +90,7 @@ double vtfbphi2eot, phieot, TempRatioeot, Vtm0eot, Vtmeot,vbieot;
 int Size_Not_Found, i;
 
     /*  loop through all the BSIM4v6 device models */
-#if NGSPICE_OPT_ZEN4
+#if NGSPICE_OPT_BSIM4_SIMD
     if (model)
         model->BSIM4v6AvxBuilt = 0;
 #endif

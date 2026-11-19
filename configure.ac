@@ -1363,6 +1363,26 @@ else
     AC_MSG_RESULT([AMD Zen 4 / AVX-512 optimizations (NGSPICE_OPT_ZEN4): auto])
 fi
 
+# Apple Silicon / ARM64 NEON specific SIMD optimizations (default: auto-detect ARM64 NEON)
+AC_ARG_ENABLE([opt-apple],
+    [AS_HELP_STRING([--enable-opt-apple],
+        [Enable Apple Silicon / ARM64 NEON SIMD & micro-architectural optimizations (yes|no|auto, default: auto)])],
+    [],
+    [enable_opt_apple=auto])
+if test "x$enable_opt_apple" = xyes ; then
+    case "$CFLAGS" in
+        *-mcpu=*|*-march=*) ;;
+        *) CFLAGS="$CFLAGS -mcpu=native" ;;
+    esac
+    AC_DEFINE([CONFIG_OPT_APPLE], [1], [Enable Apple Silicon / ARM64 NEON specific optimizations])
+    AC_MSG_RESULT([Apple Silicon / ARM64 NEON optimizations (NGSPICE_OPT_APPLE) enabled])
+elif test "x$enable_opt_apple" = xno ; then
+    AC_DEFINE([CONFIG_OPT_APPLE], [0], [Disable Apple Silicon / ARM64 NEON specific optimizations])
+    AC_MSG_RESULT([Apple Silicon / ARM64 NEON optimizations (NGSPICE_OPT_APPLE) disabled])
+else
+    AC_MSG_RESULT([Apple Silicon / ARM64 NEON optimizations (NGSPICE_OPT_APPLE): auto])
+fi
+
 # Output Files
 # ------------
 

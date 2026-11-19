@@ -1824,9 +1824,10 @@ typedef struct sBSIM4v6model
     unsigned int BSIM4v6KluNz;
     int BSIM4v6KluAll4Term;
 #endif
-#if NGSPICE_OPT_ZEN4
+#if NGSPICE_OPT_BSIM4_SIMD
     void *BSIM4v6AvxBlocks;
     void *BSIM4v6AvxDyn;
+    void *BSIM4v6AvxL2;
     int   BSIM4v6AvxDynValid;
     int   BSIM4v6AvxBlockCount;
     int  *BSIM4v6AvxFallbackIdx;

@@ -87,6 +87,9 @@ CKTload(CKTcircuit *ckt)
         int par_count = 0;
         int skip_mask_res = -1;
         int has_res_base = 0;
+#if NGSPICE_OPT_APPLE
+        int has_cap_base = 0;
+#endif
         unsigned char handled[256];
         int use_handled = (DEVmaxnum <= 256);
         if (use_handled)
@@ -99,7 +102,15 @@ CKTload(CKTcircuit *ckt)
                     has_res_base = 1;
                     skip_mask_res = i;
                     if (use_handled) handled[i] = 1;
-                } else if (prep == 1 && DEVices[i]->DEVkluLoadPar && par_count < 16) {
+                }
+#if NGSPICE_OPT_APPLE
+                else if (prep == 3 && DEVices[i]->DEVkluLoadPar && par_count < 16) {
+                    has_cap_base = 1;
+                    par_devs[par_count++] = i;
+                    if (use_handled) handled[i] = 1;
+                }
+#endif
+                else if (prep == 1 && DEVices[i]->DEVkluLoadPar && par_count < 16) {
                     par_devs[par_count++] = i;
                     if (use_handled) handled[i] = 1;
                 }
@@ -107,6 +118,11 @@ CKTload(CKTcircuit *ckt)
         }
 
         const double * restrict res_base = has_res_base ? km->KLUmatrixAxResConst : NULL;
+#if NGSPICE_OPT_APPLE
+        const double * restrict cap_unit = has_cap_base ? km->KLUmatrixAxCapUnit : NULL;
+        const double * restrict cap_rhs  = has_cap_base ? km->KLUmatrixRhsCapCache : NULL;
+        const double cap_ag0 = ckt->CKTag[0];
+#endif
         int nthreads = omp_get_max_threads();
         int par_error = 0;
 
@@ -134,11 +150,20 @@ CKTload(CKTcircuit *ckt)
 
                 #pragma omp barrier
 
-                /* Cache-tiled AVX-512 deterministic parallel reduction (t = 0 .. nthreads-1) */
+                /* Cache-tiled deterministic parallel reduction (t = 0 .. nthreads-1) */
                 #pragma omp for schedule(static) nowait
                 for (int jb = 0; jb < nz; jb += 256) {
                     int jend = jb + 256;
                     if (jend > nz) jend = nz;
+#if NGSPICE_OPT_APPLE
+                    if (res_base != NULL && cap_unit != NULL) {
+                        for (int j = jb; j < jend; j++)
+                            ax_main[j] = (res_base[j] + cap_ag0 * cap_unit[j]) + ax_tls_base[j];
+                    } else if (cap_unit != NULL) {
+                        for (int j = jb; j < jend; j++)
+                            ax_main[j] = cap_ag0 * cap_unit[j] + ax_tls_base[j];
+                    } else
+#endif
                     if (res_base != NULL) {
                         for (int j = jb; j < jend; j++)
                             ax_main[j] = res_base[j] + ax_tls_base[j];
@@ -156,8 +181,16 @@ CKTload(CKTcircuit *ckt)
                 for (int jb = 0; jb < rhs_len; jb += 256) {
                     int jend = jb + 256;
                     if (jend > rhs_len) jend = rhs_len;
-                    for (int j = jb; j < jend; j++)
-                        rhs_main[j] = rhs_tls_base[j];
+#if NGSPICE_OPT_APPLE
+                    if (cap_rhs != NULL) {
+                        for (int j = jb; j < jend; j++)
+                            rhs_main[j] = cap_rhs[j] + rhs_tls_base[j];
+                    } else
+#endif
+                    {
+                        for (int j = jb; j < jend; j++)
+                            rhs_main[j] = rhs_tls_base[j];
+                    }
                     for (int t = 1; t < nthreads; t++) {
                         const double * restrict src = rhs_tls_base + (size_t)t * rhs_stride;
                         for (int j = jb; j < jend; j++)
@@ -170,11 +203,52 @@ CKTload(CKTcircuit *ckt)
             if (par_error) return(par_error);
         } else {
             /* Single-thread (or no parallel devices): stamp directly into main KLU Ax & CKTrhs */
+#if NGSPICE_OPT_APPLE
+            if (cap_unit != NULL) {
+                int want_res = (res_base != NULL) ? 1 : 0;
+                if (!km->KLUmatrixAxResCapBase) {
+                    if (posix_memalign((void **)&km->KLUmatrixAxResCapBase, 128,
+                                       ((size_t)nz + 1) * sizeof(double)) != 0)
+                        km->KLUmatrixAxResCapBase = NULL;
+                }
+                if (km->KLUmatrixAxResCapBase) {
+                    if (!km->KLUmatrixResCapValid ||
+                        km->KLUmatrixResCapAg0 != cap_ag0 ||
+                        km->KLUmatrixResCapHasRes != want_res)
+                    {
+                        double * restrict rcb = km->KLUmatrixAxResCapBase;
+                        if (res_base != NULL) {
+                            for (int j = 0; j < nz; j++)
+                                rcb[j] = res_base[j] + cap_ag0 * cap_unit[j];
+                        } else {
+                            for (int j = 0; j < nz; j++)
+                                rcb[j] = cap_ag0 * cap_unit[j];
+                        }
+                        rcb[nz] = 0.0;
+                        km->KLUmatrixResCapAg0 = cap_ag0;
+                        km->KLUmatrixResCapHasRes = want_res;
+                        km->KLUmatrixResCapValid = 1;
+                    }
+                    memcpy(ax_main, km->KLUmatrixAxResCapBase, (size_t)nz * sizeof(double));
+                } else if (res_base != NULL) {
+                    for (int j = 0; j < nz; j++)
+                        ax_main[j] = res_base[j] + cap_ag0 * cap_unit[j];
+                } else {
+                    for (int j = 0; j < nz; j++)
+                        ax_main[j] = cap_ag0 * cap_unit[j];
+                }
+            } else
+#endif
             if (res_base != NULL)
                 memcpy(ax_main, res_base, (size_t)nz * sizeof(double));
             else
                 memset(ax_main, 0, (size_t)nz * sizeof(double));
             ax_main[nz] = 0.0;
+#if NGSPICE_OPT_APPLE
+            if (cap_rhs != NULL)
+                memcpy(rhs_main, cap_rhs, (size_t)rhs_len * sizeof(double));
+            else
+#endif
             memset(rhs_main, 0, (size_t)rhs_len * sizeof(double));
 
             for (int k = 0; k < par_count; k++) {

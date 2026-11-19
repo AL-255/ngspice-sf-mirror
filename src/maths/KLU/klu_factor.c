@@ -463,6 +463,9 @@ KLU_numeric *KLU_factor         /* returns NULL if error, or a valid
     Numeric->ref_blk_col = NULL ;
     Numeric->ref_blk_p = NULL ;
     Numeric->ref_blk_row = NULL ;
+    Numeric->invUdiag = NULL ;
+    Numeric->invRs_perm = NULL ;
+    Numeric->invValid = 0 ;
     Numeric->Pnum = KLU_malloc (n, sizeof (Int), Common) ;
     Numeric->Offp = KLU_malloc (n1, sizeof (Int), Common) ;
     Numeric->Offi = KLU_malloc (nzoff1, sizeof (Int), Common) ;

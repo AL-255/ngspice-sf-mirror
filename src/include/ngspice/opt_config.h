@@ -54,4 +54,22 @@
 #  define NGSPICE_OPT_ZEN4 0
 #endif
 
+#ifndef NGSPICE_OPT_APPLE
+#  ifdef CONFIG_OPT_APPLE
+#    define NGSPICE_OPT_APPLE CONFIG_OPT_APPLE
+#  elif defined(__aarch64__) && defined(__ARM_NEON)
+#    define NGSPICE_OPT_APPLE 1
+#  else
+#    define NGSPICE_OPT_APPLE 0
+#  endif
+#endif
+
+/* Safety: Apple Silicon / ARM64 NEON kernels require AArch64 NEON support */
+#if NGSPICE_OPT_APPLE && !(defined(__aarch64__) && defined(__ARM_NEON))
+#  undef NGSPICE_OPT_APPLE
+#  define NGSPICE_OPT_APPLE 0
+#endif
+
+#define NGSPICE_OPT_BSIM4_SIMD (NGSPICE_OPT_ZEN4 || NGSPICE_OPT_APPLE)
+
 #endif /* NGSPICE_OPT_CONFIG_H */

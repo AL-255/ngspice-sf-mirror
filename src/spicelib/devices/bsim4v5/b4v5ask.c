@@ -32,7 +32,7 @@ BSIM4v5instance *here = (BSIM4v5instance*)inst;
 
     NG_IGNORE(select);
 
-#if NGSPICE_OPT_ZEN4
+#if NGSPICE_OPT_BSIM4_SIMD
     if (ckt && (ckt->CKTmode & MODETRAN))
         BSIM4v5AvxNeedAosSync = 1;
 #endif

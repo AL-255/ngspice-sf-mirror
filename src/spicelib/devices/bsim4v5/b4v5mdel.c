@@ -25,11 +25,13 @@ BSIM4v5mDelete(GENmodel *gen_model)
 #ifdef KLU
     FREE(model->BSIM4v5KluOffArr);
 #endif
-#if NGSPICE_OPT_ZEN4
+#if NGSPICE_OPT_BSIM4_SIMD
     free(model->BSIM4v5AvxBlocks);
     model->BSIM4v5AvxBlocks = NULL;
     free(model->BSIM4v5AvxDyn);
     model->BSIM4v5AvxDyn = NULL;
+    free(model->BSIM4v5AvxL2);
+    model->BSIM4v5AvxL2 = NULL;
     model->BSIM4v5AvxDynValid = 0;
     FREE(model->BSIM4v5AvxFallbackIdx);
     model->BSIM4v5AvxBuilt = 0;

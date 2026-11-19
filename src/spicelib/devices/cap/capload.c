@@ -28,6 +28,11 @@ CAPmDelete(GENmodel *inModel)
 {
     CAPmodel *model = (CAPmodel *)inModel;
     FREE(model->CAPfastArr);
+#if NGSPICE_OPT_APPLE
+    FREE(model->CAPhotArr);
+    FREE(model->CAPceqCache);
+    model->CAPcacheValid = 0;
+#endif
     model->CAPfastCount = 0;
     model->CAPfastVer = 0;
     model->CAPfastKluAxBase = NULL;
@@ -73,15 +78,24 @@ CAPensureFastCache(GENmodel *inModel, CKTcircuit *ckt)
             count++;
     }
     FREE(head->CAPfastArr);
+#if NGSPICE_OPT_APPLE
+    FREE(head->CAPhotArr);
+    FREE(head->CAPceqCache);
+    head->CAPcacheValid = 0;
+#endif
     head->CAPfastCount = count;
     if (count > 0) {
         head->CAPfastArr = TMALLOC(CAPfastEntry, count);
+#if NGSPICE_OPT_APPLE
+        head->CAPhotArr = TMALLOC(CAPhotEntry, count);
+        head->CAPceqCache = TMALLOC(double, count);
+#endif
         uintptr_t ax_addr = (uintptr_t)ax;
         size_t ax_bytes = (size_t)nz * sizeof(double);
         int k = 0;
         for (m = head; m != NULL; m = CAPnextModel(m)) {
             for (here = CAPinstances(m); here != NULL; here = CAPnextInstance(here)) {
-                CAPfastEntry *e = &head->CAPfastArr[k++];
+                CAPfastEntry *e = &head->CAPfastArr[k];
                 e->capac = here->CAPcapac;
                 e->m = here->CAPm;
                 e->posNode = here->CAPposNode;
@@ -99,6 +113,14 @@ CAPensureFastCache(GENmodel *inModel, CKTcircuit *ckt)
                 } else {
                     e->offPP = e->offNN = e->offPN = e->offNP = 0;
                 }
+#if NGSPICE_OPT_APPLE
+                CAPhotEntry *he = &head->CAPhotArr[k];
+                he->capac = here->CAPcapac;
+                he->posNode = here->CAPposNode;
+                he->negNode = here->CAPnegNode;
+                he->qcap = here->CAPqcap;
+#endif
+                k++;
             }
         }
     }
@@ -123,6 +145,120 @@ CAPkluPrep(GENmodel *inModel, CKTcircuit *ckt)
     CAPensureFastCache(inModel, ckt);
     if (!head->CAPfastKluAxBase || head->CAPfastKluNz == 0)
         return 0;
+#if NGSPICE_OPT_APPLE
+    {
+        KLUmatrix *km = ckt->CKTmatrix->SMPkluMatrix;
+        int nz = (int)km->KLUmatrixNZ;
+        int n = head->CAPfastCount;
+        if (n > 0 && head->CAPhotArr && head->CAPceqCache) {
+            /* 1. Pre-bake constant unit-capacitance KLU matrix once per topology/version */
+            if (!km->KLUmatrixCapUnitValid || km->KLUmatrixCapVersion != head->CAPfastVer ||
+                !km->KLUmatrixAxCapUnit)
+            {
+                free(km->KLUmatrixAxCapUnit);
+                km->KLUmatrixAxCapUnit = NULL;
+                if (posix_memalign((void **)&km->KLUmatrixAxCapUnit, 128,
+                                   ((size_t)nz + 1) * sizeof(double)) == 0)
+                {
+                    double * restrict cu = km->KLUmatrixAxCapUnit;
+                    memset(cu, 0, ((size_t)nz + 1) * sizeof(double));
+                    const CAPfastEntry * restrict arr = head->CAPfastArr;
+                    for (int k = 0; k < n; k++) {
+                        double mc = arr[k].m * arr[k].capac;
+                        cu[arr[k].offPP] += mc;
+                        cu[arr[k].offNN] += mc;
+                        cu[arr[k].offPN] -= mc;
+                        cu[arr[k].offNP] -= mc;
+                    }
+                    km->KLUmatrixCapUnitValid = 1;
+                    km->KLUmatrixCapVersion = head->CAPfastVer;
+                    km->KLUmatrixResCapValid = 0;
+                    head->CAPcacheValid = 0;
+                    km->KLUmatrixRhsCapValid = 0;
+                }
+            }
+            /* 2. Per-timestep cached CAP ceq[] and RHS contribution (independent of Newton vcap!) */
+            if (km->KLUmatrixCapUnitValid && km->KLUmatrixAxCapUnit) {
+                int rhs_len = (int)km->KLUmatrixNrhs + 1;
+                if (rhs_len < ckt->CKTmaxEqNum + 1)
+                    rhs_len = ckt->CKTmaxEqNum + 1;
+                if (km->KLUmatrixRhsCapLen < rhs_len || !km->KLUmatrixRhsCapCache) {
+                    free(km->KLUmatrixRhsCapCache);
+                    km->KLUmatrixRhsCapCache = NULL;
+                    km->KLUmatrixRhsCapLen = 0;
+                    km->KLUmatrixRhsCapValid = 0;
+                    head->CAPcacheValid = 0;
+                    if (posix_memalign((void **)&km->KLUmatrixRhsCapCache, 128,
+                                       (size_t)rhs_len * sizeof(double)) == 0)
+                    {
+                        km->KLUmatrixRhsCapLen = rhs_len;
+                    }
+                }
+                if (km->KLUmatrixRhsCapCache) {
+                    double ag0 = ckt->CKTag[0];
+                    double ag1 = ckt->CKTag[1];
+                    double ag2 = ckt->CKTag[2];
+                    const double * restrict s1 = ckt->CKTstate1;
+                    const double * restrict s2 = ckt->CKTstate2;
+                    int is_gear2 = (ckt->CKTintegrateMethod == GEAR && ckt->CKTorder == 2);
+                    int is_trap2 = (ckt->CKTintegrateMethod == TRAPEZOIDAL && ckt->CKTorder == 2);
+                    int int_mode = is_gear2 ? 2 : (is_trap2 ? 1 : 0);
+
+                    if (!head->CAPcacheValid || !km->KLUmatrixRhsCapValid ||
+                        head->CAPcacheTime != ckt->CKTtime ||
+                        head->CAPcacheAg0 != ag0 || head->CAPcacheAg1 != ag1 ||
+                        head->CAPcacheAg2 != ag2 ||
+                        head->CAPcacheS1 != s1 || head->CAPcacheS2 != s2 ||
+                        head->CAPcacheIntMode != int_mode)
+                    {
+                        double * restrict rhs_c = km->KLUmatrixRhsCapCache;
+                        double * restrict ceq_c = head->CAPceqCache;
+                        const CAPfastEntry * restrict arr = head->CAPfastArr;
+                        memset(rhs_c, 0, (size_t)rhs_len * sizeof(double));
+                        if (is_gear2) {
+                            for (int k = 0; k < n; k++) {
+                                int qidx = arr[k].qcap;
+                                double ceq = ag2 * s2[qidx] + ag1 * s1[qidx];
+                                ceq_c[k] = ceq;
+                                double mceq = arr[k].m * ceq;
+                                rhs_c[arr[k].posNode] -= mceq;
+                                rhs_c[arr[k].negNode] += mceq;
+                            }
+                        } else if (is_trap2) {
+                            for (int k = 0; k < n; k++) {
+                                int qidx = arr[k].qcap;
+                                double ceq = -s1[qidx + 1] * ag1 - ag0 * s1[qidx];
+                                ceq_c[k] = ceq;
+                                double mceq = arr[k].m * ceq;
+                                rhs_c[arr[k].posNode] -= mceq;
+                                rhs_c[arr[k].negNode] += mceq;
+                            }
+                        } else {
+                            for (int k = 0; k < n; k++) {
+                                int qidx = arr[k].qcap;
+                                double ceq = ag1 * s1[qidx];
+                                ceq_c[k] = ceq;
+                                double mceq = arr[k].m * ceq;
+                                rhs_c[arr[k].posNode] -= mceq;
+                                rhs_c[arr[k].negNode] += mceq;
+                            }
+                        }
+                        head->CAPcacheTime = ckt->CKTtime;
+                        head->CAPcacheAg0 = ag0;
+                        head->CAPcacheAg1 = ag1;
+                        head->CAPcacheAg2 = ag2;
+                        head->CAPcacheS1 = s1;
+                        head->CAPcacheS2 = s2;
+                        head->CAPcacheIntMode = int_mode;
+                        head->CAPcacheValid = 1;
+                        km->KLUmatrixRhsCapValid = 1;
+                    }
+                    return 3;
+                }
+            }
+        }
+    }
+#endif
     return 1;
 }
 
@@ -184,6 +320,64 @@ CAPloadKluPar(GENmodel *inModel, CKTcircuit *ckt, double *my_ax, double *my_rhs)
     int is_init_pred = (ckt->CKTmode & MODEINITPRED) != 0;
     int is_gear2 = (ckt->CKTintegrateMethod == GEAR && ckt->CKTorder == 2);
     int is_trap2 = (ckt->CKTintegrateMethod == TRAPEZOIDAL && ckt->CKTorder == 2);
+
+#if NGSPICE_OPT_APPLE
+    {
+        KLUmatrix *km = ckt->CKTmatrix->SMPkluMatrix;
+        if (km && km->KLUmatrixCapUnitValid && km->KLUmatrixRhsCapValid && head->CAPcacheValid) {
+            const CAPhotEntry * restrict hot = head->CAPhotArr;
+            const double * restrict ceq_c = head->CAPceqCache;
+#ifdef USE_OMP
+            if (omp_in_parallel()) {
+                #pragma omp for schedule(static) nowait
+                for (int k = 0; k < n; k++) {
+                    int qidx = hot[k].qcap;
+                    double q0;
+#ifndef PREDICTOR
+                    if (is_init_pred) {
+                        q0 = s1[qidx];
+                        s0[qidx] = q0;
+                        s0[qidx + 1] = is_trap2 ? (-s1[qidx + 1] * ag1) : (ceq_c[k] + ag0 * q0);
+                    } else
+#endif
+                    {
+                        q0 = hot[k].capac * (rhsOld[hot[k].posNode] - rhsOld[hot[k].negNode]);
+                        s0[qidx] = q0;
+                        s0[qidx + 1] = ceq_c[k] + ag0 * q0;
+                    }
+                }
+                return OK;
+            }
+#endif
+#ifndef PREDICTOR
+            if (is_init_pred) {
+                if (is_trap2) {
+                    for (int k = 0; k < n; k++) {
+                        int qidx = hot[k].qcap;
+                        s0[qidx] = s1[qidx];
+                        s0[qidx + 1] = -s1[qidx + 1] * ag1;
+                    }
+                } else {
+                    for (int k = 0; k < n; k++) {
+                        int qidx = hot[k].qcap;
+                        double q0 = s1[qidx];
+                        s0[qidx] = q0;
+                        s0[qidx + 1] = ceq_c[k] + ag0 * q0;
+                    }
+                }
+                return OK;
+            }
+#endif
+            for (int k = 0; k < n; k++) {
+                int qidx = hot[k].qcap;
+                double q0 = hot[k].capac * (rhsOld[hot[k].posNode] - rhsOld[hot[k].negNode]);
+                s0[qidx] = q0;
+                s0[qidx + 1] = ceq_c[k] + ag0 * q0;
+            }
+            return OK;
+        }
+    }
+#endif
 
 #ifdef USE_OMP
     if (omp_in_parallel()) {

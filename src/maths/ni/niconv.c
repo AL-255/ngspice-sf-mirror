@@ -13,6 +13,9 @@ Author: 1985 Thomas L. Quarles
 #include "ngspice/ngspice.h"
 #include "ngspice/cktdefs.h"
 #include "ngspice/smpdefs.h"
+#if NGSPICE_OPT_APPLE
+#include <arm_neon.h>
+#endif
 
 extern bool ft_ngdebug;
 
@@ -60,7 +63,33 @@ NIconvTest(CKTcircuit *ckt)
         double voltTol = ckt->CKTvoltTol;
         double abstol = ckt->CKTabstol;
 
-        for (i = 1; i <= size; i++) {
+        i = 1;
+#if NGSPICE_OPT_APPLE
+        {
+            const float64x2_t vrel = vdupq_n_f64(reltol);
+            const float64x2_t vvt  = vdupq_n_f64(voltTol);
+            const float64x2_t vat  = vdupq_n_f64(abstol);
+            for (; i + 1 <= size; i += 2) {
+                float64x2_t vn = vld1q_f64(rhs + i);
+                float64x2_t vo = vld1q_f64(rhsOld + i);
+                float64x2_t abs_t;
+                if ((isVolt[i] & isVolt[i + 1]) != 0) {
+                    abs_t = vvt;
+                } else {
+                    abs_t = (float64x2_t){ isVolt[i] ? voltTol : abstol,
+                                           isVolt[i + 1] ? voltTol : abstol };
+                }
+                float64x2_t mx = vmaxq_f64(vabsq_f64(vo), vabsq_f64(vn));
+                float64x2_t vtol = vfmaq_f64(abs_t, vrel, mx);
+                float64x2_t diff = vabsq_f64(vsubq_f64(vn, vo));
+                uint64x2_t ok_m = vcleq_f64(diff, vtol);
+                if (vminvq_u32(vreinterpretq_u32_u64(ok_m)) == 0) {
+                    break; /* Handle exact failing/NaN index in scalar loop below */
+                }
+            }
+        }
+#endif
+        for (; i <= size; i++) {
             new = rhs[i];
             old = rhsOld[i];
             double abs_tol = isVolt[i] ? voltTol : abstol;

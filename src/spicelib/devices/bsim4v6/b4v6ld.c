@@ -115,6 +115,12 @@ static inline int BSIM4v6polyDepletion(double phi, double ngate,double epsgate, 
 #include "ngspice/bsim4_avx512_glue.h"
 #undef B4P
 #undef B4_IS_V6
+#elif NGSPICE_OPT_APPLE
+#define B4P(x) BSIM4v6##x
+#define B4_IS_V6 1
+#include "ngspice/bsim4_neon_glue.h"
+#undef B4P
+#undef B4_IS_V6
 #endif
 
 #if defined(KLU) && defined(USE_OMP)
@@ -197,7 +203,7 @@ BSIM4v6kluPrep(GENmodel *inModel, CKTcircuit *ckt)
         head->BSIM4v6KluAxBase = ax;
         head->BSIM4v6KluNz = nz;
     }
-#if NGSPICE_OPT_ZEN4
+#if NGSPICE_OPT_BSIM4_SIMD
     if (head->BSIM4v6KluAll4Term && BSIM4v6isAvxEligibleTran(ckt)) {
         BSIM4v6ensureAvxPack(head, ckt);
         BSIM4v6syncAvxDynFromInst(head);
@@ -242,6 +248,41 @@ BSIM4v6loadKluPar(GENmodel *inModel, CKTcircuit *ckt, double *my_ax, double *my_
         }
         for (int bi = 0; bi < nBlocks; bi++) {
             BSIM4v6evalAvxBlock(&blocks[bi], &dyn[bi], InstArray, ckt, my_ax, my_rhs, 0);
+        }
+        for (int fi = 0; fi < nFb; fi++) {
+            int idx = fbIdx[fi];
+            int local_error = BSIM4v6LoadOMP_core(InstArray[idx], ckt, my_ax, my_rhs, &koffArr[idx]);
+            if (local_error)
+                error = local_error;
+        }
+        return error;
+    }
+#elif NGSPICE_OPT_APPLE
+    if (head->BSIM4v6AvxBuilt && BSIM4v6isAvxEligibleTran(ckt)) {
+        const BSIM4NeonConst *consts = (const BSIM4NeonConst *)head->BSIM4v6AvxBlocks;
+        BSIM4NeonHot *hots = (BSIM4NeonHot *)head->BSIM4v6AvxDyn;
+        BSIM4NeonL2 *l2s = (BSIM4NeonL2 *)head->BSIM4v6AvxL2;
+        int nBlocks = head->BSIM4v6AvxBlockCount;
+        const int *fbIdx = head->BSIM4v6AvxFallbackIdx;
+        int nFb = head->BSIM4v6AvxFallbackCount;
+        if (omp_in_parallel()) {
+            #pragma omp for schedule(static) nowait
+            for (int bi = 0; bi < nBlocks; bi++) {
+                BSIM4v6evalNeonBlock(&consts[bi], &hots[bi], &l2s[bi], InstArray, ckt, my_ax, my_rhs, 0);
+            }
+            if (nFb > 0) {
+                #pragma omp for schedule(static) nowait
+                for (int fi = 0; fi < nFb; fi++) {
+                    int idx = fbIdx[fi];
+                    int local_error = BSIM4v6LoadOMP_core(InstArray[idx], ckt, my_ax, my_rhs, &koffArr[idx]);
+                    if (local_error)
+                        error = local_error;
+                }
+            }
+            return error;
+        }
+        for (int bi = 0; bi < nBlocks; bi++) {
+            BSIM4v6evalNeonBlock(&consts[bi], &hots[bi], &l2s[bi], InstArray, ckt, my_ax, my_rhs, 0);
         }
         for (int fi = 0; fi < nFb; fi++) {
             int idx = fbIdx[fi];
@@ -303,6 +344,39 @@ CKTcircuit *ckt)
         #pragma omp parallel for schedule(static) if(omp_get_max_threads() > 1)
         for (int bi = 0; bi < nBlocks; bi++) {
             BSIM4v6evalAvxBlock(&blocks[bi], &dyn[bi], InstArray, ckt, NULL, NULL, 2);
+        }
+        if (nFb > 0) {
+            #pragma omp parallel for schedule(static) if(omp_get_max_threads() > 1)
+            for (int fi = 0; fi < nFb; fi++) {
+                int local_error = BSIM4v6LoadOMP_core(InstArray[fbIdx[fi]], ckt, NULL, NULL, NULL);
+                if (local_error)
+                    error = local_error;
+            }
+        }
+        BSIM4v6LoadRhsMat(inModel, ckt);
+        return error;
+    }
+    model->BSIM4v6AvxDynValid = 0;
+#elif NGSPICE_OPT_APPLE
+    if (BSIM4v6isAvxEligibleTran(ckt)) {
+        BSIM4v6ensureAvxPack(model, ckt);
+        BSIM4v6syncAvxDynFromInst(model);
+        const BSIM4NeonConst *consts = (const BSIM4NeonConst *)model->BSIM4v6AvxBlocks;
+        BSIM4NeonHot *hots = (BSIM4NeonHot *)model->BSIM4v6AvxDyn;
+        BSIM4NeonL2 *l2s = (BSIM4NeonL2 *)model->BSIM4v6AvxL2;
+        int nBlocks = model->BSIM4v6AvxBlockCount;
+        const int *fbIdx = model->BSIM4v6AvxFallbackIdx;
+        int nFb = model->BSIM4v6AvxFallbackCount;
+        if (omp_get_max_threads() == 1 && nFb == 0) {
+            double *rhs = ckt->CKTrhs;
+            for (int bi = 0; bi < nBlocks; bi++) {
+                BSIM4v6evalNeonBlock(&consts[bi], &hots[bi], &l2s[bi], InstArray, ckt, NULL, rhs, 1);
+            }
+            return OK;
+        }
+        #pragma omp parallel for schedule(static) if(omp_get_max_threads() > 1)
+        for (int bi = 0; bi < nBlocks; bi++) {
+            BSIM4v6evalNeonBlock(&consts[bi], &hots[bi], &l2s[bi], InstArray, ckt, NULL, NULL, 2);
         }
         if (nFb > 0) {
             #pragma omp parallel for schedule(static) if(omp_get_max_threads() > 1)
