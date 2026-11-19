@@ -14,6 +14,7 @@ All optimizations are cleanly separated into two independent compile-time flags 
 |---|---|---|---|
 | `NGSPICE_OPT_GENERAL` | `--enable-opt-general` / `--disable-opt-general` | `1` (enabled) | **100% portable C99 / OpenMP** (zero ISA intrinsics — works on x86-64, ARM64/Apple Silicon, RISC-V, etc.): O(1) `INPgetModBin` bin index, `--precompile`/`.uselib` PDK caching, unified KLU TLS parallel load, pre-baked RES, flat CAP & fast `CAPtrunc`, KLU refactor lazy scatter-map + branchless scaling + alias-free 4× unroll, Sparse slab-linear `spClear` & `spFactor` zero-skip, `CKTterr` precomputed weights, `NIconvTest` flat byte cache, `OldCKTstate0` guard, BSIM4v5/v6 scalar fast-paths. |
 | `NGSPICE_OPT_ZEN4` | `--enable-opt-zen4` / `--disable-opt-zen4` | `auto` (`1` iff `__AVX512F__ && __GNUC__`, else `0`) | **AMD Zen 4 / AVX-512 SIMD kernels** (`bsim4_avx512_core.h`, `bsim4_avx512_glue.h`): 8-wide AVX-512 SoA BSIM4v5/v6 evaluator, inline Zen 4 `vrndscalepd`/`vscalefpd`/`vgetexppd`/`vgetmantpd` `exp`/`log` (≤2 ULP), 8-wide trap-assisted tunneling, model-sorted packing, 8-wide AVX-512 `fetlim`/`limvds`/`pnjlim`, `convTestAvx`, `truncAvx`, and two-level stationary-voltage block cache with exact first-order Taylor charge sync. |
+| `NGSPICE_OPT_APPLE` | `--enable-opt-apple` / `--disable-opt-apple` | `auto` (`1` iff `__aarch64__ && __ARM_NEON`, else `0`) | **Apple Silicon (ARM64 NEON) optimizations** (`bsim4_apple_core.h`, `bsim4_apple_glue.h`, KLU, Sparse, `nghash`/`numparam`, `niconv`): 3-phase 4-wide (`2× float64x2_t`) NEON BSIM4v5/v6 kernel shared across both models, deduplicated L1D-resident scalar `BSIM4ApplePParam` table, 128B cache-line `BSIM4AppleCheck` with `W=1` stationary bypass + dynamic miss compaction + zero-`s1`/`s2` algebraic L1 charge sync, zero-division KLU solve (`invUdiag`/`invRs_perm`) & unsigned `GET_POINTER`, pre-baked constant CAP base, flat contiguous CSC Sparse refactor/solve fast path, fast power-of-two in-place-resize `nghash` & zero-copy `numparam` subcircuit parameter swap-merge. |
 
 Both flags can also be overridden directly via `CFLAGS` (e.g. `CFLAGS="-O3 -DNGSPICE_OPT_GENERAL=1 -DNGSPICE_OPT_ZEN4=0"`). Building with `--enable-opt-general --disable-opt-zen4 CFLAGS="-O3 -march=x86-64 -mno-avx512f"` is verified to emit **0** `%zmm` instructions.
 
@@ -143,3 +144,40 @@ Precompiling the full GF180 typical PDK (`design.ngspice` + `sm141064.ngspice` c
   1. Default Zen 4 (`NGSPICE_OPT_GENERAL=1, NGSPICE_OPT_ZEN4=1`)
   2. Portable General-Only (`NGSPICE_OPT_GENERAL=1, NGSPICE_OPT_ZEN4=0`, `-march=x86-64 -mno-avx512f`, 0 `%zmm` instructions)
   3. Stock-Equivalent (`NGSPICE_OPT_GENERAL=0, NGSPICE_OPT_ZEN4=0`, `-march=x86-64 -mno-avx512f`)
+
+---
+
+## Apple Silicon Optimizations (`opt/apple-silicon-transient` — `NGSPICE_OPT_APPLE`)
+
+**Branch:** `opt/apple-silicon-transient` (based on `opt/zen4-transient` @ `53747dbda`, preserving `NGSPICE_OPT_GENERAL` + `NGSPICE_OPT_ZEN4` alongside `--enable-opt-apple`)
+**Reference Host:** Apple M6 (`arm64`, 2 Super + 4 Performance + 6 Efficiency cores; Super core: 192 KiB L1I, 128 KiB L1D, 20 MiB L2, 128-byte cache lines; Apple Clang 21.0.0)
+**Numerical Policy:** Strict IEEE-754 double precision throughout — **no `-ffast-math`**, verified 100% PASS against golden `.raw` waveforms (`compare_raw.py`) and built-in `tests/bsim4` (`nmos/qaSpec`, `pmos/qaSpec`).
+
+### Hardware & Workload Profiling Findings (Apple M6)
+1. **NEON FP64 vs SME2 Streaming SVE:** Hardware microbenchmarking on M6 Super core measured NEON FP64 at **27.9 GFMA/s (55.7 GFLOP/s)** (`fdiv.2d` 8.90 Gdiv/s, `fsqrt.2d` 4.61 Gsqrt/s) vs SME2 Streaming SVE (`SVL=512b`, `FEAT_SME_F64F64`) at only **8.8 GFMA/s** (3.2× slower) without `FEAT_SME_FA64` (`svdiv`/`svsqrt` raise `SIGILL`). NEON FP64 is strictly superior for BSIM4.
+2. **4-Wide (`2× float64x2_t`) 3-Phase Kernel:** Splitting BSIM4 into 3 `noinline` phases (`vth/mob`, `ids/diode`, `cv/jct`) at `B4A_W = 4` keeps M6's 4 FP64 NEON pipes saturated across serial dependency chains (measured **1.27× faster per transistor** than `W=2`) while staying well inside M6's 128 KiB L1D and 192 KiB L1I.
+3. **Massive `pParam` Redundancy:** Across the 4 GF180 circuits (789–16,680 MOSFETs), there are only **49–147 unique `(model, pParam, channel)` parameter sets** (16×–113× sharing), fitting completely in L1D as scalar structs (`54–160 KiB`) instead of duplicated per-block SIMD parameter arrays (`11–22 MiB`).
+4. **Per-Instance (`W=1`) Bypass & Compaction:** Checking stationary bypass per transistor (`W=1`) over exact 128-byte (1 M6 cache line) `BSIM4AppleCheck` structs raises bypass hit rates by +6.5% to +11.2% over static `W=4` blocks (`ti12_full`: 63.4% -> 71.6%, `sar12`: 51.7% -> 62.9%), eliminating 18%–23% of full physics evaluations.
+5. **128 KiB L1D Discipline:** A/B profiling proved that per-model KLU shadow delta-stamping buffers (`2 × 112 KiB` on `sar12`) evicted `my_ax` from M6's 128 KiB L1D and regressed `sar12` load by 0.39 s; removing them and computing L1 charge sync algebraically via `cq = base_cq + ag0 * dq` (zero `s1`/`s2` loads) restored full L1D residency.
+
+### Summary of Apple M6 Single-Core Speedups (vs Stock `ngspice-47` & Zen 4 AVX-512)
+
+| Deck | Solver | Stock `ngspice-47` (M6) | `opt/zen4` Portable (M6) | **`opt/apple` PGO+LTO (M6, std)** | **`opt/apple` + `.uselib` (M6)** | Speedup vs Stock M6 | Ref: Zen 4 AVX-512 (7940HX std) | Accuracy vs Golden |
+|---|---|---:|---:|---:|---:|---:|---:|---|
+| `sdm16_probe_8cyc` | **KLU 1c** | 2.97 s | 2.34 s | **1.53 s** | **1.50 s** | **1.94×** (1.98×) | 1.91 s | `rel_rms = 4.63e-09` |
+| | **Sparse 1c** | 4.48 s | 3.51 s | **1.74 s** | **1.71 s** | **2.57×** (2.62×) | 3.67 s | `rel_rms = 6.00e-10` |
+| `pll1p2g_probe_20ns` | **KLU 1c** | 4.37 s | 3.42 s | **1.17 s** | **1.09 s** | **3.74×** (4.01×) | 1.52 s | `rel_rms = 1.30e-05` |
+| | **Sparse 1c** | 4.55 s | 3.53 s | **1.26 s** | **1.18 s** | **3.61×** (3.86×) | 1.83 s | `rel_rms = 1.30e-05` |
+| `ti12_full_probe_30ns` | **KLU 1c** | 21.48 s | 14.01 s | **3.67 s** | **3.34 s** | **5.85×** (6.43×) | 9.09 s | `rel_rms = 2.25e-06` |
+| | **Sparse 1c** | 24.12 s | 16.00 s | **5.86 s** | **5.13 s** | **4.12×** (4.70×) | 13.97 s | `rel_rms = 2.25e-06` |
+| `sar12_probe_2cyc` | **KLU 1c** | 32.95 s | 24.35 s | **7.50 s** | **7.37 s** | **4.39×** (4.47×) | 9.17 s | `2/2` exact, EOC Δt `76.4 ps` |
+| | **Sparse 1c** | 42.23 s | 31.28 s | **10.03 s** | **9.79 s** | **4.21×** (4.31×) | 20.15 s | `2/2` exact, EOC Δt `30.4 ps` |
+| **`sar12_hero_16cyc`** | **KLU 1c** | — | — | **58.30 s** | — | — | 69.40 s | `16/16` exact, EOC Δt `94.7 ps` |
+| | **Sparse 1c** | — | — | **73.47 s** | — | — | 143.92 s | `16/16` exact, EOC Δt `110.5 ps` |
+
+### Apple Silicon Stage Log (`NGSPICE_OPT_APPLE`)
+- **Stage A (`4b88f4748`):** `--enable-opt-apple` / `NGSPICE_OPT_APPLE` build plumbing; zero-division KLU `klu_solve` (`invUdiag` + `invRs_perm` cached in `klu_refactor`, inlined `L`+`U` solve for `nr==1`, zero-copy identity `SMPsolve`); pre-baked constant `KLUmatrixAxCapUnit` + per-timestep cached `KLUmatrixAxResCapBase`; 2-wide NEON `NIconvTest`.
+- **Stage B (`f6f8c7725`):** Ground-up Apple Silicon BSIM4v5/v6 redesign (`bsim4_apple_core.h`, `bsim4_apple_glue.h`): single compiled kernel shared by v5 & v6, 3-phase `B4A_W=4` (`2× float64x2_t`) NEON evaluator with inline polynomial `exp`/`log`, deduplicated L1D-resident scalar `BSIM4ApplePParam` table with predictable scalar feature branches, exact 128B cache-line `BSIM4AppleCheck` + pack-level step validation, and per-instance (`W=1`) L1/L2 bypass with dynamic miss compaction.
+- **Stage C (`eca5fb44c`):** Flat contiguous CSC numeric refactor & solve fast path for Sparse (`spdefs.h`, `spalloc.c`, `spbuild.c`, `spfactor.c`, `spsolve.c`, `sputils.c`): eliminates pointer-chasing linked lists in `spFactor` and `spSolve` (toggleable via `NGSPICE_NO_SPARSE_FLAT=1`), cutting `sar12` Sparse `fac` from `6.06 s -> 1.70 s` (**3.56× faster**) and `slv` from `1.00 s -> 0.28 s` (**3.57× faster**).
+- **Stage D (`2d06a40dc`):** Fast power-of-two FNV-1a `nghash` with cached 32-bit hash pre-filtering and zero-malloc in-place node relinking in `nghash_resize`; stack-buffered `dicostack_pop` and swap-merge `nupa_copy_inst_dico` cutting `ti12_full` parse/setup overhead by 40% (`1.55 s -> 0.93 s`).
+- **Stage E (`0d2e1106b` + Clang 21 PGO):** Algebraic `cq = base_cq + ag0 * dq` L1 charge sync (zero `s1`/`s2` loads), removal of L1D-evicting KLU shadow buffers, unsigned `size_t` shift in KLU `GET_POINTER`, and Apple Clang 21 PGO + ThinLTO (`-O3 -mcpu=native -fno-math-errno -fno-trapping-math -flto=thin -fprofile-instr-use=...`).
