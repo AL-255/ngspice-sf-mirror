@@ -108,6 +108,7 @@ RESupdate_conduct(RESinstance *here, bool spill_warnings)
         here->RESscale = 1;
 
     here->RESconduct = here->RESm / (here->RESresist * factor * here->RESscale);
+    RESbumpVersion();
 
     /* Paolo Nenzi:  AC value */
     if (here->RESacresGiven) {

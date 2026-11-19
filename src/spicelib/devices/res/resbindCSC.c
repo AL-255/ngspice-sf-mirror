@@ -32,6 +32,7 @@ RESbindCSC (GENmodel *inModel, CKTcircuit *ckt)
         }
     }
 
+    RESbumpVersion();
     return (OK) ;
 }
 
@@ -56,6 +57,7 @@ RESbindCSCComplex (GENmodel *inModel, CKTcircuit *ckt)
         }
     }
 
+    RESbumpVersion();
     return (OK) ;
 }
 
@@ -80,5 +82,6 @@ RESbindCSCComplexToReal (GENmodel *inModel, CKTcircuit *ckt)
         }
     }
 
+    RESbumpVersion();
     return (OK) ;
 }

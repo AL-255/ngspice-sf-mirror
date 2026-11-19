@@ -71,6 +71,8 @@ SPICEdev BSIM4v6info = {
     .DEVbindCSC = BSIM4v6bindCSC,
     .DEVbindCSCComplex = BSIM4v6bindCSCComplex,
     .DEVbindCSCComplexToReal = BSIM4v6bindCSCComplexToReal,
+    .DEVkluPrep = BSIM4v6kluPrep,
+    .DEVkluLoadPar = BSIM4v6loadKluPar,
 #endif
 };
 

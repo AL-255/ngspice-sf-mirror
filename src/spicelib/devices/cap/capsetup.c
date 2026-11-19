@@ -117,6 +117,7 @@ do { if((here->ptr = SMPmakeElt(matrix, here->first, here->second)) == NULL){\
             TSTALLOC(CAPnegPosPtr,CAPnegNode,CAPposNode);
         }
     }
+    CAPbumpVersion();
     return(OK);
 }
 

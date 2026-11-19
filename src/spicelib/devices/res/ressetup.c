@@ -75,5 +75,6 @@ do { if((here->ptr = SMPmakeElt(matrix, here->first, here->second)) == NULL){\
             TSTALLOC(RESnegPosPtr, RESnegNode, RESposNode);
         }
     }
+    RESbumpVersion();
     return(OK);
 }

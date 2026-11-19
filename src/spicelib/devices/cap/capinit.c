@@ -43,7 +43,7 @@ SPICEdev CAPinfo = {
     .DEVacLoad = CAPacLoad,
     .DEVaccept = NULL,
     .DEVdestroy = NULL,
-    .DEVmodDelete = NULL,
+    .DEVmodDelete = CAPmDelete,
     .DEVdelete = NULL,
     .DEVsetic = CAPgetic,
     .DEVask = CAPask,
@@ -71,6 +71,8 @@ SPICEdev CAPinfo = {
     .DEVbindCSC = CAPbindCSC,
     .DEVbindCSCComplex = CAPbindCSCComplex,
     .DEVbindCSCComplexToReal = CAPbindCSCComplexToReal,
+    .DEVkluPrep = CAPkluPrep,
+    .DEVkluLoadPar = CAPloadKluPar,
 #endif
 };
 

@@ -81,6 +81,7 @@ CAPmParam(int param, IFvalue *value, GENmodel *inModel)
     default:
         return(E_BADPARM);
     }
+    CAPbumpVersion();
     return(OK);
 }
 

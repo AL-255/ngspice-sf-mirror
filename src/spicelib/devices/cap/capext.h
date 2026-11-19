@@ -20,9 +20,14 @@ extern int CAPsetup(SMPmatrix*,GENmodel*,CKTcircuit*,int*);
 extern int CAPtemp(GENmodel*,CKTcircuit*);
 extern int CAPtrunc(GENmodel*,CKTcircuit*,double*);
 extern int CAPsoaCheck(CKTcircuit *, GENmodel *);
+extern void CAPbumpVersion(void);
+extern int CAPmDelete(GENmodel*);
+extern void CAPensureFastCache(GENmodel*, CKTcircuit*);
 
 #ifdef KLU
 extern int CAPbindCSC (GENmodel*, CKTcircuit*) ;
 extern int CAPbindCSCComplex (GENmodel*, CKTcircuit*) ;
 extern int CAPbindCSCComplexToReal (GENmodel*, CKTcircuit*) ;
+extern int CAPkluPrep (GENmodel*, CKTcircuit*) ;
+extern int CAPloadKluPar (GENmodel*, CKTcircuit*, double*, double*) ;
 #endif

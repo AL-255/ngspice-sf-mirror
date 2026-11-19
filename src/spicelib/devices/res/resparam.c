@@ -98,5 +98,6 @@ RESparam(int param, IFvalue *value, GENinstance *inst, IFvalue *select)
         return(E_BADPARM);
     }
     RESupdate_conduct(here, FALSE);
+    RESbumpVersion();
     return(OK);
 }

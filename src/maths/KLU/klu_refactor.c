@@ -118,12 +118,67 @@ Int KLU_refactor        /* returns TRUE if successful, FALSE otherwise */
     /* check the input matrix compute the row scale factors, Rs */
     /* ---------------------------------------------------------------------- */
 
+    double *invRs = NULL ;
+
     /* do no scale, or check the input matrix, if scale < 0 */
-    if (scale >= 0)
+    if (scale > 0)
     {
-        /* check for out-of-range indices, but do not check for duplicates */
-        if (!KLU_scale (scale, n, Ap, Ai, Ax, Rs, NULL, Common))
+        if (n <= 0 || Ap == NULL || Ai == NULL || Az == NULL || Rs == NULL ||
+            Ap [0] != 0 || Ap [n] < 0)
         {
+            Common->status = KLU_INVALID ;
+            return (FALSE) ;
+        }
+        Int nz = Ap [n] ;
+        for (k = 0 ; k < n ; k++)
+        {
+            Rs [k] = 0.0 ;
+        }
+        if (scale == 1)
+        {
+            for (p = 0 ; p < nz ; p++)
+            {
+                double a ;
+                ABS (a, Az [p]) ;
+                Rs [Ai [p]] += a ;
+            }
+        }
+        else
+        {
+            for (p = 0 ; p < nz ; p++)
+            {
+                double a ;
+                ABS (a, Az [p]) ;
+                Int r = Ai [p] ;
+                if (a > Rs [r])
+                {
+                    Rs [r] = a ;
+                }
+            }
+        }
+        /* Numeric->Xwork has size 4*n Entry's; X[0..n-1] is used for scatter,
+         * and Iwork is unused during refactor, so (double*)(X + n) has >= 3*n doubles. */
+        invRs = (double *) (X + n) ;
+        for (k = 0 ; k < n ; k++)
+        {
+            double rk = Rs [k] ;
+            if (rk == 0.0)
+            {
+                Rs [k] = 1.0 ;
+                invRs [k] = 1.0 ;
+            }
+            else
+            {
+                invRs [k] = 1.0 / rk ;
+            }
+        }
+    }
+    else if (scale == 0)
+    {
+        if (n <= 0 || Ap == NULL || Ai == NULL || Az == NULL ||
+            Ap [0] != 0 || Ap [n] < 0)
+        {
+            Common->status = KLU_INVALID ;
             return (FALSE) ;
         }
     }
@@ -240,11 +295,14 @@ Int KLU_refactor        /* returns TRUE if successful, FALSE otherwise */
                         /* X [j] = 0 */
                         CLEAR (X [j]) ;
                         Ux [up] = ujk ;
-                        GET_POINTER (LU, Lip, Llen, Li, Lx, j, llen) ;
-                        for (p = 0 ; p < llen ; p++)
+                        if (IS_NONZERO (ujk))
                         {
-                            /* X [Li [p]] -= Lx [p] * ujk */
-                            MULT_SUB (X [Li [p]], Lx [p], ujk) ;
+                            GET_POINTER (LU, Lip, Llen, Li, Lx, j, llen) ;
+                            for (p = 0 ; p < llen ; p++)
+                            {
+                                /* X [Li [p]] -= Lx [p] * ujk */
+                                MULT_SUB (X [Li [p]], Lx [p], ujk) ;
+                            }
                         }
                     }
                     /* get the diagonal entry of U */
@@ -270,6 +328,19 @@ Int KLU_refactor        /* returns TRUE if successful, FALSE otherwise */
                     Udiag [k+k1] = ukk ;
                     /* gather and divide by pivot to get kth column of L */
                     GET_POINTER (LU, Lip, Llen, Li, Lx, k, llen) ;
+#ifndef COMPLEX
+                    if (llen > 0 && !IS_ZERO (ukk))
+                    {
+                        double inv_ukk = 1.0 / ukk ;
+                        for (p = 0 ; p < llen ; p++)
+                        {
+                            i = Li [p] ;
+                            Lx [p] = X [i] * inv_ukk ;
+                            X [i] = 0.0 ;
+                        }
+                    }
+                    else
+#endif
                     for (p = 0 ; p < llen ; p++)
                     {
                         i = Li [p] ;
@@ -318,14 +389,24 @@ Int KLU_refactor        /* returns TRUE if successful, FALSE otherwise */
                     {
                         /* entry in off-diagonal block */
                         /* Offx [poff] = Az [p] / Rs [oldrow] */
-                        SCALE_DIV_ASSIGN (Offx [poff], Az [p], Rs [oldrow]) ;
+#ifndef COMPLEX
+                        Offx [poff] = Az [p] * invRs [oldrow] ;
+#else
+                        Offx [poff].Real = Az [p].Real * invRs [oldrow] ;
+                        Offx [poff].Imag = Az [p].Imag * invRs [oldrow] ;
+#endif
                         poff++ ;
                     }
                     else
                     {
                         /* singleton */
                         /* s = Az [p] / Rs [oldrow] */
-                        SCALE_DIV_ASSIGN (s, Az [p], Rs [oldrow]) ;
+#ifndef COMPLEX
+                        s = Az [p] * invRs [oldrow] ;
+#else
+                        s.Real = Az [p].Real * invRs [oldrow] ;
+                        s.Imag = Az [p].Imag * invRs [oldrow] ;
+#endif
                     }
                 }
                 Udiag [k1] = s ;
@@ -361,14 +442,24 @@ Int KLU_refactor        /* returns TRUE if successful, FALSE otherwise */
                         {
                             /* entry in off-diagonal part */
                             /* Offx [poff] = Az [p] / Rs [oldrow] */
-                            SCALE_DIV_ASSIGN (Offx [poff], Az [p], Rs [oldrow]);
+#ifndef COMPLEX
+                            Offx [poff] = Az [p] * invRs [oldrow] ;
+#else
+                            Offx [poff].Real = Az [p].Real * invRs [oldrow] ;
+                            Offx [poff].Imag = Az [p].Imag * invRs [oldrow] ;
+#endif
                             poff++ ;
                         }
                         else
                         {
                             /* (newrow,k) is an entry in the block */
                             /* X [newrow] = Az [p] / Rs [oldrow] */
-                            SCALE_DIV_ASSIGN (X [newrow], Az [p], Rs [oldrow]) ;
+#ifndef COMPLEX
+                            X [newrow] = Az [p] * invRs [oldrow] ;
+#else
+                            X [newrow].Real = Az [p].Real * invRs [oldrow] ;
+                            X [newrow].Imag = Az [p].Imag * invRs [oldrow] ;
+#endif
                         }
                     }
 
@@ -384,11 +475,14 @@ Int KLU_refactor        /* returns TRUE if successful, FALSE otherwise */
                         /* X [j] = 0 */
                         CLEAR (X [j]) ;
                         Ux [up] = ujk ;
-                        GET_POINTER (LU, Lip, Llen, Li, Lx, j, llen) ;
-                        for (p = 0 ; p < llen ; p++)
+                        if (IS_NONZERO (ujk))
                         {
-                            /* X [Li [p]] -= Lx [p] * ujk */
-                            MULT_SUB (X [Li [p]], Lx [p], ujk) ;
+                            GET_POINTER (LU, Lip, Llen, Li, Lx, j, llen) ;
+                            for (p = 0 ; p < llen ; p++)
+                            {
+                                /* X [Li [p]] -= Lx [p] * ujk */
+                                MULT_SUB (X [Li [p]], Lx [p], ujk) ;
+                            }
                         }
                     }
                     /* get the diagonal entry of U */
@@ -414,6 +508,19 @@ Int KLU_refactor        /* returns TRUE if successful, FALSE otherwise */
                     Udiag [k+k1] = ukk ;
                     /* gather and divide by pivot to get kth column of L */
                     GET_POINTER (LU, Lip, Llen, Li, Lx, k, llen) ;
+#ifndef COMPLEX
+                    if (llen > 0 && !IS_ZERO (ukk))
+                    {
+                        double inv_ukk = 1.0 / ukk ;
+                        for (p = 0 ; p < llen ; p++)
+                        {
+                            i = Li [p] ;
+                            Lx [p] = X [i] * inv_ukk ;
+                            X [i] = 0.0 ;
+                        }
+                    }
+                    else
+#endif
                     for (p = 0 ; p < llen ; p++)
                     {
                         i = Li [p] ;

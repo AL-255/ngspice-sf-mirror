@@ -95,6 +95,7 @@ CAPtemp(GENmodel *inModel, CKTcircuit *ckt)
 
         }
     }
+    CAPbumpVersion();
     return(OK);
 }
 

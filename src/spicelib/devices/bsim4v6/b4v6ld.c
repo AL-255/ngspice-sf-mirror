@@ -30,6 +30,10 @@
 #include "ngspice/sperror.h"
 #include "ngspice/devdefs.h"
 #include "ngspice/suffix.h"
+#include <stdint.h>
+#ifdef USE_OMP
+#include <omp.h>
+#endif
 
 /*
 #define MAX_EXP 2.688117142e+43
@@ -90,11 +94,130 @@ b4v6_integrate_fast(CKTcircuit *ckt, double *geq, double *ceq, double cap, int q
 }
 
 #ifdef USE_OMP
+#ifdef KLU
+static int BSIM4v6LoadOMP_core(BSIM4v6instance *here, CKTcircuit *ckt,
+                               double * restrict ax_dst, double * restrict rhs_dst,
+                               const BSIM4v6KluOff * restrict koff);
+#else
+static int BSIM4v6LoadOMP_core(BSIM4v6instance *here, CKTcircuit *ckt,
+                               double * restrict ax_dst, double * restrict rhs_dst,
+                               const void * restrict koff);
+#endif
 int BSIM4v6LoadOMP(BSIM4v6instance *here, CKTcircuit *ckt);
 void BSIM4v6LoadRhsMat(GENmodel *inModel, CKTcircuit *ckt);
 #endif
 
 static inline int BSIM4v6polyDepletion(double phi, double ngate,double epsgate, double coxe, double Vgs, double *Vgs_eff, double *dVgs_eff_dVg);
+
+#if defined(KLU) && defined(USE_OMP)
+static inline int
+b4v6_ptr_to_klu_off(const double *ptr, uintptr_t ax_addr, size_t ax_bytes, int nz)
+{
+    uintptr_t d = (uintptr_t)ptr - ax_addr;
+    if (d < ax_bytes)
+        return (int)(d / sizeof(double));
+    return nz;
+}
+
+int
+BSIM4v6kluPrep(GENmodel *inModel, CKTcircuit *ckt)
+{
+    BSIM4v6model *head = (BSIM4v6model *)inModel;
+    KLUmatrix *km = ckt->CKTmatrix->SMPkluMatrix;
+    if (!km || !km->KLUmatrixAx || km->KLUmatrixNZ == 0 ||
+        km->KLUmatrixIsComplex != KLUmatrixReal || ckt->CKTbypass)
+        return 0;
+
+    double *ax = km->KLUmatrixAx;
+    unsigned int nz = km->KLUmatrixNZ;
+    int count = head->BSIM4v6InstCount;
+    BSIM4v6instance **InstArray = head->BSIM4v6InstanceArray;
+
+    if (head->BSIM4v6KluAxBase != ax || head->BSIM4v6KluNz != nz ||
+        (count > 0 && head->BSIM4v6KluOffArr == NULL))
+    {
+        FREE(head->BSIM4v6KluOffArr);
+        int all4 = 1;
+        for (int idx = 0; idx < count; idx++) {
+            BSIM4v6instance *h = InstArray[idx];
+            BSIM4v6model *m = BSIM4v6modPtr(h);
+            if (h->BSIM4v6rgateMod != 0 || h->BSIM4v6rbodyMod ||
+                m->BSIM4v6rdsMod || h->BSIM4v6trnqsMod) {
+                all4 = 0;
+                break;
+            }
+        }
+        head->BSIM4v6KluAll4Term = all4;
+        if (all4 && count > 0) {
+            head->BSIM4v6KluOffArr = TMALLOC(BSIM4v6KluOff, count);
+            uintptr_t ax_addr = (uintptr_t)ax;
+            size_t ax_bytes = (size_t)nz * sizeof(double);
+            int inz = (int)nz;
+            for (int idx = 0; idx < count; idx++) {
+                BSIM4v6instance *h = InstArray[idx];
+                BSIM4v6KluOff *ko = &head->BSIM4v6KluOffArr[idx];
+                ko->dNodePrime = h->BSIM4v6dNodePrime;
+                ko->gNodePrime = h->BSIM4v6gNodePrime;
+                ko->sNodePrime = h->BSIM4v6sNodePrime;
+                ko->bNodePrime = h->BSIM4v6bNodePrime;
+                ko->hasDint = (h->BSIM4v6dNode != h->BSIM4v6dNodePrime) ? 1 : 0;
+                ko->hasSint = (h->BSIM4v6sNode != h->BSIM4v6sNodePrime) ? 1 : 0;
+                ko->off[0]  = b4v6_ptr_to_klu_off(h->BSIM4v6GPgpPtr, ax_addr, ax_bytes, inz);
+                ko->off[1]  = b4v6_ptr_to_klu_off(h->BSIM4v6GPdpPtr, ax_addr, ax_bytes, inz);
+                ko->off[2]  = b4v6_ptr_to_klu_off(h->BSIM4v6GPspPtr, ax_addr, ax_bytes, inz);
+                ko->off[3]  = b4v6_ptr_to_klu_off(h->BSIM4v6GPbpPtr, ax_addr, ax_bytes, inz);
+                ko->off[4]  = b4v6_ptr_to_klu_off(h->BSIM4v6DPdpPtr, ax_addr, ax_bytes, inz);
+                ko->off[5]  = b4v6_ptr_to_klu_off(h->BSIM4v6DPgpPtr, ax_addr, ax_bytes, inz);
+                ko->off[6]  = b4v6_ptr_to_klu_off(h->BSIM4v6DPspPtr, ax_addr, ax_bytes, inz);
+                ko->off[7]  = b4v6_ptr_to_klu_off(h->BSIM4v6DPbpPtr, ax_addr, ax_bytes, inz);
+                ko->off[8]  = b4v6_ptr_to_klu_off(h->BSIM4v6SPdpPtr, ax_addr, ax_bytes, inz);
+                ko->off[9]  = b4v6_ptr_to_klu_off(h->BSIM4v6SPgpPtr, ax_addr, ax_bytes, inz);
+                ko->off[10] = b4v6_ptr_to_klu_off(h->BSIM4v6SPspPtr, ax_addr, ax_bytes, inz);
+                ko->off[11] = b4v6_ptr_to_klu_off(h->BSIM4v6SPbpPtr, ax_addr, ax_bytes, inz);
+                ko->off[12] = b4v6_ptr_to_klu_off(h->BSIM4v6BPdpPtr, ax_addr, ax_bytes, inz);
+                ko->off[13] = b4v6_ptr_to_klu_off(h->BSIM4v6BPgpPtr, ax_addr, ax_bytes, inz);
+                ko->off[14] = b4v6_ptr_to_klu_off(h->BSIM4v6BPspPtr, ax_addr, ax_bytes, inz);
+                ko->off[15] = b4v6_ptr_to_klu_off(h->BSIM4v6BPbpPtr, ax_addr, ax_bytes, inz);
+                ko->off[16] = b4v6_ptr_to_klu_off(h->BSIM4v6DPdPtr,  ax_addr, ax_bytes, inz);
+                ko->off[17] = b4v6_ptr_to_klu_off(h->BSIM4v6DdpPtr,  ax_addr, ax_bytes, inz);
+                ko->off[18] = b4v6_ptr_to_klu_off(h->BSIM4v6DdPtr,   ax_addr, ax_bytes, inz);
+                ko->off[19] = b4v6_ptr_to_klu_off(h->BSIM4v6SPsPtr,  ax_addr, ax_bytes, inz);
+                ko->off[20] = b4v6_ptr_to_klu_off(h->BSIM4v6SspPtr,  ax_addr, ax_bytes, inz);
+                ko->off[21] = b4v6_ptr_to_klu_off(h->BSIM4v6SsPtr,   ax_addr, ax_bytes, inz);
+            }
+        }
+        head->BSIM4v6KluAxBase = ax;
+        head->BSIM4v6KluNz = nz;
+    }
+    return head->BSIM4v6KluAll4Term ? 1 : 0;
+}
+
+int
+BSIM4v6loadKluPar(GENmodel *inModel, CKTcircuit *ckt, double *my_ax, double *my_rhs)
+{
+    BSIM4v6model *head = (BSIM4v6model *)inModel;
+    BSIM4v6instance **InstArray = head->BSIM4v6InstanceArray;
+    const BSIM4v6KluOff *koffArr = head->BSIM4v6KluOffArr;
+    int count = head->BSIM4v6InstCount;
+    int error = 0;
+
+    if (omp_in_parallel()) {
+        #pragma omp for schedule(static) nowait
+        for (int idx = 0; idx < count; idx++) {
+            int local_error = BSIM4v6LoadOMP_core(InstArray[idx], ckt, my_ax, my_rhs, &koffArr[idx]);
+            if (local_error)
+                error = local_error;
+        }
+        return error;
+    }
+    for (int idx = 0; idx < count; idx++) {
+        int local_error = BSIM4v6LoadOMP_core(InstArray[idx], ckt, my_ax, my_rhs, &koffArr[idx]);
+        if (local_error)
+            error = local_error;
+    }
+    return error;
+}
+#endif
 
 int
 BSIM4v6load(
@@ -107,11 +230,38 @@ CKTcircuit *ckt)
     int error = 0;
     BSIM4v6instance **InstArray;
     InstArray = model->BSIM4v6InstanceArray;
+    int count = model->BSIM4v6InstCount;
 
-#pragma omp parallel for
-    for (idx = 0; idx < model->BSIM4v6InstCount; idx++) {
+    if (omp_get_max_threads() == 1 && !ckt->CKTbypass) {
+        if (!model->BSIM4v6All4TermChecked) {
+            int all4 = 1;
+            for (idx = 0; idx < count; idx++) {
+                BSIM4v6instance *h = InstArray[idx];
+                BSIM4v6model *m = BSIM4v6modPtr(h);
+                if (h->BSIM4v6rgateMod != 0 || h->BSIM4v6rbodyMod ||
+                    m->BSIM4v6rdsMod || h->BSIM4v6trnqsMod) {
+                    all4 = 0;
+                    break;
+                }
+            }
+            model->BSIM4v6All4Term = all4;
+            model->BSIM4v6All4TermChecked = 1;
+        }
+        if (model->BSIM4v6All4Term) {
+            double *rhs = ckt->CKTrhs;
+            for (idx = 0; idx < count; idx++) {
+                int local_error = BSIM4v6LoadOMP_core(InstArray[idx], ckt, NULL, rhs, NULL);
+                if (local_error)
+                    error = local_error;
+            }
+            return error;
+        }
+    }
+
+#pragma omp parallel for schedule(static)
+    for (idx = 0; idx < count; idx++) {
         BSIM4v6instance *here = InstArray[idx];
-        int local_error = BSIM4v6LoadOMP(here, ckt);
+        int local_error = BSIM4v6LoadOMP_core(here, ckt, NULL, NULL, NULL);
         if (local_error)
             error = local_error;
     }
@@ -121,8 +271,22 @@ CKTcircuit *ckt)
     return error;
 }
 
+int BSIM4v6LoadOMP(BSIM4v6instance *here, CKTcircuit *ckt)
+{
+    return BSIM4v6LoadOMP_core(here, ckt, NULL, NULL, NULL);
+}
 
-int BSIM4v6LoadOMP(BSIM4v6instance *here, CKTcircuit *ckt) {
+#ifdef KLU
+static int BSIM4v6LoadOMP_core(BSIM4v6instance *here, CKTcircuit *ckt,
+                               double * restrict ax_dst, double * restrict rhs_dst,
+                               const BSIM4v6KluOff * restrict koff) {
+#else
+static int BSIM4v6LoadOMP_core(BSIM4v6instance *here, CKTcircuit *ckt,
+                               double * restrict ax_dst, double * restrict rhs_dst,
+                               const void * restrict koff) {
+    NG_IGNORE(ax_dst);
+    NG_IGNORE(koff);
+#endif
 BSIM4v6model *model = BSIM4v6modPtr(here);
 #else
 BSIM4v6model *model = (BSIM4v6model*)inModel;
@@ -2063,9 +2227,10 @@ for (; model != NULL; model = BSIM4v6nextModel(model))
           T0 = 2 * MM;
           T1 = vs / (pParam->BSIM4v6vtl * pParam->BSIM4v6tfactor);
           if(T1 > 0.0)  
-          {        T2 = 1.0 + exp(T0 * log(T1));
+          {        double s2 = T1 * T1;
+                  T2 = 1.0 + s2 * s2 * s2;
                   T3 = (T2 - 1.0) * T0 / vs; 
-                  Fsevl = 1.0 / exp(log(T2)/ T0);
+                  Fsevl = 1.0 / sqrt(cbrt(T2));
                   dT2_dVg = T3 * dvs_dVg;
                   dT2_dVd = T3 * dvs_dVd;
                   dT2_dVb = T3 * dvs_dVb;
@@ -3842,7 +4007,11 @@ finished:
 
           if ((here->BSIM4v6off == 0) || (!(ckt->CKTmode & MODEINITFIX)))
           {   if (Check == 1)
-              {   ckt->CKTnoncon++;
+              {
+#ifdef USE_OMP
+                  #pragma omp atomic
+#endif
+                  ckt->CKTnoncon++;
 #ifndef NEWCONV
               } 
               else
@@ -4757,6 +4926,130 @@ line900:
               m = here->BSIM4v6m;
 
 #ifdef USE_OMP
+       if (rhs_dst != NULL) {
+           /* Direct 4-terminal stamping (either KLU/TLS via ax_dst+koff, or 1-thread Sparse via here->*Ptr) */
+           double rhsd = m * (ceqjd - ceqbd + ceqgdtot - ceqdrn - ceqqd + Idtoteq);
+           double rhsg = m * (ceqqg - ceqgcrg + Igtoteq);
+           double rhsb = m * (ceqbd + ceqbs - ceqjd - ceqjs - ceqqb + Ibtoteq);
+           double rhss = m * (ceqdrn - ceqbs + ceqjs + ceqqg + ceqqb + ceqqd + ceqqgmid - ceqgstot + Istoteq);
+
+           gjbd = here->BSIM4v6gbd;
+           gjbs = here->BSIM4v6gbs;
+           gdpr = here->BSIM4v6drainConductance;
+           gspr = here->BSIM4v6sourceConductance;
+           T1 = qdef * here->BSIM4v6gtau;
+
+           ggidld = here->BSIM4v6ggidld;
+           ggidlg = here->BSIM4v6ggidlg;
+           ggidlb = here->BSIM4v6ggidlb;
+           ggislg = here->BSIM4v6ggislg;
+           ggisls = here->BSIM4v6ggisls;
+           ggislb = here->BSIM4v6ggislb;
+           double ggidl_sum = ggidlg + ggidld + ggidlb;
+           double ggisl_sum = ggislg + ggisls + ggislb;
+
+           double v34 = m * (gcggb - ggtg + gIgtotg);
+           double v35 = m * (gcgdb - ggtd + gIgtotd);
+           double v36 = m * (gcgsb - ggts + gIgtots);
+           double v37 = m * (gcgbb - ggtb + gIgtotb);
+
+           double v44 = m * (gdpr + here->BSIM4v6gds + gjbd + T1 * ddxpart_dVd
+                             - gdtotd + RevSum + gcddb + gbdpdp + dxpart * ggtd - gIdtotd + ggidld);
+           double v46 = m * (Gm + gcdgb - gdtotg + gbdpg - gIdtotg
+                             + dxpart * ggtg + T1 * ddxpart_dVg + ggidlg);
+           double v47 = m * (here->BSIM4v6gds + gdtots - dxpart * ggts + gIdtots
+                             - T1 * ddxpart_dVs + FwdSum - gcdsb - gbdpsp + ggidl_sum);
+           double v48 = m * (gjbd + gdtotb - Gmbs - gcdbb - gbdpb + gIdtotb
+                             - T1 * ddxpart_dVb - dxpart * ggtb - ggidlb);
+
+           double v51 = m * (here->BSIM4v6gds + gstotd + RevSum - gcsdb - gbspdp
+                             - T1 * dsxpart_dVd - sxpart * ggtd + gIstotd + ggisl_sum);
+           double v52 = m * (gcsgb - Gm - gstotg + gbspg + sxpart * ggtg
+                             + T1 * dsxpart_dVg - gIstotg + ggislg);
+           double v53 = m * (gspr + here->BSIM4v6gds + gjbs + T1 * dsxpart_dVs
+                             - gstots + FwdSum + gcssb + gbspsp + sxpart * ggts - gIstots + ggisls);
+           double v55 = m * (gjbs + gstotb + Gmbs - gcsbb - gbspb - sxpart * ggtb
+                             - T1 * dsxpart_dVb + gIstotb - ggislb);
+
+           double v58 = m * (gcbdb - gjbd + gbbdp - gIbtotd - ggidld + ggisl_sum);
+           double v59 = m * (gcbgb - here->BSIM4v6gbgs - gIbtotg - ggidlg - ggislg);
+           double v60 = m * (gcbsb - gjbs + gbbsp - gIbtots + ggidl_sum - ggisls);
+           double v61 = m * (gjbd + gjbs + gcbbb - here->BSIM4v6gbbs - gIbtotb - ggidlb - ggislb);
+
+#ifdef KLU
+           if (ax_dst != NULL) {
+               rhs_dst[koff->dNodePrime] += rhsd;
+               rhs_dst[koff->gNodePrime] -= rhsg;
+               rhs_dst[koff->bNodePrime] += rhsb;
+               rhs_dst[koff->sNodePrime] += rhss;
+
+               ax_dst[koff->off[0]]  += v34;
+               ax_dst[koff->off[1]]  += v35;
+               ax_dst[koff->off[2]]  += v36;
+               ax_dst[koff->off[3]]  += v37;
+               ax_dst[koff->off[4]]  += v44;
+               ax_dst[koff->off[5]]  += v46;
+               ax_dst[koff->off[6]]  -= v47;
+               ax_dst[koff->off[7]]  -= v48;
+               if (koff->hasDint) {
+                   double mgd = m * gdpr;
+                   ax_dst[koff->off[16]] -= mgd;
+                   ax_dst[koff->off[17]] -= mgd;
+                   ax_dst[koff->off[18]] += mgd;
+               }
+               ax_dst[koff->off[8]]  -= v51;
+               ax_dst[koff->off[9]]  += v52;
+               ax_dst[koff->off[10]] += v53;
+               ax_dst[koff->off[11]] -= v55;
+               if (koff->hasSint) {
+                   double mgs = m * gspr;
+                   ax_dst[koff->off[19]] -= mgs;
+                   ax_dst[koff->off[20]] -= mgs;
+                   ax_dst[koff->off[21]] += mgs;
+               }
+               ax_dst[koff->off[12]] += v58;
+               ax_dst[koff->off[13]] += v59;
+               ax_dst[koff->off[14]] += v60;
+               ax_dst[koff->off[15]] += v61;
+               return OK;
+           }
+#endif
+           rhs_dst[here->BSIM4v6dNodePrime] += rhsd;
+           rhs_dst[here->BSIM4v6gNodePrime] -= rhsg;
+           rhs_dst[here->BSIM4v6bNodePrime] += rhsb;
+           rhs_dst[here->BSIM4v6sNodePrime] += rhss;
+
+           *(here->BSIM4v6GPgpPtr) += v34;
+           *(here->BSIM4v6GPdpPtr) += v35;
+           *(here->BSIM4v6GPspPtr) += v36;
+           *(here->BSIM4v6GPbpPtr) += v37;
+           *(here->BSIM4v6DPdpPtr) += v44;
+           *(here->BSIM4v6DPgpPtr) += v46;
+           *(here->BSIM4v6DPspPtr) -= v47;
+           *(here->BSIM4v6DPbpPtr) -= v48;
+           if (here->BSIM4v6dNode != here->BSIM4v6dNodePrime) {
+               double mgd = m * gdpr;
+               *(here->BSIM4v6DPdPtr) -= mgd;
+               *(here->BSIM4v6DdpPtr) -= mgd;
+               *(here->BSIM4v6DdPtr)  += mgd;
+           }
+           *(here->BSIM4v6SPdpPtr) -= v51;
+           *(here->BSIM4v6SPgpPtr) += v52;
+           *(here->BSIM4v6SPspPtr) += v53;
+           *(here->BSIM4v6SPbpPtr) -= v55;
+           if (here->BSIM4v6sNode != here->BSIM4v6sNodePrime) {
+               double mgs = m * gspr;
+               *(here->BSIM4v6SPsPtr) -= mgs;
+               *(here->BSIM4v6SspPtr) -= mgs;
+               *(here->BSIM4v6SsPtr)  += mgs;
+           }
+           *(here->BSIM4v6BPdpPtr) += v58;
+           *(here->BSIM4v6BPgpPtr) += v59;
+           *(here->BSIM4v6BPspPtr) += v60;
+           *(here->BSIM4v6BPbpPtr) += v61;
+           return OK;
+       }
+
        here->BSIM4v6rhsdPrime = m * (ceqjd - ceqbd + ceqgdtot
                                                     - ceqdrn - ceqqd + Idtoteq);
        here->BSIM4v6rhsgPrime = m * (ceqqg - ceqgcrg + Igtoteq);

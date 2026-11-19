@@ -43,7 +43,7 @@ SPICEdev RESinfo = {
     .DEVacLoad = RESacload,
     .DEVaccept = NULL,
     .DEVdestroy = NULL,
-    .DEVmodDelete = NULL,
+    .DEVmodDelete = RESmDelete,
     .DEVdelete = NULL,
     .DEVsetic = NULL,
     .DEVask = RESask,
@@ -71,6 +71,8 @@ SPICEdev RESinfo = {
     .DEVbindCSC = RESbindCSC,
     .DEVbindCSCComplex = RESbindCSCComplex,
     .DEVbindCSCComplexToReal = RESbindCSCComplexToReal,
+    .DEVkluPrep = RESkluPrep,
+    .DEVkluLoadPar = NULL,
 #endif
 };
 

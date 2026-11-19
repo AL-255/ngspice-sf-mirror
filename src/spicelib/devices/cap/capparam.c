@@ -80,5 +80,6 @@ CAPparam(int param, IFvalue *value, GENinstance *inst, IFvalue *select)
     default:
         return(E_BADPARM);
     }
+    CAPbumpVersion();
     return(OK);
 }

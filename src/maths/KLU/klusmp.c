@@ -148,6 +148,14 @@ void SMPconvertCOOtoCSC (SMPmatrix *Matrix)
 
         /* Allocate Diag Gmin CSC Vector */
         Matrix->SMPkluMatrix->KLUmatrixDiag = NULL ;
+        Matrix->SMPkluMatrix->KLUmatrixAxTls = NULL ;
+        Matrix->SMPkluMatrix->KLUmatrixRhsTls = NULL ;
+        Matrix->SMPkluMatrix->KLUmatrixAxTlsStride = 0 ;
+        Matrix->SMPkluMatrix->KLUmatrixRhsTlsStride = 0 ;
+        Matrix->SMPkluMatrix->KLUmatrixTlsThreads = 0 ;
+        Matrix->SMPkluMatrix->KLUmatrixAxResConst = NULL ;
+        Matrix->SMPkluMatrix->KLUmatrixResConstValid = 0 ;
+        Matrix->SMPkluMatrix->KLUmatrixResVersion = 0 ;
 
         /* Allocate the temporary COO Column Index */
         Ap_COO = NULL ;
@@ -284,7 +292,10 @@ void SMPconvertCOOtoCSC (SMPmatrix *Matrix)
     Matrix->SMPkluMatrix->KLUmatrixAp = (int *) malloc ((Matrix->SMPkluMatrix->KLUmatrixN + 1) * sizeof (int)) ;
     Matrix->SMPkluMatrix->KLUmatrixAi = (int *) malloc (Matrix->SMPkluMatrix->KLUmatrixNZ * sizeof (int)) ;
     Matrix->SMPkluMatrix->KLUmatrixBindStructCOO = (BindElement *) malloc (Matrix->SMPkluMatrix->KLUmatrixLinkedListNZ * sizeof (BindElement)) ;
-    Matrix->SMPkluMatrix->KLUmatrixAx = (double *) malloc (Matrix->SMPkluMatrix->KLUmatrixNZ * sizeof (double)) ;
+    /* +1 extra trailing element serves as a branchless trash sink for ground-node stamps */
+    Matrix->SMPkluMatrix->KLUmatrixAx = (double *) malloc ((Matrix->SMPkluMatrix->KLUmatrixNZ + 1) * sizeof (double)) ;
+    if (Matrix->SMPkluMatrix->KLUmatrixAx)
+        Matrix->SMPkluMatrix->KLUmatrixAx[Matrix->SMPkluMatrix->KLUmatrixNZ] = 0.0 ;
     Matrix->SMPkluMatrix->KLUmatrixAxComplex = (double *) malloc (2 * Matrix->SMPkluMatrix->KLUmatrixNZ * sizeof (double)) ;
     Matrix->SMPkluMatrix->KLUmatrixIntermediate = (double *) malloc (Matrix->SMPkluMatrix->KLUmatrixN * sizeof (double)) ;
     Matrix->SMPkluMatrix->KLUmatrixIntermediateComplex = (double *) malloc (2 * Matrix->SMPkluMatrix->KLUmatrixN * sizeof (double)) ;
@@ -999,8 +1010,8 @@ SMPsolve (SMPmatrix *Matrix, double RHS[], double Spare[])
             }
         }
 
-        for (i = 0 ; i < Matrix->SMPkluMatrix->KLUmatrixNrhs ; i++) {
-            RHS [i] = 0 ;
+        if (Matrix->SMPkluMatrix->KLUmatrixNrhs > 0) {
+            memset (RHS, 0, (size_t)Matrix->SMPkluMatrix->KLUmatrixNrhs * sizeof (double)) ;
         }
 
         for (i = 0 ; i < Matrix->SMPkluMatrix->KLUmatrixN ; i++) {
@@ -1064,6 +1075,53 @@ SMPsolveKLUforCIDER (SMPmatrix *Matrix, double RHS[], double RHSsolution[], doub
 }
 #endif
 
+int
+SMPkluEnsureTls (KLUmatrix *km, int nthreads, int rhs_len)
+{
+    size_t ax_need, rhs_need ;
+
+    if (!km || nthreads <= 0)
+        return 0 ;
+
+    ax_need = ((size_t)km->KLUmatrixNZ + 1 + 7) & ~(size_t)7 ;
+    rhs_need = ((size_t)rhs_len + 1 + 7) & ~(size_t)7 ;
+
+    if (km->KLUmatrixTlsThreads >= nthreads &&
+        km->KLUmatrixAxTlsStride >= ax_need &&
+        km->KLUmatrixRhsTlsStride >= rhs_need &&
+        km->KLUmatrixAxTls != NULL &&
+        km->KLUmatrixRhsTls != NULL)
+    {
+        return 1 ;
+    }
+
+    free (km->KLUmatrixAxTls) ;
+    free (km->KLUmatrixRhsTls) ;
+    km->KLUmatrixAxTls = NULL ;
+    km->KLUmatrixRhsTls = NULL ;
+    km->KLUmatrixTlsThreads = 0 ;
+
+    if (posix_memalign ((void **)&km->KLUmatrixAxTls, 64,
+                        (size_t)nthreads * ax_need * sizeof (double)) != 0)
+        km->KLUmatrixAxTls = NULL ;
+    if (posix_memalign ((void **)&km->KLUmatrixRhsTls, 64,
+                        (size_t)nthreads * rhs_need * sizeof (double)) != 0)
+        km->KLUmatrixRhsTls = NULL ;
+
+    if (!km->KLUmatrixAxTls || !km->KLUmatrixRhsTls) {
+        free (km->KLUmatrixAxTls) ;
+        free (km->KLUmatrixRhsTls) ;
+        km->KLUmatrixAxTls = NULL ;
+        km->KLUmatrixRhsTls = NULL ;
+        return 0 ;
+    }
+
+    km->KLUmatrixAxTlsStride = ax_need ;
+    km->KLUmatrixRhsTlsStride = rhs_need ;
+    km->KLUmatrixTlsThreads = nthreads ;
+    return 1 ;
+}
+
 /*
  * SMPmatSize()
  */
@@ -1107,6 +1165,14 @@ SMPnewMatrix (SMPmatrix *Matrix, int size)
 //        Matrix->SMPkluMatrix->KLUmatrixNodeCollapsingOldToNew = NULL ;
         Matrix->SMPkluMatrix->KLUmatrixNodeCollapsingNewToOld = NULL ;
         Matrix->SMPkluMatrix->KLUmatrixDiag = NULL ;
+        Matrix->SMPkluMatrix->KLUmatrixAxTls = NULL ;
+        Matrix->SMPkluMatrix->KLUmatrixRhsTls = NULL ;
+        Matrix->SMPkluMatrix->KLUmatrixAxTlsStride = 0 ;
+        Matrix->SMPkluMatrix->KLUmatrixRhsTlsStride = 0 ;
+        Matrix->SMPkluMatrix->KLUmatrixTlsThreads = 0 ;
+        Matrix->SMPkluMatrix->KLUmatrixAxResConst = NULL ;
+        Matrix->SMPkluMatrix->KLUmatrixResConstValid = 0 ;
+        Matrix->SMPkluMatrix->KLUmatrixResVersion = 0 ;
 
         /* Initialize the KLU Common Data Structure */
         klu_defaults (Matrix->SMPkluMatrix->KLUmatrixCommon) ;
@@ -1152,6 +1218,14 @@ SMPnewMatrixKLUforCIDER (SMPmatrix *Matrix, int size, unsigned int KLUmatrixIsCo
         Matrix->SMPkluMatrix->KLUmatrixValueComplexCOOforCIDER = NULL ;
 
         Matrix->SMPkluMatrix->KLUmatrixDiag = NULL ;
+        Matrix->SMPkluMatrix->KLUmatrixAxTls = NULL ;
+        Matrix->SMPkluMatrix->KLUmatrixRhsTls = NULL ;
+        Matrix->SMPkluMatrix->KLUmatrixAxTlsStride = 0 ;
+        Matrix->SMPkluMatrix->KLUmatrixRhsTlsStride = 0 ;
+        Matrix->SMPkluMatrix->KLUmatrixTlsThreads = 0 ;
+        Matrix->SMPkluMatrix->KLUmatrixAxResConst = NULL ;
+        Matrix->SMPkluMatrix->KLUmatrixResConstValid = 0 ;
+        Matrix->SMPkluMatrix->KLUmatrixResVersion = 0 ;
 
         /* Initialize the KLU Common Data Structure */
         klu_defaults (Matrix->SMPkluMatrix->KLUmatrixCommon) ;
@@ -1209,6 +1283,9 @@ SMPdestroy (SMPmatrix *Matrix)
         Matrix->SMPkluMatrix->KLUmatrixNodeCollapsingNewToOld = NULL ;
         Matrix->SMPkluMatrix->KLUmatrixTrashCOO = NULL ;
         free (Matrix->SMPkluMatrix->KLUmatrixDiag) ;
+        free (Matrix->SMPkluMatrix->KLUmatrixAxTls) ;
+        free (Matrix->SMPkluMatrix->KLUmatrixRhsTls) ;
+        free (Matrix->SMPkluMatrix->KLUmatrixAxResConst) ;
         free (Matrix->SMPkluMatrix->KLUmatrixCommon) ;
         free (Matrix->SMPkluMatrix) ;
     } else {
@@ -1243,6 +1320,9 @@ SMPdestroyKLUforCIDER (SMPmatrix *Matrix)
         Matrix->SMPkluMatrix->KLUmatrixValueComplexCOOforCIDER = NULL ;
         Matrix->SMPkluMatrix->KLUmatrixTrashCOO = NULL ;
         free (Matrix->SMPkluMatrix->KLUmatrixDiag) ;
+        free (Matrix->SMPkluMatrix->KLUmatrixAxTls) ;
+        free (Matrix->SMPkluMatrix->KLUmatrixRhsTls) ;
+        free (Matrix->SMPkluMatrix->KLUmatrixAxResConst) ;
         free (Matrix->SMPkluMatrix->KLUmatrixCommon) ;
         free (Matrix->SMPkluMatrix) ;
     } else {

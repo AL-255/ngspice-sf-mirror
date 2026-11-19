@@ -24,6 +24,9 @@ BSIM4v6mDelete(GENmodel *gen_model)
 #ifdef USE_OMP
     FREE(model->BSIM4v6InstanceArray);
 #endif
+#ifdef KLU
+    FREE(model->BSIM4v6KluOffArr);
+#endif
 
     struct bsim4v6SizeDependParam *p = model->pSizeDependParamKnot;
     while (p) {

@@ -87,5 +87,6 @@ RESmParam(int param, IFvalue *value, GENmodel *inModel)
     default:
         return(E_BADPARM);
     }
+    RESbumpVersion();
     return(OK);
 }

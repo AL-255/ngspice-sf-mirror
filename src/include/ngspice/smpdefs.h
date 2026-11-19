@@ -41,6 +41,7 @@ typedef struct sSMPmatrix {
 #ifdef KLU
 void spDeterminant_KLU (SMPmatrix *, int *, double *, double *) ;
 void SMPconvertCOOtoCSC (SMPmatrix *) ;
+int  SMPkluEnsureTls (KLUmatrix *, int, int) ;
 
 #ifdef CIDER
 void SMPsolveKLUforCIDER (SMPmatrix *, double [], double [], double [], double []) ;

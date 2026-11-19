@@ -32,4 +32,6 @@ extern int BSIM4v6soaCheck(CKTcircuit *, GENmodel *);
 extern int BSIM4v6bindCSC (GENmodel*, CKTcircuit*) ;
 extern int BSIM4v6bindCSCComplex (GENmodel*, CKTcircuit*) ;
 extern int BSIM4v6bindCSCComplexToReal (GENmodel*, CKTcircuit*) ;
+extern int BSIM4v6kluPrep (GENmodel*, CKTcircuit*) ;
+extern int BSIM4v6loadKluPar (GENmodel*, CKTcircuit*, double*, double*) ;
 #endif

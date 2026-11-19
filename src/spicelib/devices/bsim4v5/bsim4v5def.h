@@ -861,6 +861,18 @@ struct bsim4v5SizeDependParam
 };
 
 
+#ifdef KLU
+typedef struct {
+    int off[22];
+    int dNodePrime;
+    int gNodePrime;
+    int sNodePrime;
+    int bNodePrime;
+    unsigned char hasDint;
+    unsigned char hasSint;
+} BSIM4v5KluOff;
+#endif
+
 typedef struct sBSIM4v5model 
 {
 
@@ -1699,6 +1711,14 @@ typedef struct sBSIM4v5model
 #ifdef USE_OMP
     int BSIM4v5InstCount;
     struct sBSIM4v5instance **BSIM4v5InstanceArray;
+    int BSIM4v5All4TermChecked;
+    int BSIM4v5All4Term;
+#endif
+#ifdef KLU
+    BSIM4v5KluOff *BSIM4v5KluOffArr;
+    double *BSIM4v5KluAxBase;
+    unsigned int BSIM4v5KluNz;
+    int BSIM4v5KluAll4Term;
 #endif
 
     /* Flags */

@@ -10,6 +10,198 @@ Modified: September 2003 Paolo Nenzi
 #include "ngspice/trandefs.h"
 #include "ngspice/sperror.h"
 #include "ngspice/suffix.h"
+#include <stdint.h>
+#ifdef USE_OMP
+#include <omp.h>
+#endif
+
+static unsigned long long cap_global_ver = 1;
+
+void
+CAPbumpVersion(void)
+{
+    cap_global_ver++;
+}
+
+int
+CAPmDelete(GENmodel *inModel)
+{
+    CAPmodel *model = (CAPmodel *)inModel;
+    FREE(model->CAPfastArr);
+    model->CAPfastCount = 0;
+    model->CAPfastVer = 0;
+    model->CAPfastKluAxBase = NULL;
+    model->CAPfastKluNz = 0;
+    cap_global_ver++;
+    return OK;
+}
+
+static inline int
+cap_ptr_to_klu_off(const double *ptr, uintptr_t ax_addr, size_t ax_bytes, int nz)
+{
+    uintptr_t d = (uintptr_t)ptr - ax_addr;
+    if (d < ax_bytes)
+        return (int)(d / sizeof(double));
+    return nz;
+}
+
+void
+CAPensureFastCache(GENmodel *inModel, CKTcircuit *ckt)
+{
+    CAPmodel *head = (CAPmodel *)inModel;
+    double *ax = NULL;
+    unsigned int nz = 0;
+#ifdef KLU
+    if (ckt->CKTmatrix && ckt->CKTmatrix->CKTkluMODE &&
+        ckt->CKTmatrix->SMPkluMatrix &&
+        ckt->CKTmatrix->SMPkluMatrix->KLUmatrixIsComplex == KLUmatrixReal)
+    {
+        ax = ckt->CKTmatrix->SMPkluMatrix->KLUmatrixAx;
+        nz = ckt->CKTmatrix->SMPkluMatrix->KLUmatrixNZ;
+    }
+#endif
+    if (head->CAPfastVer == cap_global_ver &&
+        head->CAPfastKluAxBase == ax &&
+        head->CAPfastKluNz == nz)
+        return;
+
+    CAPmodel *m;
+    CAPinstance *here;
+    int count = 0;
+    for (m = head; m != NULL; m = CAPnextModel(m)) {
+        for (here = CAPinstances(m); here != NULL; here = CAPnextInstance(here))
+            count++;
+    }
+    FREE(head->CAPfastArr);
+    head->CAPfastCount = count;
+    if (count > 0) {
+        head->CAPfastArr = TMALLOC(CAPfastEntry, count);
+        uintptr_t ax_addr = (uintptr_t)ax;
+        size_t ax_bytes = (size_t)nz * sizeof(double);
+        int k = 0;
+        for (m = head; m != NULL; m = CAPnextModel(m)) {
+            for (here = CAPinstances(m); here != NULL; here = CAPnextInstance(here)) {
+                CAPfastEntry *e = &head->CAPfastArr[k++];
+                e->capac = here->CAPcapac;
+                e->m = here->CAPm;
+                e->posNode = here->CAPposNode;
+                e->negNode = here->CAPnegNode;
+                e->qcap = here->CAPqcap;
+                e->ptrPP = here->CAPposPosPtr;
+                e->ptrNN = here->CAPnegNegPtr;
+                e->ptrPN = here->CAPposNegPtr;
+                e->ptrNP = here->CAPnegPosPtr;
+                if (ax != NULL && nz > 0) {
+                    e->offPP = cap_ptr_to_klu_off(here->CAPposPosPtr, ax_addr, ax_bytes, (int)nz);
+                    e->offNN = cap_ptr_to_klu_off(here->CAPnegNegPtr, ax_addr, ax_bytes, (int)nz);
+                    e->offPN = cap_ptr_to_klu_off(here->CAPposNegPtr, ax_addr, ax_bytes, (int)nz);
+                    e->offNP = cap_ptr_to_klu_off(here->CAPnegPosPtr, ax_addr, ax_bytes, (int)nz);
+                } else {
+                    e->offPP = e->offNN = e->offPN = e->offNP = 0;
+                }
+            }
+        }
+    }
+    head->CAPfastVer = cap_global_ver;
+    head->CAPfastKluAxBase = ax;
+    head->CAPfastKluNz = nz;
+}
+
+#ifdef KLU
+int
+CAPkluPrep(GENmodel *inModel, CKTcircuit *ckt)
+{
+    long mode = ckt->CKTmode;
+    if (!(mode & (MODETRAN | MODEAC)))
+        return 0;
+    if ((mode & MODEINITTRAN) || (mode & MODEDC))
+        return 0;
+    if ((ckt->CKTintegrateMethod != GEAR && ckt->CKTintegrateMethod != TRAPEZOIDAL) ||
+        (ckt->CKTorder != 1 && ckt->CKTorder != 2))
+        return 0;
+    CAPmodel *head = (CAPmodel *)inModel;
+    CAPensureFastCache(inModel, ckt);
+    if (!head->CAPfastKluAxBase || head->CAPfastKluNz == 0)
+        return 0;
+    return 1;
+}
+
+static inline void
+cap_load_klu_one(const CAPfastEntry * restrict e,
+                 const double * restrict rhsOld,
+                 double * restrict s0, const double * restrict s1, const double * restrict s2,
+                 double * restrict my_ax, double * restrict my_rhs,
+                 double ag0, double ag1, double ag2,
+                 int is_init_pred, int is_gear2, int is_trap2)
+{
+    int qidx = e->qcap;
+    double q0;
+    double ccap_val;
+#ifndef PREDICTOR
+    if (is_init_pred) {
+        q0 = s1[qidx];
+        s0[qidx] = q0;
+    } else {
+#endif
+        double vcap = rhsOld[e->posNode] - rhsOld[e->negNode];
+        q0 = e->capac * vcap;
+        s0[qidx] = q0;
+#ifndef PREDICTOR
+    }
+#endif
+    if (is_gear2) {
+        ccap_val = ag2 * s2[qidx] + ag1 * s1[qidx] + ag0 * q0;
+    } else if (is_trap2) {
+        ccap_val = -s1[qidx + 1] * ag1 + ag0 * (q0 - s1[qidx]);
+    } else {
+        ccap_val = ag0 * q0 + ag1 * s1[qidx];
+    }
+    s0[qidx + 1] = ccap_val;
+    double ceq = ccap_val - ag0 * q0;
+    double mgeq = e->m * ag0 * e->capac;
+    double mceq = e->m * ceq;
+    my_ax[e->offPP] += mgeq;
+    my_ax[e->offNN] += mgeq;
+    my_ax[e->offPN] -= mgeq;
+    my_ax[e->offNP] -= mgeq;
+    my_rhs[e->posNode] -= mceq;
+    my_rhs[e->negNode] += mceq;
+}
+
+int
+CAPloadKluPar(GENmodel *inModel, CKTcircuit *ckt, double *my_ax, double *my_rhs)
+{
+    CAPmodel *head = (CAPmodel *)inModel;
+    const CAPfastEntry * restrict arr = head->CAPfastArr;
+    int n = head->CAPfastCount;
+    const double * restrict rhsOld = ckt->CKTrhsOld;
+    double * restrict s0 = ckt->CKTstate0;
+    const double * restrict s1 = ckt->CKTstate1;
+    const double * restrict s2 = ckt->CKTstate2;
+    double ag0 = ckt->CKTag[0];
+    double ag1 = ckt->CKTag[1];
+    double ag2 = ckt->CKTag[2];
+    int is_init_pred = (ckt->CKTmode & MODEINITPRED) != 0;
+    int is_gear2 = (ckt->CKTintegrateMethod == GEAR && ckt->CKTorder == 2);
+    int is_trap2 = (ckt->CKTintegrateMethod == TRAPEZOIDAL && ckt->CKTorder == 2);
+
+#ifdef USE_OMP
+    if (omp_in_parallel()) {
+        #pragma omp for schedule(static) nowait
+        for (int k = 0; k < n; k++) {
+            cap_load_klu_one(&arr[k], rhsOld, s0, s1, s2, my_ax, my_rhs,
+                             ag0, ag1, ag2, is_init_pred, is_gear2, is_trap2);
+        }
+        return OK;
+    }
+#endif
+    for (int k = 0; k < n; k++) {
+        cap_load_klu_one(&arr[k], rhsOld, s0, s1, s2, my_ax, my_rhs,
+                         ag0, ag1, ag2, is_init_pred, is_gear2, is_trap2);
+    }
+    return OK;
+}
+#endif
 
 int
 CAPload(GENmodel *inModel, CKTcircuit *ckt)
@@ -42,6 +234,9 @@ CAPload(GENmodel *inModel, CKTcircuit *ckt)
             (ckt->CKTintegrateMethod == GEAR || ckt->CKTintegrateMethod == TRAPEZOIDAL) &&
             (ckt->CKTorder == 1 || ckt->CKTorder == 2))
         {
+            CAPensureFastCache(inModel, ckt);
+            const CAPfastEntry * restrict arr = model->CAPfastArr;
+            int n = model->CAPfastCount;
             const double * restrict rhsOld = ckt->CKTrhsOld;
             double * restrict rhs = ckt->CKTrhs;
             double * restrict s0 = ckt->CKTstate0;
@@ -53,44 +248,40 @@ CAPload(GENmodel *inModel, CKTcircuit *ckt)
             int is_gear2 = (ckt->CKTintegrateMethod == GEAR && ckt->CKTorder == 2);
             int is_trap2 = (ckt->CKTintegrateMethod == TRAPEZOIDAL && ckt->CKTorder == 2);
 
-            for ( ; model != NULL; model = CAPnextModel(model)) {
-                for (here = CAPinstances(model); here != NULL;
-                        here = CAPnextInstance(here)) {
-                    int qidx = here->CAPqcap;
-                    double q0;
-                    double ccap_val;
-                    m = here->CAPm;
+            for (int k = 0; k < n; k++) {
+                const CAPfastEntry *e = &arr[k];
+                int qidx = e->qcap;
+                double q0;
+                double ccap_val;
 #ifndef PREDICTOR
-                    if (is_init_pred) {
-                        q0 = s1[qidx];
-                        s0[qidx] = q0;
-                    } else {
+                if (is_init_pred) {
+                    q0 = s1[qidx];
+                    s0[qidx] = q0;
+                } else {
 #endif
-                        vcap = rhsOld[here->CAPposNode] - rhsOld[here->CAPnegNode];
-                        q0 = here->CAPcapac * vcap;
-                        s0[qidx] = q0;
+                    vcap = rhsOld[e->posNode] - rhsOld[e->negNode];
+                    q0 = e->capac * vcap;
+                    s0[qidx] = q0;
 #ifndef PREDICTOR
-                    }
-#endif
-                    if (is_gear2) {
-                        ccap_val = ag2 * s2[qidx] + ag1 * s1[qidx] + ag0 * q0;
-                    } else if (is_trap2) {
-                        ccap_val = -s1[qidx + 1] * ag1 + ag0 * (q0 - s1[qidx]);
-                    } else {
-                        ccap_val = ag0 * q0 + ag1 * s1[qidx];
-                    }
-                    s0[qidx + 1] = ccap_val;
-                    ceq = ccap_val - ag0 * q0;
-                    geq = ag0 * here->CAPcapac;
-                    double mgeq = m * geq;
-                    double mceq = m * ceq;
-                    *(here->CAPposPosPtr) += mgeq;
-                    *(here->CAPnegNegPtr) += mgeq;
-                    *(here->CAPposNegPtr) -= mgeq;
-                    *(here->CAPnegPosPtr) -= mgeq;
-                    rhs[here->CAPposNode] -= mceq;
-                    rhs[here->CAPnegNode] += mceq;
                 }
+#endif
+                if (is_gear2) {
+                    ccap_val = ag2 * s2[qidx] + ag1 * s1[qidx] + ag0 * q0;
+                } else if (is_trap2) {
+                    ccap_val = -s1[qidx + 1] * ag1 + ag0 * (q0 - s1[qidx]);
+                } else {
+                    ccap_val = ag0 * q0 + ag1 * s1[qidx];
+                }
+                s0[qidx + 1] = ccap_val;
+                ceq = ccap_val - ag0 * q0;
+                double mgeq = e->m * ag0 * e->capac;
+                double mceq = e->m * ceq;
+                *(e->ptrPP) += mgeq;
+                *(e->ptrNN) += mgeq;
+                *(e->ptrPN) -= mgeq;
+                *(e->ptrNP) -= mgeq;
+                rhs[e->posNode] -= mceq;
+                rhs[e->negNode] += mceq;
             }
             return(OK);
         }

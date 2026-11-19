@@ -124,6 +124,10 @@ typedef struct SPICEdev {
         /* routine to convert Real CSC array to Complex CSC array */
     int (*DEVbindCSCComplexToReal)(GENmodel *, CKTcircuit *);
         /* routine to convert Complex CSC array to Real CSC array */
+    int (*DEVkluPrep)(GENmodel *, CKTcircuit *);
+        /* prepare cached KLU fast-load state; 0=fallback, 1=parallel TLS, 2=prebaked const */
+    int (*DEVkluLoadPar)(GENmodel *, CKTcircuit *, double *, double *);
+        /* load directly into thread-local or main KLU Ax/RHS inside unified parallel region */
 #endif
 
 } SPICEdev;  /* instance of structure for each possible type of device */

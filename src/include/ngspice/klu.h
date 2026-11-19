@@ -987,6 +987,16 @@ typedef struct sKLUmatrix {
     double **KLUmatrixDiag ;                        /* KLU pointer to diagonal element to perform Gmin */
     unsigned int KLUloadDiagGmin:1 ;                /* KLU flag to load Diag Gmin */
 
+    /* Persistent thread-local matrix/RHS buffers and pre-baked linear resistor base */
+    double *KLUmatrixAxTls ;
+    double *KLUmatrixRhsTls ;
+    size_t  KLUmatrixAxTlsStride ;
+    size_t  KLUmatrixRhsTlsStride ;
+    int     KLUmatrixTlsThreads ;
+    double *KLUmatrixAxResConst ;
+    int     KLUmatrixResConstValid ;
+    unsigned long long KLUmatrixResVersion ;
+
 #ifdef CIDER
     int *KLUmatrixColCOOforCIDER ;             /* KLU Col Index for COO storage (for CIDER) */
     int *KLUmatrixRowCOOforCIDER ;             /* KLU Row Index for COO storage (for CIDER) */

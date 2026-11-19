@@ -88,6 +88,22 @@ typedef struct sCAPinstance {
 
 /* data per model */
 
+typedef struct {
+    double capac;
+    double m;
+    int posNode;
+    int negNode;
+    int qcap;
+    int offPP;
+    int offNN;
+    int offPN;
+    int offNP;
+    double *ptrPP;
+    double *ptrNN;
+    double *ptrPN;
+    double *ptrNP;
+} CAPfastEntry;
+
 typedef struct sCAPmodel {      /* model structure for a capacitor */
 
     struct GENmodel gen;
@@ -126,6 +142,11 @@ typedef struct sCAPmodel {      /* model structure for a capacitor */
     unsigned CAPthickGiven     : 1;    /* flags indicates insulator thickness given */
     unsigned CAPbv_maxGiven    : 1;    /* flags indicates maximum voltage is given */
 
+    CAPfastEntry *CAPfastArr;
+    int CAPfastCount;
+    unsigned long long CAPfastVer;
+    double *CAPfastKluAxBase;
+    unsigned int CAPfastKluNz;
 } CAPmodel;
 
 /* device parameters */
