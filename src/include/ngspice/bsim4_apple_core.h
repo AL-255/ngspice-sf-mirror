@@ -826,6 +826,7 @@ typedef struct __attribute__((aligned(64))) {
     double Cbgb, Cbdb, Cbsb;
     double q_lin_g, q_lin_d, q_lin_b;
     double qg_st, qd_st, qb_st;
+    double base_cqg, base_cqd, base_cqb;
     double a_vds, a_vgs, a_vbs, a_vbd;
 } BSIM4AppleL2;
 
@@ -862,13 +863,6 @@ typedef struct {
     const double    *last_s0, *last_s1, *last_s2;
     int              last_int_mode;
     int              step_valid;
-    /* Incremental KLU delta-stamping shadow buffers (1t KLU) */
-    double          *ax_shadow;
-    double          *rhs_shadow;
-    int              ax_shadow_nz;
-    int              rhs_shadow_len;
-    int              shadow_valid;
-    int              shadow_age;
 } BSIM4ApplePack;
 
 typedef struct __attribute__((aligned(64))) {
@@ -964,47 +958,34 @@ bsim4_apple_l1_sync_one(
     const BSIM4AppleCheck * restrict c,
     const BSIM4AppleL2 * restrict l2,
     double vds, double vgs, double vbs,
-    double ag0, double ag1, double ag2,
-    int is_gear2, int is_trap2,
-    double * restrict s0,
-    const double * restrict s1,
-    const double * restrict s2)
+    double ag0,
+    double * restrict s0)
 {
     double dvds = vds - c->last_vds;
     double dvgs = vgs - c->last_vgs;
     double dvbs = vbs - c->last_vbs;
     double dvgb = dvgs - dvbs;
     double dvbd = dvbs - dvds;
-    double qg = l2->qg_st + (l2->Cggb * dvgb - l2->Cgdb * dvbd - l2->Cgsb * dvbs);
-    double qd = l2->qd_st + (l2->Cdgb * dvgb - l2->Cddb * dvbd - l2->Cdsb * dvbs);
-    double qb = l2->qb_st + (l2->Cbgb * dvgb - l2->Cbdb * dvbd - l2->Cbsb * dvbs);
+    double dqg = l2->Cggb * dvgb - l2->Cgdb * dvbd - l2->Cgsb * dvbs;
+    double dqd = l2->Cdgb * dvgb - l2->Cddb * dvbd - l2->Cdsb * dvbs;
+    double dqb = l2->Cbgb * dvgb - l2->Cbdb * dvbd - l2->Cbsb * dvbs;
     int st = c->stateBase;
     s0[st + 0]  = vbs - vds;
     s0[st + 1]  = vbs;
     s0[st + 2]  = vgs;
     s0[st + 3]  = vds;
-    s0[st + 11] = qb;
-    s0[st + 13] = qg;
-    s0[st + 15] = qd;
-    if (is_gear2) {
-        s0[st + 12] = ag2 * s2[st + 11] + ag1 * s1[st + 11] + ag0 * qb;
-        s0[st + 14] = ag2 * s2[st + 13] + ag1 * s1[st + 13] + ag0 * qg;
-        s0[st + 16] = ag2 * s2[st + 15] + ag1 * s1[st + 15] + ag0 * qd;
-    } else if (is_trap2) {
-        s0[st + 12] = -s1[st + 12] * ag1 + ag0 * (qb - s1[st + 11]);
-        s0[st + 14] = -s1[st + 14] * ag1 + ag0 * (qg - s1[st + 13]);
-        s0[st + 16] = -s1[st + 16] * ag1 + ag0 * (qd - s1[st + 15]);
-    } else {
-        s0[st + 12] = ag0 * qb + ag1 * s1[st + 11];
-        s0[st + 14] = ag0 * qg + ag1 * s1[st + 13];
-        s0[st + 16] = ag0 * qd + ag1 * s1[st + 15];
-    }
+    s0[st + 11] = l2->qb_st + dqb;
+    s0[st + 12] = l2->base_cqb + ag0 * dqb;
+    s0[st + 13] = l2->qg_st + dqg;
+    s0[st + 14] = l2->base_cqg + ag0 * dqg;
+    s0[st + 15] = l2->qd_st + dqd;
+    s0[st + 16] = l2->base_cqd + ag0 * dqd;
 }
 
 static inline void
 bsim4_apple_l2_assemble_one(
     const BSIM4AppleCheck * restrict c,
-    const BSIM4AppleL2 * restrict l2,
+    BSIM4AppleL2 * restrict l2,
     BSIM4AppleStamp * restrict sp,
     double vds, double vgs, double vbs,
     int has_dv,
@@ -1015,6 +996,7 @@ bsim4_apple_l2_assemble_one(
     const double * restrict s2)
 {
     double dqg = 0.0, dqd = 0.0, dqb = 0.0;
+    double qb_st = l2->qb_st, qg_st = l2->qg_st, qd_st = l2->qd_st;
     double qb, qg, qd;
     int st = c->stateBase;
     if (has_dv) {
@@ -1026,17 +1008,17 @@ bsim4_apple_l2_assemble_one(
         dqg = l2->Cggb * dvgb - l2->Cgdb * dvbd - l2->Cgsb * dvbs;
         dqd = l2->Cdgb * dvgb - l2->Cddb * dvbd - l2->Cdsb * dvbs;
         dqb = l2->Cbgb * dvgb - l2->Cbdb * dvbd - l2->Cbsb * dvbs;
-        qb = l2->qb_st + dqb;
-        qg = l2->qg_st + dqg;
-        qd = l2->qd_st + dqd;
+        qb = qb_st + dqb;
+        qg = qg_st + dqg;
+        qd = qd_st + dqd;
         s0[st + 0] = vbs - vds;
         s0[st + 1] = vbs;
         s0[st + 2] = vgs;
         s0[st + 3] = vds;
     } else {
-        qb = l2->qb_st;
-        qg = l2->qg_st;
-        qd = l2->qd_st;
+        qb = qb_st;
+        qg = qg_st;
+        qd = qd_st;
         s0[st + 0] = l2->a_vbd;
         s0[st + 1] = l2->a_vbs;
         s0[st + 2] = l2->a_vgs;
@@ -1046,20 +1028,26 @@ bsim4_apple_l2_assemble_one(
     s0[st + 13] = qg;
     s0[st + 15] = qd;
 
-    double cqb, cqg, cqd;
+    double base_cqb, base_cqg, base_cqd;
     if (is_gear2) {
-        cqb = ag2 * s2[st + 11] + ag1 * s1[st + 11] + ag0 * qb;
-        cqg = ag2 * s2[st + 13] + ag1 * s1[st + 13] + ag0 * qg;
-        cqd = ag2 * s2[st + 15] + ag1 * s1[st + 15] + ag0 * qd;
+        base_cqb = ag2 * s2[st + 11] + ag1 * s1[st + 11] + ag0 * qb_st;
+        base_cqg = ag2 * s2[st + 13] + ag1 * s1[st + 13] + ag0 * qg_st;
+        base_cqd = ag2 * s2[st + 15] + ag1 * s1[st + 15] + ag0 * qd_st;
     } else if (is_trap2) {
-        cqb = -s1[st + 12] * ag1 + ag0 * (qb - s1[st + 11]);
-        cqg = -s1[st + 14] * ag1 + ag0 * (qg - s1[st + 13]);
-        cqd = -s1[st + 16] * ag1 + ag0 * (qd - s1[st + 15]);
+        base_cqb = -s1[st + 12] * ag1 + ag0 * (qb_st - s1[st + 11]);
+        base_cqg = -s1[st + 14] * ag1 + ag0 * (qg_st - s1[st + 13]);
+        base_cqd = -s1[st + 16] * ag1 + ag0 * (qd_st - s1[st + 15]);
     } else {
-        cqb = ag0 * qb + ag1 * s1[st + 11];
-        cqg = ag0 * qg + ag1 * s1[st + 13];
-        cqd = ag0 * qd + ag1 * s1[st + 15];
+        base_cqb = ag0 * qb_st + ag1 * s1[st + 11];
+        base_cqg = ag0 * qg_st + ag1 * s1[st + 13];
+        base_cqd = ag0 * qd_st + ag1 * s1[st + 15];
     }
+    l2->base_cqb = base_cqb;
+    l2->base_cqg = base_cqg;
+    l2->base_cqd = base_cqd;
+    double cqb = has_dv ? (base_cqb + ag0 * dqb) : base_cqb;
+    double cqg = has_dv ? (base_cqg + ag0 * dqg) : base_cqg;
+    double cqd = has_dv ? (base_cqd + ag0 * dqd) : base_cqd;
     s0[st + 12] = cqb;
     s0[st + 14] = cqg;
     s0[st + 16] = cqd;

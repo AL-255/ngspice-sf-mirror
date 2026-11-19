@@ -10,8 +10,6 @@ noinst_HEADERS = \
 	bsim4_avx512_glue.h \
 	bsim4_apple_core.h \
 	bsim4_apple_glue.h \
-	bsim4_neon_core.h \
-	bsim4_neon_glue.h \
     btf.h \
 	carddefs.h	\
 	ciderinp.h	\

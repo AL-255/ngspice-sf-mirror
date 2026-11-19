@@ -53,8 +53,6 @@ B4P(freeApplePack)(B4P(model) *head)
         free(pack->eval_vds);
         free(pack->eval_vgs);
         free(pack->eval_vbs);
-        free(pack->ax_shadow);
-        free(pack->rhs_shadow);
         free(pack);
         head->B4P(AvxBlocks) = NULL;
     }
@@ -672,7 +670,6 @@ B4P(syncAvxDynFromInst)(B4P(model) *head)
         c->stamp_valid = 0;
     }
     pack->step_valid = 0;
-    pack->shadow_valid = 0;
     head->B4P(AvxDynValid) = 1;
 }
 
@@ -854,38 +851,6 @@ B4P(stampOneDirect)(
 }
 
 static inline void
-B4P(stampOneDeltaKlu)(
-    const BSIM4AppleCheck * restrict c,
-    const BSIM4AppleStamp * restrict sp,
-    const double * restrict old_st,
-    double * restrict ax_sh,
-    double * restrict rhs_sh)
-{
-    const double * restrict st = sp->st;
-    const int * restrict off = sp->kluOff;
-    rhs_sh[c->dNodePrime] += (st[0] - old_st[0]);
-    rhs_sh[c->gNodePrime] -= (st[1] - old_st[1]);
-    rhs_sh[c->bNodePrime] += (st[2] - old_st[2]);
-    rhs_sh[c->sNodePrime] += (st[3] - old_st[3]);
-    ax_sh[off[0]]  += (st[4]  - old_st[4]);
-    ax_sh[off[1]]  += (st[5]  - old_st[5]);
-    ax_sh[off[2]]  += (st[6]  - old_st[6]);
-    ax_sh[off[3]]  += (st[7]  - old_st[7]);
-    ax_sh[off[4]]  += (st[8]  - old_st[8]);
-    ax_sh[off[5]]  += (st[9]  - old_st[9]);
-    ax_sh[off[6]]  -= (st[10] - old_st[10]);
-    ax_sh[off[7]]  -= (st[11] - old_st[11]);
-    ax_sh[off[8]]  -= (st[12] - old_st[12]);
-    ax_sh[off[9]]  += (st[13] - old_st[13]);
-    ax_sh[off[10]] += (st[14] - old_st[14]);
-    ax_sh[off[11]] -= (st[15] - old_st[15]);
-    ax_sh[off[12]] += (st[16] - old_st[16]);
-    ax_sh[off[13]] += (st[17] - old_st[17]);
-    ax_sh[off[14]] += (st[18] - old_st[18]);
-    ax_sh[off[15]] += (st[19] - old_st[19]);
-}
-
-static inline void
 B4P(scatterAosOne)(B4P(instance) *here, const BSIM4AppleOut *out, int lane)
 {
     here->B4P(von)    = out->von[lane];
@@ -931,7 +896,6 @@ B4P(evalAppleGroup)(
     double * restrict my_ax,
     double * restrict my_rhs,
     int stamp_mode,
-    int use_delta,
     int l1_step_ok,
     int l2_gmin_ok,
     int * restrict eval_q,
@@ -964,9 +928,6 @@ B4P(evalAppleGroup)(
     const int do_l1 = (!is_pred && !need_aos && vtol >= 0.0 && l1_step_ok);
     const int do_l2 = (!need_aos && vtol >= 0.0 && l2_gmin_ok);
 
-    double * restrict ax_sh  = use_delta ? pack->ax_shadow  : NULL;
-    double * restrict rhs_sh = use_delta ? pack->rhs_shadow : NULL;
-
     int start = grp->offset;
     int end   = start + grp->count;
     int n_eval = 0;
@@ -985,17 +946,14 @@ B4P(evalAppleGroup)(
             vgs = (rhsOld[c->gNodePrime] - vs) * t;
             vbs = (rhsOld[c->bNodePrime] - vs) * t;
 
-            /* Level-1 per-instance stationary check: touches ONLY this 128B cache line! */
+            /* Level-1 per-instance stationary check: zero s1/s2 loads via base_cq + ag0*dq! */
             if (do_l1 && c->stamp_valid) {
                 int exact_zero = 0;
                 if (B4P(instCacheMatch)(c, vds, vgs, vbs, vtol, reltol, abstol, &exact_zero)) {
                     if (!exact_zero) {
-                        bsim4_apple_l1_sync_one(c, &l2s[i], vds, vgs, vbs,
-                                                ag0, ag1, ag2, is_gear2, is_trap2, s0, s1, s2);
+                        bsim4_apple_l1_sync_one(c, &l2s[i], vds, vgs, vbs, ag0, s0);
                     }
-                    if (!use_delta) {
-                        B4P(stampOneDirect)(c, &stamps[i], InstArray, my_ax, my_rhs, stamp_mode);
-                    }
+                    B4P(stampOneDirect)(c, &stamps[i], InstArray, my_ax, my_rhs, stamp_mode);
                     continue;
                 }
             }
@@ -1048,16 +1006,10 @@ B4P(evalAppleGroup)(
         if (do_l2 && !icheck && c->phys_valid) {
             int exact_zero = 0;
             if (B4P(instCacheMatch)(c, vds, vgs, vbs, vtol, reltol, abstol, &exact_zero)) {
-                double old_st[20];
-                if (use_delta) memcpy(old_st, sp->st, sizeof(old_st));
                 bsim4_apple_l2_assemble_one(c, &l2s[i], sp, vds, vgs, vbs, !exact_zero,
                                             ag0, ag1, ag2, is_gear2, is_trap2, s0, s1, s2);
                 c->stamp_valid = 1;
-                if (use_delta) {
-                    B4P(stampOneDeltaKlu)(c, sp, old_st, ax_sh, rhs_sh);
-                } else {
-                    B4P(stampOneDirect)(c, sp, InstArray, my_ax, my_rhs, stamp_mode);
-                }
+                B4P(stampOneDirect)(c, sp, InstArray, my_ax, my_rhs, stamp_mode);
                 continue;
             }
         }
@@ -1093,7 +1045,6 @@ B4P(evalAppleGroup)(
         BSIM4AppleStamp     *spts[B4A_W];
         BSIM4AppleL2        *l2pts[B4A_W];
         double bvds[B4A_W], bvgs[B4A_W], bvbs[B4A_W];
-        double old_st[B4A_W][20];
 
         for (int l = 0; l < B4A_W; l++) {
             int ql = (l < nact) ? (q + l) : q;
@@ -1105,10 +1056,6 @@ B4P(evalAppleGroup)(
             bvds[l]  = eval_vds[ql];
             bvgs[l]  = eval_vgs[ql];
             bvbs[l]  = eval_vbs[ql];
-        }
-        if (use_delta) {
-            for (int l = 0; l < nact; l++)
-                memcpy(old_st[l], spts[l]->st, sizeof(old_st[l]));
         }
 
         bsim4_apple_eval_batch(
@@ -1122,17 +1069,14 @@ B4P(evalAppleGroup)(
             cpts[l]->stamp_valid = !need_aos;
             if (need_aos)
                 B4P(scatterAosOne)(InstArray[cpts[l]->instIdx], &out, l);
-            if (use_delta)
-                B4P(stampOneDeltaKlu)(cpts[l], spts[l], old_st[l], ax_sh, rhs_sh);
-            else
-                B4P(stampOneDirect)(cpts[l], spts[l], InstArray, my_ax, my_rhs, stamp_mode);
+            B4P(stampOneDirect)(cpts[l], spts[l], InstArray, my_ax, my_rhs, stamp_mode);
         }
     }
 }
 
 /*
  * Top-level single-thread / OpenMP driver for BSIM4ApplePack.
- * Uses pack-level step validation (checked ONCE per CKTload!) and adaptive KLU delta-stamping.
+ * Uses pack-level step validation (checked ONCE per CKTload instead of per transistor!).
  */
 static void
 B4P(runApplePack)(
@@ -1146,7 +1090,6 @@ B4P(runApplePack)(
     if (!pack || pack->nElig <= 0) return;
     B4P(instance) **InstArray = head->B4P(InstanceArray);
     int nGroups = pack->nGroups;
-    int nElig   = pack->nElig;
 
     const double cur_time = ckt->CKTtime;
     const double cur_gmin = ckt->CKTgmin;
@@ -1176,7 +1119,7 @@ B4P(runApplePack)(
             #pragma omp for schedule(dynamic, 1) nowait
             for (int gi = 0; gi < nGroups; gi++) {
                 B4P(evalAppleGroup)(pack, gi, InstArray, ckt, my_ax, my_rhs,
-                                    stamp_mode, 0, l1_step_ok, l2_gmin_ok, tq, tvd, tvg, tvb);
+                                    stamp_mode, l1_step_ok, l2_gmin_ok, tq, tvd, tvg, tvb);
             }
         }
         free(tq); free(tvd); free(tvg); free(tvb);
@@ -1192,76 +1135,10 @@ B4P(runApplePack)(
     }
 #endif
 
-    static int delta_env = -1;
-    if (delta_env < 0)
-        delta_env = (getenv("NGSPICE_NO_DELTA_STAMP") != NULL) ? 0 : 1;
-
-    int use_delta = 0;
-    int nz = 0, rhs_len = 0;
-#ifdef KLU
-    if (delta_env && stamp_mode == 1 && !B4P(AvxNeedAosSync) &&
-        ckt->CKTmatrix && ckt->CKTmatrix->SMPkluMatrix)
-    {
-        KLUmatrix *km = ckt->CKTmatrix->SMPkluMatrix;
-        nz = (int)km->KLUmatrixNZ;
-        rhs_len = (int)km->KLUmatrixNrhs + 1;
-        if (rhs_len < ckt->CKTmaxEqNum + 1) rhs_len = ckt->CKTmaxEqNum + 1;
-        if (nz > 0 && nElig * 12 > nz) {
-            if (!pack->ax_shadow || pack->ax_shadow_nz != nz) {
-                free(pack->ax_shadow);
-                pack->ax_shadow = NULL;
-                if (posix_memalign((void **)&pack->ax_shadow, 128, ((size_t)nz + 1) * sizeof(double)) == 0)
-                    pack->ax_shadow_nz = nz;
-                pack->shadow_valid = 0;
-            }
-            if (!pack->rhs_shadow || pack->rhs_shadow_len < rhs_len) {
-                free(pack->rhs_shadow);
-                pack->rhs_shadow = NULL;
-                if (posix_memalign((void **)&pack->rhs_shadow, 128, (size_t)rhs_len * sizeof(double)) == 0)
-                    pack->rhs_shadow_len = rhs_len;
-                pack->shadow_valid = 0;
-            }
-            if (pack->ax_shadow && pack->rhs_shadow)
-                use_delta = 1;
-        }
-    }
-#endif
-
-    if (use_delta) {
-        int need_rebuild = (!pack->shadow_valid || pack->shadow_age >= 64);
-        if (need_rebuild) {
-            double * restrict ax_sh  = pack->ax_shadow;
-            double * restrict rhs_sh = pack->rhs_shadow;
-            memset(ax_sh,  0, ((size_t)nz + 1) * sizeof(double));
-            memset(rhs_sh, 0, (size_t)rhs_len * sizeof(double));
-            for (int gi = 0; gi < nGroups; gi++) {
-                B4P(evalAppleGroup)(pack, gi, InstArray, ckt, ax_sh, rhs_sh,
-                                    1, 0, l1_step_ok, l2_gmin_ok,
-                                    pack->eval_q, pack->eval_vds, pack->eval_vgs, pack->eval_vbs);
-            }
-            pack->shadow_valid = 1;
-            pack->shadow_age   = 0;
-        } else {
-            for (int gi = 0; gi < nGroups; gi++) {
-                B4P(evalAppleGroup)(pack, gi, InstArray, ckt, my_ax, my_rhs,
-                                    1, 1, l1_step_ok, l2_gmin_ok,
-                                    pack->eval_q, pack->eval_vds, pack->eval_vgs, pack->eval_vbs);
-            }
-            pack->shadow_age++;
-        }
-
-        const double * restrict ax_sh  = pack->ax_shadow;
-        const double * restrict rhs_sh = pack->rhs_shadow;
-        for (int j = 0; j < nz; j++)
-            my_ax[j] += ax_sh[j];
-        for (int j = 0; j < rhs_len; j++)
-            my_rhs[j] += rhs_sh[j];
-    } else {
-        for (int gi = 0; gi < nGroups; gi++) {
-            B4P(evalAppleGroup)(pack, gi, InstArray, ckt, my_ax, my_rhs,
-                                stamp_mode, 0, l1_step_ok, l2_gmin_ok,
-                                pack->eval_q, pack->eval_vds, pack->eval_vgs, pack->eval_vbs);
-        }
+    for (int gi = 0; gi < nGroups; gi++) {
+        B4P(evalAppleGroup)(pack, gi, InstArray, ckt, my_ax, my_rhs,
+                            stamp_mode, l1_step_ok, l2_gmin_ok,
+                            pack->eval_q, pack->eval_vds, pack->eval_vgs, pack->eval_vbs);
     }
 
     pack->last_time = cur_time; pack->last_gmin = cur_gmin;
