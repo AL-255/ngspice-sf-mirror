@@ -258,20 +258,6 @@ Int KLU_refactor        /* returns TRUE if successful, FALSE otherwise */
     const Int * restrict ref_blk_p   = Numeric->ref_blk_p ;
     const Int * restrict ref_blk_row = Numeric->ref_blk_row ;
     int have_ref_map = (ref_blk_col != NULL && Numeric->ref_nz == Ap [n]) ;
-#if !defined(COMPLEX) && NGSPICE_OPT_APPLE
-    if (Numeric->invUdiag == NULL && n > 0)
-    {
-        Numeric->invUdiag = KLU_malloc (n, sizeof (double), Common) ;
-        if (Common->status < KLU_OK) Common->status = KLU_OK ;
-    }
-    if (scale > 0 && Numeric->invRs_perm == NULL && n > 0)
-    {
-        Numeric->invRs_perm = KLU_malloc (n, sizeof (double), Common) ;
-        if (Common->status < KLU_OK) Common->status = KLU_OK ;
-    }
-    double * restrict invUdiag = Numeric->invUdiag ;
-    Numeric->invValid = 0 ;
-#endif
 #else
     const Int * restrict ref_off_p   = NULL ;
     const Int * restrict ref_blk_col = NULL ;
@@ -362,9 +348,6 @@ Int KLU_refactor        /* returns TRUE if successful, FALSE otherwise */
                     }
                 }
                 Udiag [k1] = s ;
-#if !defined(COMPLEX) && NGSPICE_OPT_APPLE
-                if (invUdiag) invUdiag [k1] = (s != 0.0) ? (1.0 / s) : 0.0 ;
-#endif
 
             }
             else
@@ -495,9 +478,6 @@ Int KLU_refactor        /* returns TRUE if successful, FALSE otherwise */
                     if (llen > 0 && !IS_ZERO (ukk))
                     {
                         double inv_ukk = 1.0 / ukk ;
-#if NGSPICE_OPT_APPLE
-                        if (invUdiag) invUdiag [k+k1] = inv_ukk ;
-#endif
                         double * restrict Xr = X ;
                         const Int * restrict Lir = Li ;
                         double * restrict Lxr = Lx ;
@@ -529,9 +509,6 @@ Int KLU_refactor        /* returns TRUE if successful, FALSE otherwise */
                     }
                     else
                     {
-#if NGSPICE_OPT_APPLE
-                        if (invUdiag) invUdiag [k+k1] = !IS_ZERO (ukk) ? (1.0 / ukk) : 0.0 ;
-#endif
                         for (p = 0 ; p < llen ; p++)
                         {
                             i = Li [p] ;
@@ -648,9 +625,6 @@ Int KLU_refactor        /* returns TRUE if successful, FALSE otherwise */
                     }
                 }
                 Udiag [k1] = s ;
-#if !defined(COMPLEX) && NGSPICE_OPT_APPLE
-                if (invUdiag) invUdiag [k1] = (s != 0.0) ? (1.0 / s) : 0.0 ;
-#endif
 
             }
             else
@@ -803,9 +777,6 @@ Int KLU_refactor        /* returns TRUE if successful, FALSE otherwise */
                     if (llen > 0 && !IS_ZERO (ukk))
                     {
                         double inv_ukk = 1.0 / ukk ;
-#if NGSPICE_OPT_APPLE
-                        if (invUdiag) invUdiag [k+k1] = inv_ukk ;
-#endif
                         double * restrict Xr = X ;
                         const Int * restrict Lir = Li ;
                         double * restrict Lxr = Lx ;
@@ -837,9 +808,6 @@ Int KLU_refactor        /* returns TRUE if successful, FALSE otherwise */
                     }
                     else
                     {
-#if NGSPICE_OPT_APPLE
-                        if (invUdiag) invUdiag [k+k1] = !IS_ZERO (ukk) ? (1.0 / ukk) : 0.0 ;
-#endif
                         for (p = 0 ; p < llen ; p++)
                         {
                             i = Li [p] ;
@@ -866,20 +834,6 @@ Int KLU_refactor        /* returns TRUE if successful, FALSE otherwise */
 
     if (scale > 0)
     {
-#if !defined(COMPLEX) && NGSPICE_OPT_APPLE
-        double * restrict iRsP = Numeric->invRs_perm ;
-        const double * restrict iRs = invRs ;
-        if (iRsP != NULL)
-        {
-            for (k = 0 ; k < n ; k++)
-            {
-                Int pk = Pnum [k] ;
-                REAL (X [k]) = Rs [pk] ;
-                iRsP [k] = iRs [pk] ;
-            }
-        }
-        else
-#endif
         for (k = 0 ; k < n ; k++)
         {
             REAL (X [k]) = Rs [Pnum [k]] ;
@@ -889,9 +843,6 @@ Int KLU_refactor        /* returns TRUE if successful, FALSE otherwise */
             Rs [k] = REAL (X [k]) ;
         }
     }
-#if !defined(COMPLEX) && NGSPICE_OPT_APPLE
-    Numeric->invValid = (invUdiag != NULL && (scale <= 0 || Numeric->invRs_perm != NULL)) ? 1 : 0 ;
-#endif
 
 #ifndef NDEBUG
     ASSERT (Offp [n] == poff) ;

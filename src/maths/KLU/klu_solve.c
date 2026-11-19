@@ -159,20 +159,6 @@ Int KLU_solve
             {
 
                 case 1:
-#if !defined(COMPLEX) && NGSPICE_OPT_APPLE
-                    if (Numeric->invValid && Numeric->invRs_perm != NULL)
-                    {
-                        double * restrict Xr = X ;
-                        const double * restrict Bzr = Bz ;
-                        const Int * restrict Pnr = Pnum ;
-                        const double * restrict iRsP = Numeric->invRs_perm ;
-                        for (k = 0 ; k < n ; k++)
-                        {
-                            Xr [k] = Bzr [Pnr [k]] * iRsP [k] ;
-                        }
-                    }
-                    else
-#endif
                     for (k = 0 ; k < n ; k++)
                     {
                         SCALE_DIV_ASSIGN (X [k], Bz  [Pnum [k]], Rs [k]) ;
@@ -241,11 +227,6 @@ Int KLU_solve
                 {
 
                     case 1:
-#if !defined(COMPLEX) && NGSPICE_OPT_APPLE
-                        if (Numeric->invValid && Numeric->invUdiag != NULL)
-                            X [k1] *= Numeric->invUdiag [k1] ;
-                        else
-#endif
                         DIV (X [k1], X [k1], s) ;
                         break ;
 
@@ -272,16 +253,16 @@ Int KLU_solve
             else
             {
 #if !defined(COMPLEX) && NGSPICE_OPT_APPLE
-                if (nr == 1 && Numeric->invValid && Numeric->invUdiag != NULL)
+                if (nr == 1)
                 {
-                    /* Inlined zero-division real L + U triangular solve for nrhs=1 */
+                    /* Inlined real L + U triangular solve for nrhs=1 (strict IEEE-754 division) */
                     double * restrict Xr = X + k1 ;
                     Unit *LUb = LUbx [block] ;
                     const Int * restrict Lip_b = Lip + k1 ;
                     const Int * restrict Llen_b = Llen + k1 ;
                     const Int * restrict Uip_b = Uip + k1 ;
                     const Int * restrict Ulen_b = Ulen + k1 ;
-                    const double * restrict invUdr = Numeric->invUdiag + k1 ;
+                    const double * restrict Udr = Udiag + k1 ;
                     Int *Li_b, *Ui_b, len_b ;
                     double *Lx_b, *Ux_b ;
                     for (k = 0 ; k < nk ; k++)
@@ -306,7 +287,7 @@ Int KLU_solve
                     }
                     for (k = nk - 1 ; k >= 0 ; k--)
                     {
-                        double xk = Xr [k] * invUdr [k] ;
+                        double xk = Xr [k] / Udr [k] ;
                         Xr [k] = xk ;
                         if (xk == 0.0) continue ;
                         GET_POINTER (LUb, Uip_b, Ulen_b, Ui_b, Ux_b, k, len_b) ;
