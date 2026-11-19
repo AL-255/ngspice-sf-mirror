@@ -195,6 +195,61 @@ CAPloadKluPar(GENmodel *inModel, CKTcircuit *ckt, double *my_ax, double *my_rhs)
         return OK;
     }
 #endif
+    if (!is_init_pred) {
+        if (is_gear2) {
+            for (int k = 0; k < n; k++) {
+                const CAPfastEntry *e = &arr[k];
+                int qidx = e->qcap;
+                double q0 = e->capac * (rhsOld[e->posNode] - rhsOld[e->negNode]);
+                s0[qidx] = q0;
+                double ceq = ag2 * s2[qidx] + ag1 * s1[qidx];
+                s0[qidx + 1] = ceq + ag0 * q0;
+                double mgeq = e->m * ag0 * e->capac;
+                double mceq = e->m * ceq;
+                my_ax[e->offPP] += mgeq;
+                my_ax[e->offNN] += mgeq;
+                my_ax[e->offPN] -= mgeq;
+                my_ax[e->offNP] -= mgeq;
+                my_rhs[e->posNode] -= mceq;
+                my_rhs[e->negNode] += mceq;
+            }
+        } else if (is_trap2) {
+            for (int k = 0; k < n; k++) {
+                const CAPfastEntry *e = &arr[k];
+                int qidx = e->qcap;
+                double q0 = e->capac * (rhsOld[e->posNode] - rhsOld[e->negNode]);
+                s0[qidx] = q0;
+                double ceq = -s1[qidx + 1] * ag1 - ag0 * s1[qidx];
+                s0[qidx + 1] = ceq + ag0 * q0;
+                double mgeq = e->m * ag0 * e->capac;
+                double mceq = e->m * ceq;
+                my_ax[e->offPP] += mgeq;
+                my_ax[e->offNN] += mgeq;
+                my_ax[e->offPN] -= mgeq;
+                my_ax[e->offNP] -= mgeq;
+                my_rhs[e->posNode] -= mceq;
+                my_rhs[e->negNode] += mceq;
+            }
+        } else {
+            for (int k = 0; k < n; k++) {
+                const CAPfastEntry *e = &arr[k];
+                int qidx = e->qcap;
+                double q0 = e->capac * (rhsOld[e->posNode] - rhsOld[e->negNode]);
+                s0[qidx] = q0;
+                double ceq = ag1 * s1[qidx];
+                s0[qidx + 1] = ag0 * q0 + ceq;
+                double mgeq = e->m * ag0 * e->capac;
+                double mceq = e->m * ceq;
+                my_ax[e->offPP] += mgeq;
+                my_ax[e->offNN] += mgeq;
+                my_ax[e->offPN] -= mgeq;
+                my_ax[e->offNP] -= mgeq;
+                my_rhs[e->posNode] -= mceq;
+                my_rhs[e->negNode] += mceq;
+            }
+        }
+        return OK;
+    }
     for (int k = 0; k < n; k++) {
         cap_load_klu_one(&arr[k], rhsOld, s0, s1, s2, my_ax, my_rhs,
                          ag0, ag1, ag2, is_init_pred, is_gear2, is_trap2);

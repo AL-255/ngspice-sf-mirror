@@ -104,6 +104,14 @@ typedef struct
     void *Offx ;        /* size nzoff, numerical values */
     int nzoff ;
 
+    /* precomputed refactor scatter map (built lazily on first KLU_refactor) */
+    int ref_nz ;
+    int ref_poff ;
+    int *ref_off_p ;
+    int *ref_blk_col ;
+    int *ref_blk_p ;
+    int *ref_blk_row ;
+
 } klu_numeric ;
 
 typedef struct          /* 64-bit version (otherwise same as above) */
@@ -120,6 +128,7 @@ typedef struct          /* 64-bit version (otherwise same as above) */
     UF_long *Offp, *Offi ;
     void *Offx ;
     UF_long nzoff ;
+    UF_long ref_nz, ref_poff, *ref_off_p, *ref_blk_col, *ref_blk_p, *ref_blk_row ;
 
 } klu_l_numeric ;
 

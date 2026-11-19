@@ -136,24 +136,34 @@ Int KLU_refactor        /* returns TRUE if successful, FALSE otherwise */
         }
         if (scale == 1)
         {
+            const Int * restrict Air = Ai ;
+            double * restrict Rsr = Rs ;
             for (p = 0 ; p < nz ; p++)
             {
                 double a ;
+#ifndef COMPLEX
+                a = fabs (Az [p]) ;
+#else
                 ABS (a, Az [p]) ;
-                Rs [Ai [p]] += a ;
+#endif
+                Rsr [Air [p]] += a ;
             }
         }
         else
         {
+            const Int * restrict Air = Ai ;
+            double * restrict Rsr = Rs ;
             for (p = 0 ; p < nz ; p++)
             {
                 double a ;
+#ifndef COMPLEX
+                a = fabs (Az [p]) ;
+#else
                 ABS (a, Az [p]) ;
-                Int r = Ai [p] ;
-                if (a > Rs [r])
-                {
-                    Rs [r] = a ;
-                }
+#endif
+                Int r = Air [p] ;
+                double cur = Rsr [r] ;
+                Rsr [r] = (a > cur) ? a : cur ;
             }
         }
         /* Numeric->Xwork has size 4*n Entry's; X[0..n-1] is used for scatter,
@@ -184,6 +194,71 @@ Int KLU_refactor        /* returns TRUE if successful, FALSE otherwise */
     }
 
     /* ---------------------------------------------------------------------- */
+    /* build lazy precomputed scatter map for KLU_refactor (reused every call) */
+    /* ---------------------------------------------------------------------- */
+
+    if (Numeric->ref_blk_col == NULL && n > 0 && Ap != NULL && Ai != NULL &&
+        Ap [0] == 0 && Ap [n] >= 0)
+    {
+        Int nz_map = Ap [n] ;
+        Int *r_off_p   = KLU_malloc (nzoff + 1, sizeof (Int), Common) ;
+        Int *r_blk_col = KLU_malloc (n + 1, sizeof (Int), Common) ;
+        Int *r_blk_p   = KLU_malloc (nz_map + 1, sizeof (Int), Common) ;
+        Int *r_blk_row = KLU_malloc (nz_map + 1, sizeof (Int), Common) ;
+        if (r_off_p != NULL && r_blk_col != NULL && r_blk_p != NULL &&
+            r_blk_row != NULL && Common->status >= KLU_OK)
+        {
+            Int poff_b = 0, bidx = 0 ;
+            for (block = 0 ; block < nblocks ; block++)
+            {
+                k1 = R [block] ;
+                k2 = R [block+1] ;
+                for (k = k1 ; k < k2 ; k++)
+                {
+                    r_blk_col [k] = bidx ;
+                    oldcol = Q [k] ;
+                    pend = Ap [oldcol+1] ;
+                    for (p = Ap [oldcol] ; p < pend ; p++)
+                    {
+                        newrow = Pinv [Ai [p]] - k1 ;
+                        if (newrow < 0 && poff_b < nzoff)
+                        {
+                            r_off_p [poff_b++] = p ;
+                        }
+                        else
+                        {
+                            r_blk_p [bidx] = p ;
+                            r_blk_row [bidx] = newrow ;
+                            bidx++ ;
+                        }
+                    }
+                }
+            }
+            r_blk_col [n] = bidx ;
+            Numeric->ref_nz = nz_map ;
+            Numeric->ref_poff = poff_b ;
+            Numeric->ref_off_p = r_off_p ;
+            Numeric->ref_blk_col = r_blk_col ;
+            Numeric->ref_blk_p = r_blk_p ;
+            Numeric->ref_blk_row = r_blk_row ;
+        }
+        else
+        {
+            KLU_free (r_off_p,   nzoff + 1, sizeof (Int), Common) ;
+            KLU_free (r_blk_col, n + 1, sizeof (Int), Common) ;
+            KLU_free (r_blk_p,   nz_map + 1, sizeof (Int), Common) ;
+            KLU_free (r_blk_row, nz_map + 1, sizeof (Int), Common) ;
+            Common->status = KLU_OK ;
+        }
+    }
+
+    const Int * restrict ref_off_p   = Numeric->ref_off_p ;
+    const Int * restrict ref_blk_col = Numeric->ref_blk_col ;
+    const Int * restrict ref_blk_p   = Numeric->ref_blk_p ;
+    const Int * restrict ref_blk_row = Numeric->ref_blk_row ;
+    int have_ref_map = (ref_blk_col != NULL && Numeric->ref_nz == Ap [n]) ;
+
+    /* ---------------------------------------------------------------------- */
     /* clear workspace X */
     /* ---------------------------------------------------------------------- */
 
@@ -206,6 +281,16 @@ Int KLU_refactor        /* returns TRUE if successful, FALSE otherwise */
         /* no scaling */
         /* ------------------------------------------------------------------ */
 
+        if (have_ref_map)
+        {
+            Int npoff = Numeric->ref_poff ;
+            for (p = 0 ; p < npoff ; p++)
+            {
+                Offx [p] = Az [ref_off_p [p]] ;
+            }
+            poff = npoff ;
+        }
+
         for (block = 0 ; block < nblocks ; block++)
         {
 
@@ -224,22 +309,34 @@ Int KLU_refactor        /* returns TRUE if successful, FALSE otherwise */
                 /* singleton case */
                 /* ---------------------------------------------------------- */
 
-                oldcol = Q [k1] ;
-                pend = Ap [oldcol+1] ;
                 CLEAR (s) ;
-                for (p = Ap [oldcol] ; p < pend ; p++)
+                if (have_ref_map)
                 {
-                    newrow = Pinv [Ai [p]] - k1 ;
-                    if (newrow < 0 && poff < nzoff)
+                    Int t0 = ref_blk_col [k1] ;
+                    Int t1 = ref_blk_col [k1 + 1] ;
+                    for (p = t0 ; p < t1 ; p++)
                     {
-                        /* entry in off-diagonal block */
-                        Offx [poff] = Az [p] ;
-                        poff++ ;
+                        s = Az [ref_blk_p [p]] ;
                     }
-                    else
+                }
+                else
+                {
+                    oldcol = Q [k1] ;
+                    pend = Ap [oldcol+1] ;
+                    for (p = Ap [oldcol] ; p < pend ; p++)
                     {
-                        /* singleton */
-                        s = Az [p] ;
+                        newrow = Pinv [Ai [p]] - k1 ;
+                        if (newrow < 0 && poff < nzoff)
+                        {
+                            /* entry in off-diagonal block */
+                            Offx [poff] = Az [p] ;
+                            poff++ ;
+                        }
+                        else
+                        {
+                            /* singleton */
+                            s = Az [p] ;
+                        }
                     }
                 }
                 Udiag [k1] = s ;
@@ -265,21 +362,33 @@ Int KLU_refactor        /* returns TRUE if successful, FALSE otherwise */
                     /* scatter kth column of the block into workspace X */
                     /* ------------------------------------------------------ */
 
-                    oldcol = Q [k+k1] ;
-                    pend = Ap [oldcol+1] ;
-                    for (p = Ap [oldcol] ; p < pend ; p++)
+                    if (have_ref_map)
                     {
-                        newrow = Pinv [Ai [p]] - k1 ;
-                        if (newrow < 0 && poff < nzoff)
+                        Int t0 = ref_blk_col [k + k1] ;
+                        Int t1 = ref_blk_col [k + k1 + 1] ;
+                        for (p = t0 ; p < t1 ; p++)
                         {
-                            /* entry in off-diagonal block */
-                            Offx [poff] = Az [p] ;
-                            poff++ ;
+                            X [ref_blk_row [p]] = Az [ref_blk_p [p]] ;
                         }
-                        else
+                    }
+                    else
+                    {
+                        oldcol = Q [k+k1] ;
+                        pend = Ap [oldcol+1] ;
+                        for (p = Ap [oldcol] ; p < pend ; p++)
                         {
-                            /* (newrow,k) is an entry in the block */
-                            X [newrow] = Az [p] ;
+                            newrow = Pinv [Ai [p]] - k1 ;
+                            if (newrow < 0 && poff < nzoff)
+                            {
+                                /* entry in off-diagonal block */
+                                Offx [poff] = Az [p] ;
+                                poff++ ;
+                            }
+                            else
+                            {
+                                /* (newrow,k) is an entry in the block */
+                                X [newrow] = Az [p] ;
+                            }
                         }
                     }
 
@@ -308,10 +417,18 @@ Int KLU_refactor        /* returns TRUE if successful, FALSE otherwise */
                                 Int i1 = Lir [p + 1] ;
                                 Int i2 = Lir [p + 2] ;
                                 Int i3 = Lir [p + 3] ;
-                                Xr [i0] -= Lxr [p] * ujk ;
-                                Xr [i1] -= Lxr [p + 1] * ujk ;
-                                Xr [i2] -= Lxr [p + 2] * ujk ;
-                                Xr [i3] -= Lxr [p + 3] * ujk ;
+                                double x0 = Xr [i0] ;
+                                double x1 = Xr [i1] ;
+                                double x2 = Xr [i2] ;
+                                double x3 = Xr [i3] ;
+                                x0 -= Lxr [p]     * ujk ;
+                                x1 -= Lxr [p + 1] * ujk ;
+                                x2 -= Lxr [p + 2] * ujk ;
+                                x3 -= Lxr [p + 3] * ujk ;
+                                Xr [i0] = x0 ;
+                                Xr [i1] = x1 ;
+                                Xr [i2] = x2 ;
+                                Xr [i3] = x3 ;
                             }
                             for ( ; p < llen ; p++)
                             {
@@ -362,14 +479,18 @@ Int KLU_refactor        /* returns TRUE if successful, FALSE otherwise */
                             Int i1 = Lir [p + 1] ;
                             Int i2 = Lir [p + 2] ;
                             Int i3 = Lir [p + 3] ;
-                            Lxr [p]     = Xr [i0] * inv_ukk ;
-                            Lxr [p + 1] = Xr [i1] * inv_ukk ;
-                            Lxr [p + 2] = Xr [i2] * inv_ukk ;
-                            Lxr [p + 3] = Xr [i3] * inv_ukk ;
+                            double x0 = Xr [i0] ;
+                            double x1 = Xr [i1] ;
+                            double x2 = Xr [i2] ;
+                            double x3 = Xr [i3] ;
                             Xr [i0] = 0.0 ;
                             Xr [i1] = 0.0 ;
                             Xr [i2] = 0.0 ;
                             Xr [i3] = 0.0 ;
+                            Lxr [p]     = x0 * inv_ukk ;
+                            Lxr [p + 1] = x1 * inv_ukk ;
+                            Lxr [p + 2] = x2 * inv_ukk ;
+                            Lxr [p + 3] = x3 * inv_ukk ;
                         }
                         for ( ; p < llen ; p++)
                         {
@@ -399,6 +520,25 @@ Int KLU_refactor        /* returns TRUE if successful, FALSE otherwise */
         /* scaling */
         /* ------------------------------------------------------------------ */
 
+        if (have_ref_map)
+        {
+            Int npoff = Numeric->ref_poff ;
+            const Int * restrict Air = Ai ;
+            const double * restrict iRs = invRs ;
+            for (p = 0 ; p < npoff ; p++)
+            {
+                Int idx = ref_off_p [p] ;
+                oldrow = Air [idx] ;
+#ifndef COMPLEX
+                Offx [p] = Az [idx] * iRs [oldrow] ;
+#else
+                Offx [p].Real = Az [idx].Real * iRs [oldrow] ;
+                Offx [p].Imag = Az [idx].Imag * iRs [oldrow] ;
+#endif
+            }
+            poff = npoff ;
+        }
+
         for (block = 0 ; block < nblocks ; block++)
         {
 
@@ -417,35 +557,54 @@ Int KLU_refactor        /* returns TRUE if successful, FALSE otherwise */
                 /* singleton case */
                 /* ---------------------------------------------------------- */
 
-                oldcol = Q [k1] ;
-                pend = Ap [oldcol+1] ;
                 CLEAR (s) ;
-                for (p = Ap [oldcol] ; p < pend ; p++)
+                if (have_ref_map)
                 {
-                    oldrow = Ai [p] ;
-                    newrow = Pinv [oldrow] - k1 ;
-                    if (newrow < 0 && poff < nzoff)
+                    Int t0 = ref_blk_col [k1] ;
+                    Int t1 = ref_blk_col [k1 + 1] ;
+                    for (p = t0 ; p < t1 ; p++)
                     {
-                        /* entry in off-diagonal block */
-                        /* Offx [poff] = Az [p] / Rs [oldrow] */
+                        Int idx = ref_blk_p [p] ;
+                        oldrow = Ai [idx] ;
 #ifndef COMPLEX
-                        Offx [poff] = Az [p] * invRs [oldrow] ;
+                        s = Az [idx] * invRs [oldrow] ;
 #else
-                        Offx [poff].Real = Az [p].Real * invRs [oldrow] ;
-                        Offx [poff].Imag = Az [p].Imag * invRs [oldrow] ;
+                        s.Real = Az [idx].Real * invRs [oldrow] ;
+                        s.Imag = Az [idx].Imag * invRs [oldrow] ;
 #endif
-                        poff++ ;
                     }
-                    else
+                }
+                else
+                {
+                    oldcol = Q [k1] ;
+                    pend = Ap [oldcol+1] ;
+                    for (p = Ap [oldcol] ; p < pend ; p++)
                     {
-                        /* singleton */
-                        /* s = Az [p] / Rs [oldrow] */
+                        oldrow = Ai [p] ;
+                        newrow = Pinv [oldrow] - k1 ;
+                        if (newrow < 0 && poff < nzoff)
+                        {
+                            /* entry in off-diagonal block */
+                            /* Offx [poff] = Az [p] / Rs [oldrow] */
 #ifndef COMPLEX
-                        s = Az [p] * invRs [oldrow] ;
+                            Offx [poff] = Az [p] * invRs [oldrow] ;
 #else
-                        s.Real = Az [p].Real * invRs [oldrow] ;
-                        s.Imag = Az [p].Imag * invRs [oldrow] ;
+                            Offx [poff].Real = Az [p].Real * invRs [oldrow] ;
+                            Offx [poff].Imag = Az [p].Imag * invRs [oldrow] ;
 #endif
+                            poff++ ;
+                        }
+                        else
+                        {
+                            /* singleton */
+                            /* s = Az [p] / Rs [oldrow] */
+#ifndef COMPLEX
+                            s = Az [p] * invRs [oldrow] ;
+#else
+                            s.Real = Az [p].Real * invRs [oldrow] ;
+                            s.Imag = Az [p].Imag * invRs [oldrow] ;
+#endif
+                        }
                     }
                 }
                 Udiag [k1] = s ;
@@ -471,34 +630,55 @@ Int KLU_refactor        /* returns TRUE if successful, FALSE otherwise */
                     /* scatter kth column of the block into workspace X */
                     /* ------------------------------------------------------ */
 
-                    oldcol = Q [k+k1] ;
-                    pend = Ap [oldcol+1] ;
-                    for (p = Ap [oldcol] ; p < pend ; p++)
+                    if (have_ref_map)
                     {
-                        oldrow = Ai [p] ;
-                        newrow = Pinv [oldrow] - k1 ;
-                        if (newrow < 0 && poff < nzoff)
+                        Int t0 = ref_blk_col [k + k1] ;
+                        Int t1 = ref_blk_col [k + k1 + 1] ;
+                        const Int * restrict Air = Ai ;
+                        const double * restrict iRs = invRs ;
+                        for (p = t0 ; p < t1 ; p++)
                         {
-                            /* entry in off-diagonal part */
-                            /* Offx [poff] = Az [p] / Rs [oldrow] */
+                            Int idx = ref_blk_p [p] ;
+                            oldrow = Air [idx] ;
 #ifndef COMPLEX
-                            Offx [poff] = Az [p] * invRs [oldrow] ;
+                            X [ref_blk_row [p]] = Az [idx] * iRs [oldrow] ;
 #else
-                            Offx [poff].Real = Az [p].Real * invRs [oldrow] ;
-                            Offx [poff].Imag = Az [p].Imag * invRs [oldrow] ;
+                            X [ref_blk_row [p]].Real = Az [idx].Real * iRs [oldrow] ;
+                            X [ref_blk_row [p]].Imag = Az [idx].Imag * iRs [oldrow] ;
 #endif
-                            poff++ ;
                         }
-                        else
+                    }
+                    else
+                    {
+                        oldcol = Q [k+k1] ;
+                        pend = Ap [oldcol+1] ;
+                        for (p = Ap [oldcol] ; p < pend ; p++)
                         {
-                            /* (newrow,k) is an entry in the block */
-                            /* X [newrow] = Az [p] / Rs [oldrow] */
+                            oldrow = Ai [p] ;
+                            newrow = Pinv [oldrow] - k1 ;
+                            if (newrow < 0 && poff < nzoff)
+                            {
+                                /* entry in off-diagonal part */
+                                /* Offx [poff] = Az [p] / Rs [oldrow] */
 #ifndef COMPLEX
-                            X [newrow] = Az [p] * invRs [oldrow] ;
+                                Offx [poff] = Az [p] * invRs [oldrow] ;
 #else
-                            X [newrow].Real = Az [p].Real * invRs [oldrow] ;
-                            X [newrow].Imag = Az [p].Imag * invRs [oldrow] ;
+                                Offx [poff].Real = Az [p].Real * invRs [oldrow] ;
+                                Offx [poff].Imag = Az [p].Imag * invRs [oldrow] ;
 #endif
+                                poff++ ;
+                            }
+                            else
+                            {
+                                /* (newrow,k) is an entry in the block */
+                                /* X [newrow] = Az [p] / Rs [oldrow] */
+#ifndef COMPLEX
+                                X [newrow] = Az [p] * invRs [oldrow] ;
+#else
+                                X [newrow].Real = Az [p].Real * invRs [oldrow] ;
+                                X [newrow].Imag = Az [p].Imag * invRs [oldrow] ;
+#endif
+                            }
                         }
                     }
 
@@ -527,10 +707,18 @@ Int KLU_refactor        /* returns TRUE if successful, FALSE otherwise */
                                 Int i1 = Lir [p + 1] ;
                                 Int i2 = Lir [p + 2] ;
                                 Int i3 = Lir [p + 3] ;
-                                Xr [i0] -= Lxr [p] * ujk ;
-                                Xr [i1] -= Lxr [p + 1] * ujk ;
-                                Xr [i2] -= Lxr [p + 2] * ujk ;
-                                Xr [i3] -= Lxr [p + 3] * ujk ;
+                                double x0 = Xr [i0] ;
+                                double x1 = Xr [i1] ;
+                                double x2 = Xr [i2] ;
+                                double x3 = Xr [i3] ;
+                                x0 -= Lxr [p]     * ujk ;
+                                x1 -= Lxr [p + 1] * ujk ;
+                                x2 -= Lxr [p + 2] * ujk ;
+                                x3 -= Lxr [p + 3] * ujk ;
+                                Xr [i0] = x0 ;
+                                Xr [i1] = x1 ;
+                                Xr [i2] = x2 ;
+                                Xr [i3] = x3 ;
                             }
                             for ( ; p < llen ; p++)
                             {
@@ -581,14 +769,18 @@ Int KLU_refactor        /* returns TRUE if successful, FALSE otherwise */
                             Int i1 = Lir [p + 1] ;
                             Int i2 = Lir [p + 2] ;
                             Int i3 = Lir [p + 3] ;
-                            Lxr [p]     = Xr [i0] * inv_ukk ;
-                            Lxr [p + 1] = Xr [i1] * inv_ukk ;
-                            Lxr [p + 2] = Xr [i2] * inv_ukk ;
-                            Lxr [p + 3] = Xr [i3] * inv_ukk ;
+                            double x0 = Xr [i0] ;
+                            double x1 = Xr [i1] ;
+                            double x2 = Xr [i2] ;
+                            double x3 = Xr [i3] ;
                             Xr [i0] = 0.0 ;
                             Xr [i1] = 0.0 ;
                             Xr [i2] = 0.0 ;
                             Xr [i3] = 0.0 ;
+                            Lxr [p]     = x0 * inv_ukk ;
+                            Lxr [p + 1] = x1 * inv_ukk ;
+                            Lxr [p + 2] = x2 * inv_ukk ;
+                            Lxr [p + 3] = x3 * inv_ukk ;
                         }
                         for ( ; p < llen ; p++)
                         {

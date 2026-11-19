@@ -707,12 +707,213 @@ B4P(syncAvxDynFromInst)(B4P(model) *head)
         for (int lane = nact; lane < 8; lane++)
             von_a[lane] = von_a[0];
         dyn[bi].von = v8_load(von_a);
+        dyn[bi].phys_valid = 0;
+        dyn[bi].stamp_valid = 0;
     }
     head->B4P(AvxDynValid) = 1;
 }
 
+static inline double
+B4P(avxBypassTol)(const CKTcircuit *ckt)
+{
+    static int init = 0;
+    static int mode = 0; /* 0=auto(min(CKTvoltTol,1e-6)), 1=disabled, 2=override */
+    static double override_tol = 1.0e-6;
+    if (!init) {
+        if (getenv("NGSPICE_NO_BLOCK_BYPASS") != NULL) {
+            mode = 1;
+        } else {
+            const char *env = getenv("NGSPICE_AVX_BYPASS_TOL");
+            if (env && env[0]) {
+                override_tol = atof(env);
+                mode = 2;
+            }
+        }
+        init = 1;
+    }
+    if (mode == 1) return -1.0;
+    if (mode == 2) return override_tol;
+    double vt = ckt->CKTvoltTol;
+    return (vt < 1.0e-6) ? vt : 1.0e-6;
+}
+
+static inline int
+B4P(blockCacheMatch)(
+    const BSIM4Avx512Dyn * restrict d,
+    v8d vds, v8d vgs, v8d vbs,
+    double vtol, double reltol, double abstol,
+    __mmask8 active_mask,
+    int *exact_zero_out)
+{
+    v8d delvds = vds - d->last_vds;
+    v8d delvgs = vgs - d->last_vgs;
+    v8d delvbs = vbs - d->last_vbs;
+    v8d dv = v8_max(v8_abs(delvds), v8_max(v8_abs(delvgs), v8_abs(delvbs)));
+    if ((v8_le(dv, v8_set1(vtol)) & active_mask) != active_mask)
+        return 0;
+    /* Require identical forward/reverse sign across vds == 0 */
+    __mmask8 m_flip = (v8_ge(vds, v8_set1(0.0)) ^ v8_ge(d->last_vds, v8_set1(0.0))) & active_mask;
+    if (m_flip)
+        return 0;
+    /* Require 10x tighter than convTest current tolerance so cache can NEVER stall Newton */
+    const v8d v_rel = v8_set1(0.1 * reltol);
+    const v8d v_abs = v8_set1(0.1 * abstol);
+    v8d cd_diff = d->cd_g * delvgs + d->cd_d * delvds + d->cd_b * delvbs;
+    v8d cdhat   = d->Idtot + cd_diff;
+    v8d tol0    = v_rel * v8_max(v8_abs(cdhat), v8_abs(d->Idtot)) + v_abs;
+    v8d cb_diff = d->cb_g * delvgs + d->cb_d * delvds + d->cb_b * delvbs;
+    v8d cbhat   = d->Ibtot + cb_diff;
+    v8d tol6    = v_rel * v8_max(v8_abs(cbhat), v8_abs(d->Ibtot)) + v_abs;
+    __mmask8 fail = (v8_ge(v8_abs(cd_diff), tol0) | v8_ge(v8_abs(cb_diff), tol6)) & active_mask;
+    if (fail)
+        return 0;
+    *exact_zero_out = ((v8_le(dv, v8_set1(1.0e-13)) & active_mask) == active_mask);
+    return 1;
+}
+
+static inline void
+B4P(stampAvxDyn)(
+    const BSIM4Avx512Block * restrict blk,
+    const BSIM4Avx512Dyn * restrict dyn,
+    B4P(instance) **InstArray,
+    double * restrict my_ax,
+    double * restrict my_rhs,
+    int stamp_mode)
+{
+    int nact = blk->n_active;
+    double mgd_arr[8], mgs_arr[8];
+    if (blk->m_has_dint) v8_store(mgd_arr, blk->mgd);
+    if (blk->m_has_sint) v8_store(mgs_arr, blk->mgs);
+
+    if (stamp_mode == 0) {
+        for (int lane = 0; lane < nact; lane++) {
+            const int *off = blk->kluOff[lane];
+            my_rhs[blk->dNodePrime[lane]] += dyn->st_rhsd[lane];
+            my_rhs[blk->gNodePrime[lane]] -= dyn->st_rhsg[lane];
+            my_rhs[blk->bNodePrime[lane]] += dyn->st_rhsb[lane];
+            my_rhs[blk->sNodePrime[lane]] += dyn->st_rhss[lane];
+
+            my_ax[off[0]]  += dyn->st_v34[lane];
+            my_ax[off[1]]  += dyn->st_v35[lane];
+            my_ax[off[2]]  += dyn->st_v36[lane];
+            my_ax[off[3]]  += dyn->st_v37[lane];
+            my_ax[off[4]]  += dyn->st_v44[lane];
+            my_ax[off[5]]  += dyn->st_v46[lane];
+            my_ax[off[6]]  -= dyn->st_v47[lane];
+            my_ax[off[7]]  -= dyn->st_v48[lane];
+            my_ax[off[8]]  -= dyn->st_v51[lane];
+            my_ax[off[9]]  += dyn->st_v52[lane];
+            my_ax[off[10]] += dyn->st_v53[lane];
+            my_ax[off[11]] -= dyn->st_v55[lane];
+            my_ax[off[12]] += dyn->st_v58[lane];
+            my_ax[off[13]] += dyn->st_v59[lane];
+            my_ax[off[14]] += dyn->st_v60[lane];
+            my_ax[off[15]] += dyn->st_v61[lane];
+        }
+        if (blk->m_has_dint) {
+            for (int lane = 0; lane < nact; lane++) {
+                if (blk->m_has_dint & (1u << lane)) {
+                    const int *off = blk->kluOff[lane];
+                    double mgd = mgd_arr[lane];
+                    my_ax[off[16]] -= mgd;
+                    my_ax[off[17]] -= mgd;
+                    my_ax[off[18]] += mgd;
+                }
+            }
+        }
+        if (blk->m_has_sint) {
+            for (int lane = 0; lane < nact; lane++) {
+                if (blk->m_has_sint & (1u << lane)) {
+                    const int *off = blk->kluOff[lane];
+                    double mgs = mgs_arr[lane];
+                    my_ax[off[19]] -= mgs;
+                    my_ax[off[20]] -= mgs;
+                    my_ax[off[21]] += mgs;
+                }
+            }
+        }
+    } else if (stamp_mode == 1) {
+        for (int lane = 0; lane < nact; lane++) {
+            B4P(instance) *here = InstArray[blk->instIdx[lane]];
+            __mmask8 bit = (__mmask8)(1u << lane);
+            my_rhs[blk->dNodePrime[lane]] += dyn->st_rhsd[lane];
+            my_rhs[blk->gNodePrime[lane]] -= dyn->st_rhsg[lane];
+            my_rhs[blk->bNodePrime[lane]] += dyn->st_rhsb[lane];
+            my_rhs[blk->sNodePrime[lane]] += dyn->st_rhss[lane];
+
+            *(here->B4P(GPgpPtr)) += dyn->st_v34[lane];
+            *(here->B4P(GPdpPtr)) += dyn->st_v35[lane];
+            *(here->B4P(GPspPtr)) += dyn->st_v36[lane];
+            *(here->B4P(GPbpPtr)) += dyn->st_v37[lane];
+            *(here->B4P(DPdpPtr)) += dyn->st_v44[lane];
+            *(here->B4P(DPgpPtr)) += dyn->st_v46[lane];
+            *(here->B4P(DPspPtr)) -= dyn->st_v47[lane];
+            *(here->B4P(DPbpPtr)) -= dyn->st_v48[lane];
+            if (blk->m_has_dint & bit) {
+                double mgd = mgd_arr[lane];
+                *(here->B4P(DPdPtr)) -= mgd;
+                *(here->B4P(DdpPtr)) -= mgd;
+                *(here->B4P(DdPtr))  += mgd;
+            }
+            *(here->B4P(SPdpPtr)) -= dyn->st_v51[lane];
+            *(here->B4P(SPgpPtr)) += dyn->st_v52[lane];
+            *(here->B4P(SPspPtr)) += dyn->st_v53[lane];
+            *(here->B4P(SPbpPtr)) -= dyn->st_v55[lane];
+            if (blk->m_has_sint & bit) {
+                double mgs = mgs_arr[lane];
+                *(here->B4P(SPsPtr)) -= mgs;
+                *(here->B4P(SspPtr)) -= mgs;
+                *(here->B4P(SsPtr))  += mgs;
+            }
+            *(here->B4P(BPdpPtr)) += dyn->st_v58[lane];
+            *(here->B4P(BPgpPtr)) += dyn->st_v59[lane];
+            *(here->B4P(BPspPtr)) += dyn->st_v60[lane];
+            *(here->B4P(BPbpPtr)) += dyn->st_v61[lane];
+        }
+    } else {
+        for (int lane = 0; lane < nact; lane++) {
+            B4P(instance) *here = InstArray[blk->instIdx[lane]];
+            __mmask8 bit = (__mmask8)(1u << lane);
+            here->B4P(rhsdPrime) = dyn->st_rhsd[lane];
+            here->B4P(rhsgPrime) = dyn->st_rhsg[lane];
+            here->B4P(rhsbPrime) = dyn->st_rhsb[lane];
+            here->B4P(rhssPrime) = dyn->st_rhss[lane];
+            here->B4P(_34) = dyn->st_v34[lane];
+            here->B4P(_35) = dyn->st_v35[lane];
+            here->B4P(_36) = dyn->st_v36[lane];
+            here->B4P(_37) = dyn->st_v37[lane];
+            here->B4P(_44) = dyn->st_v44[lane];
+            here->B4P(_46) = dyn->st_v46[lane];
+            here->B4P(_47) = dyn->st_v47[lane];
+            here->B4P(_48) = dyn->st_v48[lane];
+            if (blk->m_has_dint & bit) {
+                double mgd = mgd_arr[lane];
+                here->B4P(_45) = mgd;
+                here->B4P(_49) = mgd;
+                here->B4P(_50) = mgd;
+            }
+            here->B4P(_51) = dyn->st_v51[lane];
+            here->B4P(_52) = dyn->st_v52[lane];
+            here->B4P(_53) = dyn->st_v53[lane];
+            here->B4P(_55) = dyn->st_v55[lane];
+            if (blk->m_has_sint & bit) {
+                double mgs = mgs_arr[lane];
+                here->B4P(_54) = mgs;
+                here->B4P(_56) = mgs;
+                here->B4P(_57) = mgs;
+            }
+            here->B4P(_58) = dyn->st_v58[lane];
+            here->B4P(_59) = dyn->st_v59[lane];
+            here->B4P(_60) = dyn->st_v60[lane];
+            here->B4P(_61) = dyn->st_v61[lane];
+        }
+    }
+}
+
 /*
- * Evaluate one 8-wide block with 8-wide AVX-512 voltage limiting and stamp:
+ * Evaluate one 8-wide block with 8-wide AVX-512 voltage limiting, two-level
+ * stationary-voltage caching (Level 1 same-step stamp replay & Level 2
+ * cross-step physics reuse), and direct stamping:
  *   stamp_mode == 0: KLU / TLS direct stamp into my_ax & my_rhs (zero AoS chase when !need_aos!)
  *   stamp_mode == 1: Sparse 1t direct stamp into *(here->*Ptr) & my_rhs
  *   stamp_mode == 2: Sparse OMP buffered write into here->B4P(_34.._61) & here->B4P(rhs*)
@@ -732,13 +933,54 @@ B4P(evalAvxBlock)(
     const double * restrict s1 = ckt->CKTstate1;
     const double * restrict s2 = ckt->CKTstate2;
     int is_pred = (ckt->CKTmode & MODEINITPRED) != 0;
-    double xfact = is_pred ? (ckt->CKTdelta / ckt->CKTdeltaOld[1]) : 0.0;
-    double one_p_xf = 1.0 + xfact;
+    int is_gear2 = (ckt->CKTintegrateMethod == GEAR && ckt->CKTorder == 2);
+    int is_trap2 = (ckt->CKTintegrateMethod == TRAPEZOIDAL && ckt->CKTorder == 2);
+    int int_mode = is_gear2 ? 2 : (is_trap2 ? 1 : 0);
+    int need_aos = B4P(AvxNeedAosSync);
+    double ag0 = ckt->CKTag[0], ag1 = ckt->CKTag[1], ag2 = ckt->CKTag[2];
+    double vtol = B4P(avxBypassTol)(ckt);
     int nact = blk->n_active;
     __mmask8 active_mask = (__mmask8)((1u << nact) - 1u);
 
     double a_vds[8], a_vgs[8], a_vbs[8];
     double a_s0_vds[8], a_s0_vgs[8], a_s0_vbs[8], a_s0_vbd[8];
+
+    /* Level-1 fast path: exact same timestep/integration & stationary voltages ->
+     * skip CKTstate0 read/write, voltage limiting, physics, and integration! */
+    if (!is_pred && !need_aos && vtol >= 0.0 && dyn->stamp_valid &&
+        dyn->last_time == ckt->CKTtime &&
+        dyn->last_ag0 == ag0 && dyn->last_ag1 == ag1 && dyn->last_ag2 == ag2 &&
+        dyn->last_gmin == ckt->CKTgmin && dyn->last_int_mode == int_mode &&
+        dyn->last_s0 == s0 && dyn->last_s1 == s1 && dyn->last_s2 == s2)
+    {
+        for (int lane = 0; lane < nact; lane++) {
+            double vs_node = rhsOld[blk->sNodePrime[lane]];
+            a_vds[lane] = rhsOld[blk->dNodePrime[lane]] - vs_node;
+            a_vgs[lane] = rhsOld[blk->gNodePrime[lane]] - vs_node;
+            a_vbs[lane] = rhsOld[blk->bNodePrime[lane]] - vs_node;
+        }
+        for (int lane = nact; lane < 8; lane++) {
+            a_vds[lane] = a_vds[0];
+            a_vgs[lane] = a_vgs[0];
+            a_vbs[lane] = a_vbs[0];
+        }
+        v8d vds_r = v8_load(a_vds) * blk->type;
+        v8d vgs_r = v8_load(a_vgs) * blk->type;
+        v8d vbs_r = v8_load(a_vbs) * blk->type;
+        int exact_zero = 0;
+        if (B4P(blockCacheMatch)(dyn, vds_r, vgs_r, vbs_r, vtol,
+                                 ckt->CKTreltol, ckt->CKTabstol, active_mask, &exact_zero)) {
+            if (!exact_zero) {
+                bsim4_avx512_l1_sync_state(blk, dyn, vds_r, vgs_r, vbs_r,
+                                           ag0, ag1, ag2, is_gear2, is_trap2, s0, s1, s2);
+            }
+            B4P(stampAvxDyn)(blk, dyn, InstArray, my_ax, my_rhs, stamp_mode);
+            return;
+        }
+    }
+
+    double xfact = is_pred ? (ckt->CKTdelta / ckt->CKTdeltaOld[1]) : 0.0;
+    double one_p_xf = 1.0 + xfact;
 
 #ifndef PREDICTOR
     if (is_pred) {
@@ -812,11 +1054,11 @@ B4P(evalAvxBlock)(
     }
 
     /* 8-wide AVX-512 DEVpnjlim */
+    __mmask8 chk_mask = 0;
     {
         __mmask8 m_vds_fwd = v8_ge(vds, v8_set1(0.0));
         v8d vj_in  = v8_sel(m_vds_fwd, vbs, vbd);
         v8d vj_old = v8_sel(m_vds_fwd, s0_vbs, s0_vbd);
-        __mmask8 chk_mask = 0;
         v8d vj_lim = v8_pnjlim(vj_in, vj_old, CONSTvt0, blk->vcrit_v, &chk_mask);
         vbs = v8_sel(m_vds_fwd, vj_lim, vj_lim + vds);
         chk_mask &= active_mask;
@@ -834,18 +1076,38 @@ B4P(evalAvxBlock)(
         }
     }
 
-    int is_gear2 = (ckt->CKTintegrateMethod == GEAR && ckt->CKTorder == 2);
-    int is_trap2 = (ckt->CKTintegrateMethod == TRAPEZOIDAL && ckt->CKTorder == 2);
-    int need_aos = B4P(AvxNeedAosSync);
+    /* Level-2 fast path: cross-timestep stationary voltages -> reuse cached DC+C+Q
+     * physics and only run charge integration + ag0 stamp assembly! */
+    if (!need_aos && !chk_mask && vtol >= 0.0 && dyn->phys_valid &&
+        dyn->last_gmin == ckt->CKTgmin)
+    {
+        int exact_zero = 0;
+        if (B4P(blockCacheMatch)(dyn, vds, vgs, vbs, vtol,
+                                 ckt->CKTreltol, ckt->CKTabstol, active_mask, &exact_zero)) {
+            bsim4_avx512_integrate_and_assemble(blk, dyn, vds, vgs, vbs, !exact_zero,
+                                                ag0, ag1, ag2, is_gear2, is_trap2, s0, s1, s2);
+            dyn->last_time = ckt->CKTtime;
+            dyn->last_ag0 = ag0; dyn->last_ag1 = ag1; dyn->last_ag2 = ag2;
+            dyn->last_int_mode = int_mode;
+            dyn->last_s0 = s0; dyn->last_s1 = s1; dyn->last_s2 = s2;
+            dyn->stamp_valid = 1;
+            B4P(stampAvxDyn)(blk, dyn, InstArray, my_ax, my_rhs, stamp_mode);
+            return;
+        }
+    }
 
     BSIM4Avx512Out out;
     bsim4_avx512_eval_block(blk, dyn, vds, vgs, vbs,
-                            ckt->CKTgmin, ckt->CKTag[0], ckt->CKTag[1], ckt->CKTag[2],
+                            ckt->CKTgmin, ag0, ag1, ag2,
                             is_gear2, is_trap2, s0, s1, s2, &out, need_aos);
 
-    double mgd_arr[8], mgs_arr[8];
-    if (blk->m_has_dint) v8_store(mgd_arr, blk->mgd);
-    if (blk->m_has_sint) v8_store(mgs_arr, blk->mgs);
+    dyn->last_time = ckt->CKTtime;
+    dyn->last_ag0 = ag0; dyn->last_ag1 = ag1; dyn->last_ag2 = ag2;
+    dyn->last_gmin = ckt->CKTgmin;
+    dyn->last_int_mode = int_mode;
+    dyn->last_s0 = s0; dyn->last_s1 = s1; dyn->last_s2 = s2;
+    dyn->phys_valid = 1;
+    dyn->stamp_valid = !need_aos;
 
     if (need_aos) {
         for (int lane = 0; lane < nact; lane++) {
@@ -877,129 +1139,7 @@ B4P(evalAvxBlock)(
         }
     }
 
-    if (stamp_mode == 0) {
-        for (int lane = 0; lane < nact; lane++) {
-            const int *off = blk->kluOff[lane];
-            my_rhs[blk->dNodePrime[lane]] += out.rhsd[lane];
-            my_rhs[blk->gNodePrime[lane]] -= out.rhsg[lane];
-            my_rhs[blk->bNodePrime[lane]] += out.rhsb[lane];
-            my_rhs[blk->sNodePrime[lane]] += out.rhss[lane];
-
-            my_ax[off[0]]  += out.v34[lane];
-            my_ax[off[1]]  += out.v35[lane];
-            my_ax[off[2]]  += out.v36[lane];
-            my_ax[off[3]]  += out.v37[lane];
-            my_ax[off[4]]  += out.v44[lane];
-            my_ax[off[5]]  += out.v46[lane];
-            my_ax[off[6]]  -= out.v47[lane];
-            my_ax[off[7]]  -= out.v48[lane];
-            my_ax[off[8]]  -= out.v51[lane];
-            my_ax[off[9]]  += out.v52[lane];
-            my_ax[off[10]] += out.v53[lane];
-            my_ax[off[11]] -= out.v55[lane];
-            my_ax[off[12]] += out.v58[lane];
-            my_ax[off[13]] += out.v59[lane];
-            my_ax[off[14]] += out.v60[lane];
-            my_ax[off[15]] += out.v61[lane];
-        }
-        if (blk->m_has_dint) {
-            for (int lane = 0; lane < nact; lane++) {
-                if (blk->m_has_dint & (1u << lane)) {
-                    const int *off = blk->kluOff[lane];
-                    double mgd = mgd_arr[lane];
-                    my_ax[off[16]] -= mgd;
-                    my_ax[off[17]] -= mgd;
-                    my_ax[off[18]] += mgd;
-                }
-            }
-        }
-        if (blk->m_has_sint) {
-            for (int lane = 0; lane < nact; lane++) {
-                if (blk->m_has_sint & (1u << lane)) {
-                    const int *off = blk->kluOff[lane];
-                    double mgs = mgs_arr[lane];
-                    my_ax[off[19]] -= mgs;
-                    my_ax[off[20]] -= mgs;
-                    my_ax[off[21]] += mgs;
-                }
-            }
-        }
-    } else if (stamp_mode == 1) {
-        for (int lane = 0; lane < nact; lane++) {
-            B4P(instance) *here = InstArray[blk->instIdx[lane]];
-            __mmask8 bit = (__mmask8)(1u << lane);
-            my_rhs[blk->dNodePrime[lane]] += out.rhsd[lane];
-            my_rhs[blk->gNodePrime[lane]] -= out.rhsg[lane];
-            my_rhs[blk->bNodePrime[lane]] += out.rhsb[lane];
-            my_rhs[blk->sNodePrime[lane]] += out.rhss[lane];
-
-            *(here->B4P(GPgpPtr)) += out.v34[lane];
-            *(here->B4P(GPdpPtr)) += out.v35[lane];
-            *(here->B4P(GPspPtr)) += out.v36[lane];
-            *(here->B4P(GPbpPtr)) += out.v37[lane];
-            *(here->B4P(DPdpPtr)) += out.v44[lane];
-            *(here->B4P(DPgpPtr)) += out.v46[lane];
-            *(here->B4P(DPspPtr)) -= out.v47[lane];
-            *(here->B4P(DPbpPtr)) -= out.v48[lane];
-            if (blk->m_has_dint & bit) {
-                double mgd = mgd_arr[lane];
-                *(here->B4P(DPdPtr)) -= mgd;
-                *(here->B4P(DdpPtr)) -= mgd;
-                *(here->B4P(DdPtr))  += mgd;
-            }
-            *(here->B4P(SPdpPtr)) -= out.v51[lane];
-            *(here->B4P(SPgpPtr)) += out.v52[lane];
-            *(here->B4P(SPspPtr)) += out.v53[lane];
-            *(here->B4P(SPbpPtr)) -= out.v55[lane];
-            if (blk->m_has_sint & bit) {
-                double mgs = mgs_arr[lane];
-                *(here->B4P(SPsPtr)) -= mgs;
-                *(here->B4P(SspPtr)) -= mgs;
-                *(here->B4P(SsPtr))  += mgs;
-            }
-            *(here->B4P(BPdpPtr)) += out.v58[lane];
-            *(here->B4P(BPgpPtr)) += out.v59[lane];
-            *(here->B4P(BPspPtr)) += out.v60[lane];
-            *(here->B4P(BPbpPtr)) += out.v61[lane];
-        }
-    } else {
-        for (int lane = 0; lane < nact; lane++) {
-            B4P(instance) *here = InstArray[blk->instIdx[lane]];
-            __mmask8 bit = (__mmask8)(1u << lane);
-            here->B4P(rhsdPrime) = out.rhsd[lane];
-            here->B4P(rhsgPrime) = out.rhsg[lane];
-            here->B4P(rhsbPrime) = out.rhsb[lane];
-            here->B4P(rhssPrime) = out.rhss[lane];
-            here->B4P(_34) = out.v34[lane];
-            here->B4P(_35) = out.v35[lane];
-            here->B4P(_36) = out.v36[lane];
-            here->B4P(_37) = out.v37[lane];
-            here->B4P(_44) = out.v44[lane];
-            here->B4P(_46) = out.v46[lane];
-            here->B4P(_47) = out.v47[lane];
-            here->B4P(_48) = out.v48[lane];
-            if (blk->m_has_dint & bit) {
-                double mgd = mgd_arr[lane];
-                here->B4P(_45) = mgd;
-                here->B4P(_49) = mgd;
-                here->B4P(_50) = mgd;
-            }
-            here->B4P(_51) = out.v51[lane];
-            here->B4P(_52) = out.v52[lane];
-            here->B4P(_53) = out.v53[lane];
-            here->B4P(_55) = out.v55[lane];
-            if (blk->m_has_sint & bit) {
-                double mgs = mgs_arr[lane];
-                here->B4P(_54) = mgs;
-                here->B4P(_56) = mgs;
-                here->B4P(_57) = mgs;
-            }
-            here->B4P(_58) = out.v58[lane];
-            here->B4P(_59) = out.v59[lane];
-            here->B4P(_60) = out.v60[lane];
-            here->B4P(_61) = out.v61[lane];
-        }
-    }
+    B4P(stampAvxDyn)(blk, dyn, InstArray, my_ax, my_rhs, stamp_mode);
 }
 
 /*
@@ -1092,6 +1232,183 @@ B4P(convTestAvx)(GENmodel *inModel, CKTcircuit *ckt)
         if (fail)
             return 1;
     }
+    return 0;
+}
+
+/*
+ * 8-wide AVX-512 truncation error over AvxBlocks (zero AoS chase!).
+ * Handles ord == 1 and ord == 2 when CKTterrCacheValid is set.
+ * Returns -1 if not applicable (caller falls back to scalar), 0 if handled.
+ */
+static inline double
+B4P(terrBlock8)(
+    const BSIM4Avx512Block * restrict blk,
+    const double * restrict s0,
+    const double * restrict s1,
+    const double * restrict s2,
+    const double * restrict s3,
+    int ord,
+    v8d v_abstol, v8d v_reltol, v8d v_relInvD, v8d v_chgtol,
+    v8d v_trtol, v8d v_tfac,
+    v8d v_w0, v8d v_w1, v8d v_w2, v8d v_w3,
+    double cur)
+{
+    int nact = blk->n_active;
+    __mmask8 active_mask = (__mmask8)((1u << nact) - 1u);
+    double aq0[3][8], aq1[3][8], aq2[3][8], aq3[3][8], ac0[3][8], ac1[3][8];
+
+    if (ord == 2) {
+        for (int lane = 0; lane < nact; lane++) {
+            int st = blk->stateBase[lane];
+            aq0[0][lane] = s0[st + 11]; ac0[0][lane] = s0[st + 12];
+            aq0[1][lane] = s0[st + 13]; ac0[1][lane] = s0[st + 14];
+            aq0[2][lane] = s0[st + 15]; ac0[2][lane] = s0[st + 16];
+            aq1[0][lane] = s1[st + 11]; ac1[0][lane] = s1[st + 12];
+            aq1[1][lane] = s1[st + 13]; ac1[1][lane] = s1[st + 14];
+            aq1[2][lane] = s1[st + 15]; ac1[2][lane] = s1[st + 16];
+            aq2[0][lane] = s2[st + 11];
+            aq2[1][lane] = s2[st + 13];
+            aq2[2][lane] = s2[st + 15];
+            aq3[0][lane] = s3[st + 11];
+            aq3[1][lane] = s3[st + 13];
+            aq3[2][lane] = s3[st + 15];
+        }
+        for (int lane = nact; lane < 8; lane++) {
+            for (int c = 0; c < 3; c++) {
+                aq0[c][lane] = aq0[c][0]; ac0[c][lane] = ac0[c][0];
+                aq1[c][lane] = aq1[c][0]; ac1[c][lane] = ac1[c][0];
+                aq2[c][lane] = aq2[c][0]; aq3[c][lane] = aq3[c][0];
+            }
+        }
+        for (int c = 0; c < 3; c++) {
+            v8d q0 = v8_load(aq0[c]), q1 = v8_load(aq1[c]);
+            v8d c0 = v8_abs(v8_load(ac0[c])), c1 = v8_abs(v8_load(ac1[c]));
+            v8d volttol = v_abstol + v_reltol * v8_max(c0, c1);
+            v8d qmax = v8_max(v8_abs(q0), v8_abs(q1));
+            v8d chargetol = v_relInvD * v8_max(qmax, v_chgtol);
+            v8d tol = v8_max(volttol, chargetol);
+            v8d d0 = v_w0 * q0 + v_w1 * q1 + v_w2 * v8_load(aq2[c]) + v_w3 * v8_load(aq3[c]);
+            v8d den = v8_max(v_abstol, v_tfac * v8_abs(d0));
+            v8d num = v_trtol * tol;
+            if (cur >= 1e150 || (v8_lt(num, v8_set1(cur * cur) * den) & active_mask)) {
+                double del[8];
+                v8_store(del, v8_sqrt(num / den));
+                for (int lane = 0; lane < nact; lane++) {
+                    if (del[lane] < cur)
+                        cur = del[lane];
+                }
+            }
+        }
+    } else {
+        for (int lane = 0; lane < nact; lane++) {
+            int st = blk->stateBase[lane];
+            aq0[0][lane] = s0[st + 11]; ac0[0][lane] = s0[st + 12];
+            aq0[1][lane] = s0[st + 13]; ac0[1][lane] = s0[st + 14];
+            aq0[2][lane] = s0[st + 15]; ac0[2][lane] = s0[st + 16];
+            aq1[0][lane] = s1[st + 11]; ac1[0][lane] = s1[st + 12];
+            aq1[1][lane] = s1[st + 13]; ac1[1][lane] = s1[st + 14];
+            aq1[2][lane] = s1[st + 15]; ac1[2][lane] = s1[st + 16];
+            aq2[0][lane] = s2[st + 11];
+            aq2[1][lane] = s2[st + 13];
+            aq2[2][lane] = s2[st + 15];
+        }
+        for (int lane = nact; lane < 8; lane++) {
+            for (int c = 0; c < 3; c++) {
+                aq0[c][lane] = aq0[c][0]; ac0[c][lane] = ac0[c][0];
+                aq1[c][lane] = aq1[c][0]; ac1[c][lane] = ac1[c][0];
+                aq2[c][lane] = aq2[c][0];
+            }
+        }
+        for (int c = 0; c < 3; c++) {
+            v8d q0 = v8_load(aq0[c]), q1 = v8_load(aq1[c]);
+            v8d c0 = v8_abs(v8_load(ac0[c])), c1 = v8_abs(v8_load(ac1[c]));
+            v8d volttol = v_abstol + v_reltol * v8_max(c0, c1);
+            v8d qmax = v8_max(v8_abs(q0), v8_abs(q1));
+            v8d chargetol = v_relInvD * v8_max(qmax, v_chgtol);
+            v8d tol = v8_max(volttol, chargetol);
+            v8d d0 = v_w0 * q0 + v_w1 * q1 + v_w2 * v8_load(aq2[c]);
+            v8d den = v8_max(v_abstol, v_tfac * v8_abs(d0));
+            v8d num = v_trtol * tol;
+            if (cur >= 1e150 || (v8_lt(num, v8_set1(cur) * den) & active_mask)) {
+                double del[8];
+                v8_store(del, num / den);
+                for (int lane = 0; lane < nact; lane++) {
+                    if (del[lane] < cur)
+                        cur = del[lane];
+                }
+            }
+        }
+    }
+    return cur;
+}
+
+int
+B4P(truncAvx)(GENmodel *inModel, CKTcircuit *ckt, double *timeStep)
+{
+    B4P(model) *head = (B4P(model) *)inModel;
+    int ord = ckt->CKTorder;
+    if (!head->B4P(AvxBuilt) || !ckt->CKTterrCacheValid || (ord != 1 && ord != 2))
+        return -1;
+
+    const BSIM4Avx512Block *blocks = (const BSIM4Avx512Block *)head->B4P(AvxBlocks);
+    int nBlocks = head->B4P(AvxBlockCount);
+    const double * restrict s0 = ckt->CKTstate0;
+    const double * restrict s1 = ckt->CKTstate1;
+    const double * restrict s2 = ckt->CKTstates[2];
+    const double * restrict s3 = (ord == 2) ? ckt->CKTstates[3] : NULL;
+    const double *w = ckt->CKTterrWeights;
+
+    v8d v_abstol  = v8_set1(ckt->CKTabstol);
+    v8d v_reltol  = v8_set1(ckt->CKTreltol);
+    v8d v_relInvD = v8_set1(ckt->CKTterrReltolInvDelta);
+    v8d v_chgtol  = v8_set1(ckt->CKTchgtol);
+    v8d v_trtol   = v8_set1(ckt->CKTtrtol);
+    v8d v_tfac    = v8_set1(ckt->CKTterrFactor);
+    v8d v_w0      = v8_set1(w[0]);
+    v8d v_w1      = v8_set1(w[1]);
+    v8d v_w2      = v8_set1(w[2]);
+    v8d v_w3      = v8_set1(ord == 2 ? w[3] : 0.0);
+
+    double minStep = *timeStep;
+#ifdef USE_OMP
+    if (nBlocks > 32 && omp_get_max_threads() > 1) {
+        #pragma omp parallel for reduction(min:minStep)
+        for (int bi = 0; bi < nBlocks; bi++) {
+            minStep = B4P(terrBlock8)(&blocks[bi], s0, s1, s2, s3, ord,
+                                      v_abstol, v_reltol, v_relInvD, v_chgtol,
+                                      v_trtol, v_tfac, v_w0, v_w1, v_w2, v_w3, minStep);
+        }
+    } else
+#endif
+    {
+        for (int bi = 0; bi < nBlocks; bi++) {
+            minStep = B4P(terrBlock8)(&blocks[bi], s0, s1, s2, s3, ord,
+                                      v_abstol, v_reltol, v_relInvD, v_chgtol,
+                                      v_trtol, v_tfac, v_w0, v_w1, v_w2, v_w3, minStep);
+        }
+    }
+
+    int nFb = head->B4P(AvxFallbackCount);
+    if (nFb > 0) {
+        const int *fbIdx = head->B4P(AvxFallbackIdx);
+        B4P(instance) **InstArray = head->B4P(InstanceArray);
+        for (int k = 0; k < nFb; k++) {
+            B4P(instance) *inst = InstArray[fbIdx[k]];
+            CKTterr(inst->B4P(qb), ckt, &minStep);
+            CKTterr(inst->B4P(qg), ckt, &minStep);
+            CKTterr(inst->B4P(qd), ckt, &minStep);
+            if (inst->B4P(trnqsMod))
+                CKTterr(inst->B4P(qcdump), ckt, &minStep);
+            if (inst->B4P(rbodyMod)) {
+                CKTterr(inst->B4P(qbs), ckt, &minStep);
+                CKTterr(inst->B4P(qbd), ckt, &minStep);
+            }
+            if (inst->B4P(rgateMod) == 3)
+                CKTterr(inst->B4P(qgmid), ckt, &minStep);
+        }
+    }
+
+    *timeStep = minStep;
     return 0;
 }
 

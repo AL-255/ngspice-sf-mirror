@@ -518,22 +518,49 @@ typedef struct __attribute__((aligned(64))) {
     int kluOff[8][22];     /* KLU Ax offsets (valid when KLU mode active) */
 } BSIM4Avx512Block;
 
-/* Compact 64B-aligned per-block dynamic state for AVX-512 voltage limiting & convTest */
+/* Compact 64B-aligned per-block dynamic state, Level-1 stamp cache & Level-2 physics cache */
 typedef struct __attribute__((aligned(64))) {
+    /* Hot Level-1 / convTest / limiting fields (first cache lines) */
     v8d von;
     v8d last_vds, last_vgs, last_vbs;
     v8d Idtot, cd_g, cd_d, cd_b;
     v8d Ibtot, cb_g, cb_d, cb_b;
+
+    /* Level-1 cached matrix/RHS stamps (already multiplied by m) */
+    double st_rhsd[8], st_rhsg[8], st_rhsb[8], st_rhss[8];
+    double st_v34[8], st_v35[8], st_v36[8], st_v37[8];
+    double st_v44[8], st_v46[8], st_v47[8], st_v48[8];
+    double st_v51[8], st_v52[8], st_v53[8], st_v55[8];
+    double st_v58[8], st_v59[8], st_v60[8], st_v61[8];
+
+    /* Cache validity metadata */
+    double last_time;
+    double last_ag0, last_ag1, last_ag2;
+    double last_gmin;
+    const double *last_s0;
+    const double *last_s1;
+    const double *last_s2;
+    int last_int_mode;
+    uint8_t phys_valid;
+    uint8_t stamp_valid;
+
+    /* Level-2 cached time-independent physics (DC + unscaled C + charges) */
+    v8d Cggb, Cgdb, Cgsb;
+    v8d Cdgb, Cddb, Cdsb;
+    v8d Csgb, Csdb, Cssb;
+    v8d Cbgb, Cbdb, Cbsb;
+    v8d mdc44, mdc46, mdc47, mdc48;
+    v8d mdc51, mdc52, mdc53, mdc55;
+    v8d mdc58, mdc59, mdc60, mdc61;
+    v8d mdc_rhsd, mdc_rhsb, mdc_rhss;
+    v8d q_lin_g, q_lin_d, q_lin_b;
+    v8d qb_st, qg_st, qd_st;
+    double a_vbd[8], a_vbs[8], a_vgs[8], a_vds[8];
+    double a_qb[8], a_qg[8], a_qd[8];
 } BSIM4Avx512Dyn;
 
 typedef struct __attribute__((aligned(64))) {
-    /* Direct stamp quantities (already multiplied by m) */
-    double rhsd[8], rhsg[8], rhsb[8], rhss[8];
-    double v34[8], v35[8], v36[8], v37[8];
-    double v44[8], v46[8], v47[8], v48[8];
-    double v51[8], v52[8], v53[8], v55[8];
-    double v58[8], v59[8], v60[8], v61[8];
-    /* Instance state fields needed by convTest / next iteration / ask */
+    /* Instance state fields needed only when need_aos != 0 (e.g., .save @m[...]) */
     double von[8];
     int    mode[8];
     double cd[8], gds[8], gm[8], gmbs[8];
@@ -542,6 +569,226 @@ typedef struct __attribute__((aligned(64))) {
     double Igidl[8], ggidld[8], ggidlg[8], ggidlb[8];
     double Igisl[8], ggisls[8], ggislg[8], ggislb[8];
 } BSIM4Avx512Out;
+
+/*
+ * Fast Level-1 state sync helper: when a block hits Level-1 with small nonzero dv,
+ * update CKTstate0 voltages & first-order Taylor-corrected charges/currents so
+ * the next timestep's s1/s2 and CKTtrunc stay accurate to O(dv^2), without
+ * re-evaluating BSIM4 physics or matrix/RHS stamps (which are invariant to O(dv^2)).
+ */
+static inline void
+bsim4_avx512_l1_sync_state(
+    const BSIM4Avx512Block * restrict b,
+    const BSIM4Avx512Dyn * restrict dyn,
+    v8d vds, v8d vgs, v8d vbs,
+    double ag0, double ag1, double ag2,
+    int is_gear2, int is_trap2,
+    double * restrict s0,
+    const double * restrict s1,
+    const double * restrict s2)
+{
+    v8d dvds = vds - dyn->last_vds;
+    v8d dvgs = vgs - dyn->last_vgs;
+    v8d dvbs = vbs - dyn->last_vbs;
+    v8d dvgb = dvgs - dvbs;
+    v8d dvbd = dvbs - dvds;
+
+    v8d qg_new = dyn->qg_st + (dyn->Cggb * dvgb - dyn->Cgdb * dvbd - dyn->Cgsb * dvbs);
+    v8d qd_new = dyn->qd_st + (dyn->Cdgb * dvgb - dyn->Cddb * dvbd - dyn->Cdsb * dvbs);
+    v8d qb_new = dyn->qb_st + (dyn->Cbgb * dvgb - dyn->Cbdb * dvbd - dyn->Cbsb * dvbs);
+
+    double lvds[8], lvgs[8], lvbs[8], lvbd[8];
+    double lqb[8], lqg[8], lqd[8];
+    v8_store(lvds, vds); v8_store(lvgs, vgs);
+    v8_store(lvbs, vbs); v8_store(lvbd, vbs - vds);
+    v8_store(lqb, qb_new); v8_store(lqg, qg_new); v8_store(lqd, qd_new);
+
+    const int nact = b->n_active;
+    for (int lane = 0; lane < nact; lane++) {
+        int st = b->stateBase[lane];
+        double qb = lqb[lane], qg = lqg[lane], qd = lqd[lane];
+        s0[st + 0]  = lvbd[lane];
+        s0[st + 1]  = lvbs[lane];
+        s0[st + 2]  = lvgs[lane];
+        s0[st + 3]  = lvds[lane];
+        s0[st + 11] = qb;
+        s0[st + 13] = qg;
+        s0[st + 15] = qd;
+
+        double cqb, cqg, cqd;
+        if (is_gear2) {
+            cqb = ag2 * s2[st + 11] + ag1 * s1[st + 11] + ag0 * qb;
+            cqg = ag2 * s2[st + 13] + ag1 * s1[st + 13] + ag0 * qg;
+            cqd = ag2 * s2[st + 15] + ag1 * s1[st + 15] + ag0 * qd;
+        } else if (is_trap2) {
+            cqb = -s1[st + 12] * ag1 + ag0 * (qb - s1[st + 11]);
+            cqg = -s1[st + 14] * ag1 + ag0 * (qg - s1[st + 13]);
+            cqd = -s1[st + 16] * ag1 + ag0 * (qd - s1[st + 15]);
+        } else {
+            cqb = ag0 * qb + ag1 * s1[st + 11];
+            cqg = ag0 * qg + ag1 * s1[st + 13];
+            cqd = ag0 * qd + ag1 * s1[st + 15];
+        }
+        s0[st + 12] = cqb;
+        s0[st + 14] = cqg;
+        s0[st + 16] = cqd;
+    }
+}
+
+/*
+ * Fast Level-2 helper: integrate cached charges (with optional first-order
+ * Taylor correction dq = C * dv when has_dv != 0) into CKTstate0 and assemble
+ * the 20 matrix/RHS stamps in dyn->st_* from cached DC + C matrices.
+ * Used on BOTH full evaluations (has_dv=0) and Level-2 cross-step hits (has_dv=1).
+ */
+static inline void
+bsim4_avx512_integrate_and_assemble(
+    const BSIM4Avx512Block * restrict b,
+    BSIM4Avx512Dyn * restrict dyn,
+    v8d vds, v8d vgs, v8d vbs,
+    int has_dv,
+    double ag0, double ag1, double ag2,
+    int is_gear2, int is_trap2,
+    double * restrict s0,
+    const double * restrict s1,
+    const double * restrict s2)
+{
+    double a_cqb[8], a_cqg[8], a_cqd[8];
+    const int nact = b->n_active;
+    v8d dqg = v8_set1(0.0), dqd = v8_set1(0.0), dqb = v8_set1(0.0);
+
+    if (has_dv) {
+        v8d dvds = vds - dyn->last_vds;
+        v8d dvgs = vgs - dyn->last_vgs;
+        v8d dvbs = vbs - dyn->last_vbs;
+        v8d dvgb = dvgs - dvbs;
+        v8d dvbd = dvbs - dvds;
+        dqg = dyn->Cggb * dvgb - dyn->Cgdb * dvbd - dyn->Cgsb * dvbs;
+        dqd = dyn->Cdgb * dvgb - dyn->Cddb * dvbd - dyn->Cdsb * dvbs;
+        dqb = dyn->Cbgb * dvgb - dyn->Cbdb * dvbd - dyn->Cbsb * dvbs;
+
+        double lvds[8], lvgs[8], lvbs[8], lvbd[8];
+        double lqb[8], lqg[8], lqd[8];
+        v8_store(lvds, vds); v8_store(lvgs, vgs);
+        v8_store(lvbs, vbs); v8_store(lvbd, vbs - vds);
+        v8_store(lqb, dyn->qb_st + dqb);
+        v8_store(lqg, dyn->qg_st + dqg);
+        v8_store(lqd, dyn->qd_st + dqd);
+
+        for (int lane = 0; lane < nact; lane++) {
+            int st = b->stateBase[lane];
+            double qb = lqb[lane], qg = lqg[lane], qd = lqd[lane];
+            s0[st + 0]  = lvbd[lane];
+            s0[st + 1]  = lvbs[lane];
+            s0[st + 2]  = lvgs[lane];
+            s0[st + 3]  = lvds[lane];
+            s0[st + 11] = qb;
+            s0[st + 13] = qg;
+            s0[st + 15] = qd;
+
+            double cqb, cqg, cqd;
+            if (is_gear2) {
+                cqb = ag2 * s2[st + 11] + ag1 * s1[st + 11] + ag0 * qb;
+                cqg = ag2 * s2[st + 13] + ag1 * s1[st + 13] + ag0 * qg;
+                cqd = ag2 * s2[st + 15] + ag1 * s1[st + 15] + ag0 * qd;
+            } else if (is_trap2) {
+                cqb = -s1[st + 12] * ag1 + ag0 * (qb - s1[st + 11]);
+                cqg = -s1[st + 14] * ag1 + ag0 * (qg - s1[st + 13]);
+                cqd = -s1[st + 16] * ag1 + ag0 * (qd - s1[st + 15]);
+            } else {
+                cqb = ag0 * qb + ag1 * s1[st + 11];
+                cqg = ag0 * qg + ag1 * s1[st + 13];
+                cqd = ag0 * qd + ag1 * s1[st + 15];
+            }
+            s0[st + 12] = a_cqb[lane] = cqb;
+            s0[st + 14] = a_cqg[lane] = cqg;
+            s0[st + 16] = a_cqd[lane] = cqd;
+        }
+    } else {
+        for (int lane = 0; lane < nact; lane++) {
+            int st = b->stateBase[lane];
+            double qb = dyn->a_qb[lane];
+            double qg = dyn->a_qg[lane];
+            double qd = dyn->a_qd[lane];
+            s0[st + 0]  = dyn->a_vbd[lane];
+            s0[st + 1]  = dyn->a_vbs[lane];
+            s0[st + 2]  = dyn->a_vgs[lane];
+            s0[st + 3]  = dyn->a_vds[lane];
+            s0[st + 11] = qb;
+            s0[st + 13] = qg;
+            s0[st + 15] = qd;
+
+            double cqb, cqg, cqd;
+            if (is_gear2) {
+                cqb = ag2 * s2[st + 11] + ag1 * s1[st + 11] + ag0 * qb;
+                cqg = ag2 * s2[st + 13] + ag1 * s1[st + 13] + ag0 * qg;
+                cqd = ag2 * s2[st + 15] + ag1 * s1[st + 15] + ag0 * qd;
+            } else if (is_trap2) {
+                cqb = -s1[st + 12] * ag1 + ag0 * (qb - s1[st + 11]);
+                cqg = -s1[st + 14] * ag1 + ag0 * (qg - s1[st + 13]);
+                cqd = -s1[st + 16] * ag1 + ag0 * (qd - s1[st + 15]);
+            } else {
+                cqb = ag0 * qb + ag1 * s1[st + 11];
+                cqg = ag0 * qg + ag1 * s1[st + 13];
+                cqd = ag0 * qd + ag1 * s1[st + 15];
+            }
+            s0[st + 12] = a_cqb[lane] = cqb;
+            s0[st + 14] = a_cqg[lane] = cqg;
+            s0[st + 16] = a_cqd[lane] = cqd;
+        }
+    }
+    for (int lane = nact; lane < 8; lane++) {
+        a_cqb[lane] = a_cqg[lane] = a_cqd[lane] = 0.0;
+    }
+
+    v8d v_ag0 = v8_set1(ag0);
+    v8d vm_ag0 = b->m * v_ag0;
+    v8d cqbody = v8_load(a_cqb);
+    v8d cqgate = v8_load(a_cqg);
+    v8d cqdrn  = v8_load(a_cqd);
+
+    v8d mtype = b->m * b->type;
+    v8d mceqqg = (cqgate + v_ag0 * (dyn->q_lin_g - dqg)) * mtype;
+    v8d mceqqd = (cqdrn  + v_ag0 * (dyn->q_lin_d - dqd)) * mtype;
+    v8d mceqqb = (cqbody + v_ag0 * (dyn->q_lin_b - dqb)) * mtype;
+
+    v8_store(dyn->st_rhsd, dyn->mdc_rhsd - mceqqd);
+    v8_store(dyn->st_rhsg, mceqqg);
+    v8_store(dyn->st_rhsb, dyn->mdc_rhsb - mceqqb);
+    v8_store(dyn->st_rhss, dyn->mdc_rhss + mceqqg + mceqqb + mceqqd);
+
+    v8d v34 = dyn->Cggb * vm_ag0;
+    v8d v35 = dyn->Cgdb * vm_ag0;
+    v8d v36 = dyn->Cgsb * vm_ag0;
+    v8_store(dyn->st_v34, v34);
+    v8_store(dyn->st_v35, v35);
+    v8_store(dyn->st_v36, v36);
+    v8_store(dyn->st_v37, -(v34 + v35 + v36));
+
+    v8d mgcdgb = dyn->Cdgb * vm_ag0;
+    v8d mgcddb = dyn->Cddb * vm_ag0;
+    v8d mgcdsb = dyn->Cdsb * vm_ag0;
+    v8_store(dyn->st_v44, dyn->mdc44 + mgcddb);
+    v8_store(dyn->st_v46, dyn->mdc46 + mgcdgb);
+    v8_store(dyn->st_v47, dyn->mdc47 - mgcdsb);
+    v8_store(dyn->st_v48, dyn->mdc48 + (mgcdgb + mgcddb + mgcdsb));
+
+    v8d mgcsgb = dyn->Csgb * vm_ag0;
+    v8d mgcsdb = dyn->Csdb * vm_ag0;
+    v8d mgcssb = dyn->Cssb * vm_ag0;
+    v8_store(dyn->st_v51, dyn->mdc51 - mgcsdb);
+    v8_store(dyn->st_v52, dyn->mdc52 + mgcsgb);
+    v8_store(dyn->st_v53, dyn->mdc53 + mgcssb);
+    v8_store(dyn->st_v55, dyn->mdc55 + (mgcsgb + mgcsdb + mgcssb));
+
+    v8d mgcbgb = dyn->Cbgb * vm_ag0;
+    v8d mgcbdb = dyn->Cbdb * vm_ag0;
+    v8d mgcbsb = dyn->Cbsb * vm_ag0;
+    v8_store(dyn->st_v58, dyn->mdc58 + mgcbdb);
+    v8_store(dyn->st_v59, dyn->mdc59 + mgcbgb);
+    v8_store(dyn->st_v60, dyn->mdc60 + mgcbsb);
+    v8_store(dyn->st_v61, dyn->mdc61 - (mgcbgb + mgcbdb + mgcbsb));
+}
 
 /*
  * Evaluate 8 MOSFETs in parallel given prepared/limited terminal voltages
@@ -2047,7 +2294,6 @@ bsim4_avx512_eval_block(
         }
     }
 
-    v8d v_ag0 = v8_set1(ag0);
     v8d qgb = b->cgbo * vgb;
     v8d qgate_tot = qgate + qgdo + qgso + qgb;
     v8d qbulk_tot = qbulk - qgb;
@@ -2058,97 +2304,57 @@ bsim4_avx512_eval_block(
     v8d qdrn_tot  = v8_sel(m_fwd, qdrn_fwd, qdrn_rev);
     v8d qsrc_tot  = v8_sel(m_fwd, qsrc_fwd, qsrc_rev);
 
-    v8d gcggb = (cggb + cgdo + cgso + b->cgbo) * v_ag0;
-    v8d gcgdb = (v8_sel(m_fwd, cgdb, cgsb) - cgdo) * v_ag0;
-    v8d gcgsb = (v8_sel(m_fwd, cgsb, cgdb) - cgso) * v_ag0;
-    v8d gcgbb = -(gcggb + gcgdb + gcgsb);
+    /* Unscaled (time-independent) terminal capacitances */
+    v8d Cggb = cggb + cgdo + cgso + b->cgbo;
+    v8d Cgdb = v8_sel(m_fwd, cgdb, cgsb) - cgdo;
+    v8d Cgsb = v8_sel(m_fwd, cgsb, cgdb) - cgso;
 
     v8d cgg_bg_dg = cggb + cbgb + cdgb;
-    v8d gcdgb = v8_sel(m_fwd, (cdgb - cgdo) * v_ag0, -(cgg_bg_dg + cgdo) * v_ag0);
-    v8d gcsgb = v8_sel(m_fwd, -(cgg_bg_dg + cgso) * v_ag0, (cdgb - cgso) * v_ag0);
-    v8d gcbgb = (cbgb - b->cgbo) * v_ag0;
+    v8d Cdgb = v8_sel(m_fwd, cdgb - cgdo, -(cgg_bg_dg + cgdo));
+    v8d Csgb = v8_sel(m_fwd, -(cgg_bg_dg + cgso), cdgb - cgso);
+    v8d Cbgb = cbgb - b->cgbo;
 
     v8d c_sum_d = cgdb + cbdb + cddb;
     v8d c_sum_s = cgsb + cbsb + cdsb;
-    v8d gcddb = v8_sel(m_fwd, (cddb + capbd + cgdo) * v_ag0, (capbd + cgdo - c_sum_s) * v_ag0);
-    v8d gcdsb = v8_sel(m_fwd, cdsb * v_ag0, -c_sum_d * v_ag0);
-    v8d gcsdb = v8_sel(m_fwd, -c_sum_d * v_ag0, cdsb * v_ag0);
-    v8d gcssb = v8_sel(m_fwd, (capbs + cgso - c_sum_s) * v_ag0, (cddb + capbs + cgso) * v_ag0);
+    v8d Cddb = v8_sel(m_fwd, cddb + capbd + cgdo, capbd + cgdo - c_sum_s);
+    v8d Cdsb = v8_sel(m_fwd, cdsb, -c_sum_d);
+    v8d Csdb = v8_sel(m_fwd, -c_sum_d, cdsb);
+    v8d Cssb = v8_sel(m_fwd, capbs + cgso - c_sum_s, cddb + capbs + cgso);
 
-    v8d gcdbb = -(gcdgb + gcddb + gcdsb);
-    v8d gcsbb = -(gcsgb + gcsdb + gcssb);
-    v8d gcbdb = (v8_sel(m_fwd, cbdb, cbsb) - capbd) * v_ag0;
-    v8d gcbsb = (v8_sel(m_fwd, cbsb, cbdb) - capbs) * v_ag0;
-    v8d gcbbb = -(gcbdb + gcbgb + gcbsb);
+    v8d Cbdb = v8_sel(m_fwd, cbdb, cbsb) - capbd;
+    v8d Cbsb = v8_sel(m_fwd, cbsb, cbdb) - capbs;
 
     /* ===================================================================== */
-    /* 12. Write CKTstate0 & Integrate (qb, qg, qd)                          */
+    /* 12. Cache Time-Independent Physics (DC + C + Charges) in dyn          */
     /* ===================================================================== */
     v8d qg_st = qgate_tot;
     v8d qd_st = qdrn_tot - qbd;
     v8d qs_st = qsrc_tot - qbs;
     v8d qb_st = qbulk_tot + qbd + qbs;
 
-    double a_vds[8], a_vgs[8], a_vbs[8], a_vbd[8];
-    double a_qbs[8], a_qbd[8], a_qg[8], a_qd[8], a_qs[8], a_qb[8];
-    double a_cqg[8], a_cqd[8], a_cqb[8];
-    v8_store(a_vds, vds); v8_store(a_vgs, vgs); v8_store(a_vbs, vbs); v8_store(a_vbd, vbd);
-    v8_store(a_qbs, qbs); v8_store(a_qbd, qbd);
-    v8_store(a_qg, qg_st); v8_store(a_qd, qd_st); v8_store(a_qs, qs_st); v8_store(a_qb, qb_st);
+    v8_store(dyn->a_vds, vds); v8_store(dyn->a_vgs, vgs);
+    v8_store(dyn->a_vbs, vbs); v8_store(dyn->a_vbd, vbd);
+    v8_store(dyn->a_qg, qg_st); v8_store(dyn->a_qd, qd_st); v8_store(dyn->a_qb, qb_st);
+    dyn->qb_st = qb_st; dyn->qg_st = qg_st; dyn->qd_st = qd_st;
 
-    for (int lane = 0; lane < b->n_active; lane++) {
-        int st = b->stateBase[lane];
-        s0[st + 0] = a_vbd[lane];
-        s0[st + 1] = a_vbs[lane];
-        s0[st + 2] = a_vgs[lane];
-        s0[st + 3] = a_vds[lane];
-        s0[st + 4] = a_vbs[lane]; /* vdbs */
-        s0[st + 5] = a_vbd[lane]; /* vdbd */
-        s0[st + 6] = a_vbs[lane]; /* vsbs */
-        s0[st + 7] = a_vgs[lane]; /* vges */
-        s0[st + 8] = a_vgs[lane]; /* vgms */
-        s0[st + 9] = 0.0;         /* vses */
-        s0[st + 10] = a_vds[lane]; /* vdes */
-        s0[st + 19] = a_qbs[lane];
-        s0[st + 21] = a_qbd[lane];
-        s0[st + 11] = a_qb[lane];
-        s0[st + 13] = a_qg[lane];
-        s0[st + 15] = a_qd[lane];
-        s0[st + 28] = a_qs[lane];
-        s0[st + 27] = 0.0;        /* qdef */
-
-        double cqb, cqg, cqd;
-        if (is_gear2) {
-            cqb = ag2 * s2[st + 11] + ag1 * s1[st + 11] + ag0 * a_qb[lane];
-            cqg = ag2 * s2[st + 13] + ag1 * s1[st + 13] + ag0 * a_qg[lane];
-            cqd = ag2 * s2[st + 15] + ag1 * s1[st + 15] + ag0 * a_qd[lane];
-        } else if (is_trap2) {
-            cqb = -s1[st + 12] * ag1 + ag0 * (a_qb[lane] - s1[st + 11]);
-            cqg = -s1[st + 14] * ag1 + ag0 * (a_qg[lane] - s1[st + 13]);
-            cqd = -s1[st + 16] * ag1 + ag0 * (a_qd[lane] - s1[st + 15]);
-        } else {
-            cqb = ag0 * a_qb[lane] + ag1 * s1[st + 11];
-            cqg = ag0 * a_qg[lane] + ag1 * s1[st + 13];
-            cqd = ag0 * a_qd[lane] + ag1 * s1[st + 15];
+    if (need_aos) {
+        double a_qbs[8], a_qbd[8], a_qs[8];
+        v8_store(a_qbs, qbs); v8_store(a_qbd, qbd); v8_store(a_qs, qs_st);
+        for (int lane = 0; lane < b->n_active; lane++) {
+            int st = b->stateBase[lane];
+            s0[st + 4]  = dyn->a_vbs[lane]; /* vdbs */
+            s0[st + 5]  = dyn->a_vbd[lane]; /* vdbd */
+            s0[st + 6]  = dyn->a_vbs[lane]; /* vsbs */
+            s0[st + 7]  = dyn->a_vgs[lane]; /* vges */
+            s0[st + 8]  = dyn->a_vgs[lane]; /* vgms */
+            s0[st + 9]  = 0.0;              /* vses */
+            s0[st + 10] = dyn->a_vds[lane]; /* vdes */
+            s0[st + 19] = a_qbs[lane];
+            s0[st + 21] = a_qbd[lane];
+            s0[st + 27] = 0.0;              /* qdef */
+            s0[st + 28] = a_qs[lane];
         }
-        s0[st + 12] = a_cqb[lane] = cqb;
-        s0[st + 14] = a_cqg[lane] = cqg;
-        s0[st + 16] = a_cqd[lane] = cqd;
     }
-    for (int lane = b->n_active; lane < 8; lane++) {
-        a_cqb[lane] = a_cqg[lane] = a_cqd[lane] = 0.0;
-    }
-
-    v8d cqbody = v8_load(a_cqb);
-    v8d cqgate = v8_load(a_cqg);
-    v8d cqdrn  = v8_load(a_cqd);
-
-    /* ===================================================================== */
-    /* 13. Equivalent Currents & Matrix Stamps                               */
-    /* ===================================================================== */
-    v8d ceqqg = (cqgate - gcggb * vgb + gcgdb * vbd + gcgsb * vbs) * b->type;
-    v8d ceqqd = (cqdrn  - gcdgb * vgb + gcddb * vbd + gcdsb * vbs) * b->type;
-    v8d ceqqb = (cqbody - gcbgb * vgb + gcbdb * vbd + gcbsb * vbs) * b->type;
 
     v8d ceqjs = (cbs - gbs * vbs) * b->type;
     v8d ceqjd = (cbd - gbd * vbd) * b->type;
@@ -2186,30 +2392,37 @@ bsim4_avx512_eval_block(
     v8d ggisl_sum = Ggislg + Ggisls + Ggislb;
 
     v8d vm = b->m;
-    v8_store(out->rhsd, vm * (ceqjd - ceqbd - ceqdrn - ceqqd));
-    v8_store(out->rhsg, vm * ceqqg);
-    v8_store(out->rhsb, vm * (ceqbd + ceqbs - ceqjd - ceqjs - ceqqb));
-    v8_store(out->rhss, vm * (ceqdrn - ceqbs + ceqjs + ceqqg + ceqqb + ceqqd));
+    dyn->Cggb = Cggb; dyn->Cgdb = Cgdb; dyn->Cgsb = Cgsb;
+    dyn->Cdgb = Cdgb; dyn->Cddb = Cddb; dyn->Cdsb = Cdsb;
+    dyn->Csgb = Csgb; dyn->Csdb = Csdb; dyn->Cssb = Cssb;
+    dyn->Cbgb = Cbgb; dyn->Cbdb = Cbdb; dyn->Cbsb = Cbsb;
 
-    v8_store(out->v34, vm * gcggb);
-    v8_store(out->v35, vm * gcgdb);
-    v8_store(out->v36, vm * gcgsb);
-    v8_store(out->v37, vm * gcgbb);
+    dyn->mdc44 = vm * (b->drainCond + Gds + gbd + RevSum + gbdpdp + Ggidld);
+    dyn->mdc46 = vm * (Gm_st + gbdpg + Ggidlg);
+    dyn->mdc47 = vm * (Gds + FwdSum - gbdpsp + ggidl_sum);
+    dyn->mdc48 = vm * (gbd - Gmbs_st - gbdpb - Ggidlb);
+    dyn->mdc51 = vm * (Gds + RevSum - gbspdp + ggisl_sum);
+    dyn->mdc52 = vm * (-Gm_st + gbspg + Ggislg);
+    dyn->mdc53 = vm * (b->sourceCond + Gds + gbs + FwdSum + gbspsp + Ggisls);
+    dyn->mdc55 = vm * (gbs + Gmbs_st - gbspb - Ggislb);
+    dyn->mdc58 = vm * (-gbd + gbbdp - Ggidld + ggisl_sum);
+    dyn->mdc59 = vm * (-Gbg - Ggidlg - Ggislg);
+    dyn->mdc60 = vm * (-gbs + gbbsp + ggidl_sum - Ggisls);
+    dyn->mdc61 = vm * (gbd + gbs - Gbb - Ggidlb - Ggislb);
 
-    v8_store(out->v44, vm * (b->drainCond + Gds + gbd + RevSum + gcddb + gbdpdp + Ggidld));
-    v8_store(out->v46, vm * (Gm_st + gcdgb + gbdpg + Ggidlg));
-    v8_store(out->v47, vm * (Gds + FwdSum - gcdsb - gbdpsp + ggidl_sum));
-    v8_store(out->v48, vm * (gbd - Gmbs_st - gcdbb - gbdpb - Ggidlb));
+    dyn->mdc_rhsd = vm * (ceqjd - ceqbd - ceqdrn);
+    dyn->mdc_rhsb = vm * (ceqbd + ceqbs - ceqjd - ceqjs);
+    dyn->mdc_rhss = vm * (ceqdrn - ceqbs + ceqjs);
 
-    v8_store(out->v51, vm * (Gds + RevSum - gcsdb - gbspdp + ggisl_sum));
-    v8_store(out->v52, vm * (gcsgb - Gm_st + gbspg + Ggislg));
-    v8_store(out->v53, vm * (b->sourceCond + Gds + gbs + FwdSum + gcssb + gbspsp + Ggisls));
-    v8_store(out->v55, vm * (gbs + Gmbs_st - gcsbb - gbspb - Ggislb));
+    dyn->q_lin_g = -Cggb * vgb + Cgdb * vbd + Cgsb * vbs;
+    dyn->q_lin_d = -Cdgb * vgb + Cddb * vbd + Cdsb * vbs;
+    dyn->q_lin_b = -Cbgb * vgb + Cbdb * vbd + Cbsb * vbs;
 
-    v8_store(out->v58, vm * (gcbdb - gbd + gbbdp - Ggidld + ggisl_sum));
-    v8_store(out->v59, vm * (gcbgb - Gbg - Ggidlg - Ggislg));
-    v8_store(out->v60, vm * (gcbsb - gbs + gbbsp + ggidl_sum - Ggisls));
-    v8_store(out->v61, vm * (gbd + gbs + gcbbb - Gbb - Ggidlb - Ggislb));
+    /* ===================================================================== */
+    /* 13. Integrate Charges & Assemble Matrix/RHS Stamps in dyn->st_*       */
+    /* ===================================================================== */
+    bsim4_avx512_integrate_and_assemble(b, dyn, vds, vgs, vbs, 0,
+                                        ag0, ag1, ag2, is_gear2, is_trap2, s0, s1, s2);
 
     /* Pre-assemble compact SoA convTest coefficients in dyn (exact match to b4v*cvtest.c) */
     {

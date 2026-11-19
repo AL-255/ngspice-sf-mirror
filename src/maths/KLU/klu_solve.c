@@ -286,10 +286,18 @@ Int KLU_solve
                                 Int i1 = Oir [p + 1] ;
                                 Int i2 = Oir [p + 2] ;
                                 Int i3 = Oir [p + 3] ;
-                                Xr [i0] -= Oxr [p] * xk ;
-                                Xr [i1] -= Oxr [p + 1] * xk ;
-                                Xr [i2] -= Oxr [p + 2] * xk ;
-                                Xr [i3] -= Oxr [p + 3] * xk ;
+                                double x0 = Xr [i0] ;
+                                double x1 = Xr [i1] ;
+                                double x2 = Xr [i2] ;
+                                double x3 = Xr [i3] ;
+                                x0 -= Oxr [p]     * xk ;
+                                x1 -= Oxr [p + 1] * xk ;
+                                x2 -= Oxr [p + 2] * xk ;
+                                x3 -= Oxr [p + 3] * xk ;
+                                Xr [i0] = x0 ;
+                                Xr [i1] = x1 ;
+                                Xr [i2] = x2 ;
+                                Xr [i3] = x3 ;
                             }
                             for ( ; p < pend ; p++)
                             {

@@ -62,6 +62,11 @@ Int KLU_free_numeric
     KLU_free (Numeric->Rs,   n, sizeof (double), Common) ;
     KLU_free (Numeric->Pinv, n, sizeof (Int), Common) ;
 
+    KLU_free (Numeric->ref_off_p,   nzoff + 1, sizeof (Int), Common) ;
+    KLU_free (Numeric->ref_blk_col, n + 1, sizeof (Int), Common) ;
+    KLU_free (Numeric->ref_blk_p,   Numeric->ref_nz + 1, sizeof (Int), Common) ;
+    KLU_free (Numeric->ref_blk_row, Numeric->ref_nz + 1, sizeof (Int), Common) ;
+
     KLU_free (Numeric->Work, Numeric->worksize, 1, Common) ;
 
     KLU_free (Numeric, 1, sizeof (KLU_numeric), Common) ;

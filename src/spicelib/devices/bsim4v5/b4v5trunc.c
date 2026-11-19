@@ -27,6 +27,11 @@ double *timeStep)
 BSIM4v5model *model = (BSIM4v5model*)inModel;
 BSIM4v5instance *here;
 
+#if defined(__AVX512F__) && defined(__GNUC__) && !defined(STEPDEBUG)
+    if (BSIM4v5truncAvx(inModel, ckt, timeStep) == 0)
+        return(OK);
+#endif
+
 #ifdef USE_OMP
     int InstCount = model->BSIM4v5InstCount;
     BSIM4v5instance **InstArray = model->BSIM4v5InstanceArray;

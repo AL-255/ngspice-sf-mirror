@@ -37,5 +37,6 @@ extern int BSIM4v6loadKluPar (GENmodel*, CKTcircuit*, double*, double*) ;
 #endif
 #if defined(__AVX512F__) && defined(__GNUC__)
 extern int BSIM4v6convTestAvx(GENmodel*, CKTcircuit*);
+extern int BSIM4v6truncAvx(GENmodel*, CKTcircuit*, double*);
 extern int BSIM4v6AvxNeedAosSync;
 #endif

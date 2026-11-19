@@ -236,10 +236,18 @@ void KLU_lsolve
                     Int i1 = Lir [p + 1] ;
                     Int i2 = Lir [p + 2] ;
                     Int i3 = Lir [p + 3] ;
-                    Xr [i0] -= Lxr [p] * xk ;
-                    Xr [i1] -= Lxr [p + 1] * xk ;
-                    Xr [i2] -= Lxr [p + 2] * xk ;
-                    Xr [i3] -= Lxr [p + 3] * xk ;
+                    double x0 = Xr [i0] ;
+                    double x1 = Xr [i1] ;
+                    double x2 = Xr [i2] ;
+                    double x3 = Xr [i3] ;
+                    x0 -= Lxr [p]     * xk ;
+                    x1 -= Lxr [p + 1] * xk ;
+                    x2 -= Lxr [p + 2] * xk ;
+                    x3 -= Lxr [p + 3] * xk ;
+                    Xr [i0] = x0 ;
+                    Xr [i1] = x1 ;
+                    Xr [i2] = x2 ;
+                    Xr [i3] = x3 ;
                 }
                 for ( ; p < len ; p++)
                 {
@@ -371,10 +379,18 @@ void KLU_usolve
                     Int i1 = Uir [p + 1] ;
                     Int i2 = Uir [p + 2] ;
                     Int i3 = Uir [p + 3] ;
-                    Xr [i0] -= Uxr [p] * xk ;
-                    Xr [i1] -= Uxr [p + 1] * xk ;
-                    Xr [i2] -= Uxr [p + 2] * xk ;
-                    Xr [i3] -= Uxr [p + 3] * xk ;
+                    double x0 = Xr [i0] ;
+                    double x1 = Xr [i1] ;
+                    double x2 = Xr [i2] ;
+                    double x3 = Xr [i3] ;
+                    x0 -= Uxr [p]     * xk ;
+                    x1 -= Uxr [p + 1] * xk ;
+                    x2 -= Uxr [p + 2] * xk ;
+                    x3 -= Uxr [p + 3] * xk ;
+                    Xr [i0] = x0 ;
+                    Xr [i1] = x1 ;
+                    Xr [i2] = x2 ;
+                    Xr [i3] = x3 ;
                 }
                 for ( ; p < len ; p++)
                 {
