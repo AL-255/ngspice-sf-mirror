@@ -116,6 +116,7 @@ int
 RESload(GENmodel *inModel, CKTcircuit *ckt)
 {
     RESmodel *model = (RESmodel *)inModel;
+#if NGSPICE_OPT_GENERAL
     int need_current = (ckt->CKTmode & MODEDC) != 0;
 
     if (!need_current) {
@@ -133,6 +134,7 @@ RESload(GENmodel *inModel, CKTcircuit *ckt)
         }
         return(OK);
     }
+#endif
 
     /*  loop through all the resistor models */
     for( ; model != NULL; model = RESnextModel(model)) {

@@ -499,6 +499,7 @@ INPgetModBin(CKTcircuit *ckt, char *name, INPmodel **model, INPtables *tab, char
     l = parse_values[0] * scale;
     w = parse_values[1] / parse_values[2] * scale;
 
+#if NGSPICE_OPT_GENERAL
     ensure_modbin_cache();
 
     INPModBinList *bl = modbin_hash ? (INPModBinList *)nghash_find(modbin_hash, name) : NULL;
@@ -523,6 +524,36 @@ INPgetModBin(CKTcircuit *ckt, char *name, INPmodel **model, INPtables *tab, char
             return NULL;
         }
     }
+#else
+    {
+        static char *model_tokens[] = { "lmin", "lmax", "wmin", "wmax" };
+        INPmodel *modtmp;
+        size_t namelen = strlen(name);
+        for (modtmp = modtab; modtmp != NULL; modtmp = modtmp->INPnextModel) {
+            if (strncmp(modtmp->INPmodName, name, namelen) == 0 &&
+                modtmp->INPmodName[namelen] == '.')
+            {
+                if (modtmp->INPmodType < 0) {
+                    *model = NULL;
+                    return tprintf("Unknown device type for model %s\n", name);
+                }
+                if (parse_line(modtmp->INPmodLine->line, model_tokens, 4, parse_values, parse_found)) {
+                    if (in_range(l, parse_values[0], parse_values[1]) &&
+                        in_range(w, parse_values[2], parse_values[3]))
+                    {
+                        if (!modtmp->INPmodfast) {
+                            int error = create_model(ckt, modtmp, tab);
+                            if (error)
+                                return NULL;
+                        }
+                        *model = modtmp;
+                        return NULL;
+                    }
+                }
+            }
+        }
+    }
+#endif
 
     return NULL;
 }

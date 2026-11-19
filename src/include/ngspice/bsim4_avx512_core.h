@@ -11,7 +11,7 @@
 #ifndef NGSPICE_BSIM4_AVX512_CORE_H
 #define NGSPICE_BSIM4_AVX512_CORE_H
 
-#if defined(__AVX512F__) && defined(__GNUC__)
+#if NGSPICE_OPT_ZEN4
 
 #include <immintrin.h>
 #include <stdint.h>
@@ -2471,5 +2471,5 @@ bsim4_avx512_eval_block(
     }
 }
 
-#endif /* __AVX512F__ && __GNUC__ */
+#endif /* NGSPICE_OPT_ZEN4 */
 #endif /* NGSPICE_BSIM4_AVX512_CORE_H */

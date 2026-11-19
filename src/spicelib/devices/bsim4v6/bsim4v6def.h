@@ -1824,7 +1824,7 @@ typedef struct sBSIM4v6model
     unsigned int BSIM4v6KluNz;
     int BSIM4v6KluAll4Term;
 #endif
-#if defined(__AVX512F__) && defined(__GNUC__)
+#if NGSPICE_OPT_ZEN4
     void *BSIM4v6AvxBlocks;
     void *BSIM4v6AvxDyn;
     int   BSIM4v6AvxDynValid;

@@ -34,7 +34,7 @@ BSIM4v6instance *here = (BSIM4v6instance*)inst;
 
     NG_IGNORE(select);
 
-#if defined(__AVX512F__) && defined(__GNUC__)
+#if NGSPICE_OPT_ZEN4
     if (ckt && (ckt->CKTmode & MODETRAN))
         BSIM4v6AvxNeedAosSync = 1;
 #endif

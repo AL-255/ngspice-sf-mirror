@@ -25,7 +25,7 @@ BSIM4v5mDelete(GENmodel *gen_model)
 #ifdef KLU
     FREE(model->BSIM4v5KluOffArr);
 #endif
-#if defined(__AVX512F__) && defined(__GNUC__)
+#if NGSPICE_OPT_ZEN4
     free(model->BSIM4v5AvxBlocks);
     model->BSIM4v5AvxBlocks = NULL;
     free(model->BSIM4v5AvxDyn);

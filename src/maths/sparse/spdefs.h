@@ -36,6 +36,7 @@
  */
 
 #include <stdio.h>
+#include "ngspice/opt_config.h"
 
 #undef  ABORT
 #undef  FREE

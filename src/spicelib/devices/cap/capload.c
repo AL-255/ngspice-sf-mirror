@@ -284,6 +284,7 @@ CAPload(GENmodel *inModel, CKTcircuit *ckt)
             ( ( (mode & MODEDC) && (mode & MODEINITJCT) )
               || ( (mode & MODEUIC) && is_init_tran ) );
 
+#if NGSPICE_OPT_GENERAL
         /* Fast hoisted path for standard transient iterations (Gear 1/2, Trap 1/2) */
         if (is_tran_ac && !cond1 && !is_init_tran &&
             (ckt->CKTintegrateMethod == GEAR || ckt->CKTintegrateMethod == TRAPEZOIDAL) &&
@@ -340,6 +341,7 @@ CAPload(GENmodel *inModel, CKTcircuit *ckt)
             }
             return(OK);
         }
+#endif
 
         /*  loop through all the capacitor models */
         for( ; model != NULL; model = CAPnextModel(model)) {

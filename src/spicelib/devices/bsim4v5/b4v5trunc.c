@@ -27,7 +27,7 @@ double *timeStep)
 BSIM4v5model *model = (BSIM4v5model*)inModel;
 BSIM4v5instance *here;
 
-#if defined(__AVX512F__) && defined(__GNUC__) && !defined(STEPDEBUG)
+#if NGSPICE_OPT_ZEN4 && !defined(STEPDEBUG)
     if (BSIM4v5truncAvx(inModel, ckt, timeStep) == 0)
         return(OK);
 #endif

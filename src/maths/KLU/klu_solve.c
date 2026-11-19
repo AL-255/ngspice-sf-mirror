@@ -269,7 +269,7 @@ Int KLU_solve
                 {
 
                     case 1:
-#ifndef COMPLEX
+#if !defined(COMPLEX) && NGSPICE_OPT_GENERAL
                     {
                         double * restrict Xr = X ;
                         const Int * restrict Oir = Offi ;

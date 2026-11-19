@@ -1329,6 +1329,40 @@ else
     AC_MSG_RESULT([OpenMP feature disabled])
 fi
 
+# Portable general optimizations (default: enabled)
+AC_ARG_ENABLE([opt-general],
+    [AS_HELP_STRING([--disable-opt-general],
+        [Disable portable C99/OpenMP algorithmic & data-structure optimizations (default: enabled)])],
+    [],
+    [enable_opt_general=yes])
+if test "x$enable_opt_general" != xno ; then
+    AC_DEFINE([CONFIG_OPT_GENERAL], [1], [Enable portable general optimizations])
+    AC_MSG_RESULT([Portable general optimizations (NGSPICE_OPT_GENERAL) enabled])
+else
+    AC_DEFINE([CONFIG_OPT_GENERAL], [0], [Disable portable general optimizations])
+    AC_MSG_RESULT([Portable general optimizations (NGSPICE_OPT_GENERAL) disabled])
+fi
+
+# AMD Zen 4 / AVX-512 specific SIMD optimizations (default: auto-detect AVX-512)
+AC_ARG_ENABLE([opt-zen4],
+    [AS_HELP_STRING([--enable-opt-zen4],
+        [Enable AMD Zen 4 / AVX-512 specific SIMD optimizations (yes|no|auto, default: auto)])],
+    [],
+    [enable_opt_zen4=auto])
+if test "x$enable_opt_zen4" = xyes ; then
+    case "$CFLAGS" in
+        *-march=*) ;;
+        *) CFLAGS="$CFLAGS -march=znver4 -mtune=znver4" ;;
+    esac
+    AC_DEFINE([CONFIG_OPT_ZEN4], [1], [Enable AMD Zen 4 / AVX-512 specific optimizations])
+    AC_MSG_RESULT([AMD Zen 4 / AVX-512 optimizations (NGSPICE_OPT_ZEN4) enabled])
+elif test "x$enable_opt_zen4" = xno ; then
+    AC_DEFINE([CONFIG_OPT_ZEN4], [0], [Disable AMD Zen 4 / AVX-512 specific optimizations])
+    AC_MSG_RESULT([AMD Zen 4 / AVX-512 optimizations (NGSPICE_OPT_ZEN4) disabled])
+else
+    AC_MSG_RESULT([AMD Zen 4 / AVX-512 optimizations (NGSPICE_OPT_ZEN4): auto])
+fi
+
 # Output Files
 # ------------
 

@@ -6,7 +6,7 @@
  *   B4P(name) -> BSIM4v5##name  or  BSIM4v6##name
  *   B4_IS_V6  -> 0 or 1
  */
-#if defined(__AVX512F__) && defined(__GNUC__)
+#if NGSPICE_OPT_ZEN4
 
 #include "ngspice/bsim4_avx512_core.h"
 
@@ -1412,4 +1412,4 @@ B4P(truncAvx)(GENmodel *inModel, CKTcircuit *ckt, double *timeStep)
     return 0;
 }
 
-#endif /* __AVX512F__ && __GNUC__ */
+#endif /* NGSPICE_OPT_ZEN4 */

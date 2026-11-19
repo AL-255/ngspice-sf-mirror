@@ -100,6 +100,7 @@ spClear(MatrixPtr Matrix)
     /* Begin `spClear'. */
     assert( IS_SPARSE( Matrix ) );
 
+#if NGSPICE_OPT_GENERAL
     /* Clear matrix linearly across contiguous element & fill-in slabs. */
     if (Matrix->PreviousMatrixWasComplex || Matrix->Complex)
     {
@@ -149,6 +150,33 @@ spClear(MatrixPtr Matrix)
             }
         }
     }
+#else
+    if (Matrix->PreviousMatrixWasComplex || Matrix->Complex)
+    {
+        for (I = Matrix->Size; I > 0; I--)
+        {
+            pElement = Matrix->FirstInCol[I];
+            while (pElement != NULL)
+            {
+                pElement->Real = 0.0;
+                pElement->Imag = 0.0;
+                pElement = pElement->NextInCol;
+            }
+        }
+    }
+    else
+    {
+        for (I = Matrix->Size; I > 0; I--)
+        {
+            pElement = Matrix->FirstInCol[I];
+            while (pElement != NULL)
+            {
+                pElement->Real = 0.0;
+                pElement = pElement->NextInCol;
+            }
+        }
+    }
+#endif
 
     /* Empty the trash. */
     Matrix->TrashCan.Real = 0.0;

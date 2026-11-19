@@ -6,6 +6,8 @@ noinst_HEADERS = \
     amd.h \
 	bdrydefs.h	\
 	bool.h		\
+	bsim4_avx512_core.h \
+	bsim4_avx512_glue.h \
     btf.h \
 	carddefs.h	\
 	ciderinp.h	\
@@ -98,6 +100,7 @@ noinst_HEADERS = \
 	onemesh.h	\
 	opdefs.h	\
 	optdefs.h	\
+	opt_config.h	\
 	optndefs.h	\
 	osdiitf.h       \
 	outpdefs.h	\

@@ -18,6 +18,7 @@
 #endif
 
 #include "ngspice/config.h"
+#include "ngspice/opt_config.h"
 #include <stddef.h>
 
 #ifdef HAVE_LIMITS_H

@@ -387,12 +387,18 @@ spFactor(MatrixPtr Matrix)
             pColumn = Matrix->FirstInCol[Step];
             while (pColumn->Row < Step) {
                 pElement = Matrix->Diag[pColumn->Row];
+#if NGSPICE_OPT_GENERAL
                 Mult = Dest[pColumn->Row] * pElement->Real;
                 pColumn->Real = Mult;
                 if (Mult != 0.0) {
                     while ((pElement = pElement->NextInCol) != NULL)
                         Dest[pElement->Row] -= Mult * pElement->Real;
                 }
+#else
+                pColumn->Real = Dest[pColumn->Row] * pElement->Real;
+                while ((pElement = pElement->NextInCol) != NULL)
+                    Dest[pElement->Row] -= pColumn->Real * pElement->Real;
+#endif
                 pColumn = pColumn->NextInCol;
             }
 
@@ -422,10 +428,15 @@ spFactor(MatrixPtr Matrix)
             while (pColumn->Row < Step) {
                 pElement = Matrix->Diag[pColumn->Row];
                 Mult = (*pDest[pColumn->Row] *= pElement->Real);
+#if NGSPICE_OPT_GENERAL
                 if (Mult != 0.0) {
                     while ((pElement = pElement->NextInCol) != NULL)
                         *pDest[pElement->Row] -= Mult * pElement->Real;
                 }
+#else
+                while ((pElement = pElement->NextInCol) != NULL)
+                    *pDest[pElement->Row] -= Mult * pElement->Real;
+#endif
                 pColumn = pColumn->NextInCol;
             }
 

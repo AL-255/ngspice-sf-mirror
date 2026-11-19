@@ -29,6 +29,7 @@ NIconvTest(CKTcircuit *ckt)
     static int nancount = 0;
 
     size = SMPmatSize(ckt->CKTmatrix);
+#if NGSPICE_OPT_GENERAL
     if (!ckt->CKTnodeIsVolt || ckt->CKTnodeIsVoltSize != size) {
         FREE(ckt->CKTnodeIsVolt);
         ckt->CKTnodeIsVolt = TMALLOC(unsigned char, size + 1);
@@ -40,6 +41,9 @@ NIconvTest(CKTcircuit *ckt)
             ckt->CKTnodeIsVolt[i] = (node->type == SP_VOLTAGE) ? 1 : 0;
         }
     }
+#else
+    node = ckt->CKTnodes;
+#endif
 #ifdef STEPDEBUG
     for (i=1;i<=size;i++) {
         new =  ckt->CKTrhs [i] ;
@@ -47,6 +51,7 @@ NIconvTest(CKTcircuit *ckt)
         printf("chk for convergence:   %s    new: %g    old: %g\n",CKTnodName(ckt,i),new,old);
     }
 #endif /* STEPDEBUG */
+#if NGSPICE_OPT_GENERAL
     {
         const double * restrict rhs = ckt->CKTrhs;
         const double * restrict rhsOld = ckt->CKTrhsOld;
@@ -80,6 +85,41 @@ NIconvTest(CKTcircuit *ckt)
             }
         }
     }
+#else
+    for (i=1;i<=size;i++) {
+        node = node->next;
+        new =  ckt->CKTrhs [i] ;
+        old =  ckt->CKTrhsOld [i] ;
+        if (isnan(new)) {
+            if (ft_ngdebug && nancount < 10) {
+                fprintf(stderr, "Warning: non-convergence, node %s is nan\n", CKTnodName(ckt, i));
+                nancount++;
+            }
+            else if (ft_ngdebug && nancount == 10) {
+                fprintf(stderr, "    non-convergence warnings (nan) limited to 10 node %s\n", CKTnodName(ckt, i));
+                nancount++;
+            }
+            return 1;
+        }
+        if(node->type == SP_VOLTAGE) {
+            tol =  ckt->CKTreltol * (MAX(fabs(old),fabs(new))) +
+                    ckt->CKTvoltTol;
+            if (fabs(new-old) >tol ) {
+                ckt->CKTtroubleNode = i;
+                ckt->CKTtroubleElt = NULL;
+                return(1);
+            }
+        } else {
+            tol =  ckt->CKTreltol * (MAX(fabs(old),fabs(new))) +
+                    ckt->CKTabstol;
+            if (fabs(new-old) >tol ) {
+                ckt->CKTtroubleNode = i;
+                ckt->CKTtroubleElt = NULL;
+                return(1);
+            }
+        }
+    }
+#endif
 
 #ifdef NEWCONV
     i = CKTconvTest(ckt);

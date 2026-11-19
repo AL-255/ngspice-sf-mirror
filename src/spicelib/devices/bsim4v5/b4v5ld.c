@@ -98,7 +98,7 @@ void BSIM4v5LoadRhsMat(GENmodel *inModel, CKTcircuit *ckt);
 
 static inline int BSIM4v5polyDepletion(double phi, double ngate,double coxe, double Vgs, double *Vgs_eff, double *dVgs_eff_dVg);
 
-#if defined(__AVX512F__) && defined(__GNUC__)
+#if NGSPICE_OPT_ZEN4
 #define B4P(x) BSIM4v5##x
 #define B4_IS_V6 0
 #include "ngspice/bsim4_avx512_glue.h"
@@ -186,7 +186,7 @@ BSIM4v5kluPrep(GENmodel *inModel, CKTcircuit *ckt)
         head->BSIM4v5KluAxBase = ax;
         head->BSIM4v5KluNz = nz;
     }
-#if defined(__AVX512F__) && defined(__GNUC__)
+#if NGSPICE_OPT_ZEN4
     if (head->BSIM4v5KluAll4Term && BSIM4v5isAvxEligibleTran(ckt)) {
         BSIM4v5ensureAvxPack(head, ckt);
         BSIM4v5syncAvxDynFromInst(head);
@@ -206,7 +206,7 @@ BSIM4v5loadKluPar(GENmodel *inModel, CKTcircuit *ckt, double *my_ax, double *my_
     int count = head->BSIM4v5InstCount;
     int error = 0;
 
-#if defined(__AVX512F__) && defined(__GNUC__)
+#if NGSPICE_OPT_ZEN4
     if (head->BSIM4v5AvxBuilt && BSIM4v5isAvxEligibleTran(ckt)) {
         const BSIM4Avx512Block *blocks = (const BSIM4Avx512Block *)head->BSIM4v5AvxBlocks;
         BSIM4Avx512Dyn *dyn = (BSIM4Avx512Dyn *)head->BSIM4v5AvxDyn;
@@ -273,7 +273,7 @@ CKTcircuit *ckt)
     InstArray = model->BSIM4v5InstanceArray;
     int count = model->BSIM4v5InstCount;
 
-#if defined(__AVX512F__) && defined(__GNUC__)
+#if NGSPICE_OPT_ZEN4
     if (BSIM4v5isAvxEligibleTran(ckt)) {
         BSIM4v5ensureAvxPack(model, ckt);
         BSIM4v5syncAvxDynFromInst(model);

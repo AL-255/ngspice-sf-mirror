@@ -25,6 +25,7 @@ CAPtrunc(GENmodel *inModel, CKTcircuit *ckt, double *timeStep)
     int count = model->CAPfastCount;
     int ord = ckt->CKTorder;
 
+#if NGSPICE_OPT_GENERAL
     if (ckt->CKTterrCacheValid && (ord == 1 || ord == 2) && count > 0) {
         const double * restrict s0 = ckt->CKTstate0;
         const double * restrict s1 = ckt->CKTstate1;
@@ -114,6 +115,7 @@ CAPtrunc(GENmodel *inModel, CKTcircuit *ckt, double *timeStep)
         *timeStep = minStep;
         return(OK);
     }
+#endif
 
 #ifdef USE_OMP
     if (count >= 64 && omp_get_max_threads() > 1) {

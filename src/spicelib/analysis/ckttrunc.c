@@ -30,6 +30,7 @@ CKTtrunc(CKTcircuit *ckt, double *timeStep)
 
         startTime = SPfrontEnd->IFseconds();
 
+#if NGSPICE_OPT_GENERAL
         /* Precompute divided-difference linear weights once per timepoint for CKTterr */
         {
             static const double gearCoeff[] = {
@@ -67,6 +68,9 @@ CKTtrunc(CKTcircuit *ckt, double *timeStep)
                 ckt->CKTterrCacheValid = 0;
             }
         }
+#else
+        ckt->CKTterrCacheValid = 0;
+#endif
 
         timetemp = HUGE;
         for (i = 0; i < DEVmaxnum; i++) {

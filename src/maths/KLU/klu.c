@@ -219,7 +219,7 @@ void KLU_lsolve
     {
 
         case 1:
-#ifndef COMPLEX
+#if !defined(COMPLEX) && NGSPICE_OPT_GENERAL
         {
             double * restrict Xr = X ;
             for (k = 0 ; k < n ; k++)
@@ -361,7 +361,7 @@ void KLU_usolve
     {
 
         case 1:
-#ifndef COMPLEX
+#if !defined(COMPLEX) && NGSPICE_OPT_GENERAL
         {
             double * restrict Xr = X ;
             const double * restrict Udr = Udiag ;

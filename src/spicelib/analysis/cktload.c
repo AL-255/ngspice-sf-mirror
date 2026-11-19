@@ -67,7 +67,7 @@ CKTload(CKTcircuit *ckt)
     noncon = ckt->CKTnoncon;
 #endif /* STEPDEBUG */
 
-#if defined(KLU) && defined(USE_OMP)
+#if NGSPICE_OPT_GENERAL && defined(KLU) && defined(USE_OMP)
     if (ckt->CKTmatrix->CKTkluMODE &&
         ckt->CKTmatrix->SMPkluMatrix &&
         ckt->CKTmatrix->SMPkluMatrix->KLUmatrixIsComplex == KLUmatrixReal &&
@@ -233,7 +233,7 @@ CKTload(CKTcircuit *ckt)
         }
     }
 
-#if defined(KLU) && defined(USE_OMP)
+#if NGSPICE_OPT_GENERAL && defined(KLU) && defined(USE_OMP)
 after_device_loads:
 #endif
 

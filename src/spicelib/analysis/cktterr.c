@@ -19,6 +19,7 @@ CKTterr(int qcap, CKTcircuit *ckt, double *timeStep)
     double factor = 0.0;
     double d0;
 
+#if NGSPICE_OPT_GENERAL
     if (ckt->CKTterrCacheValid) {
         const double *s0 = ckt->CKTstate0;
         const double *s1 = ckt->CKTstate1;
@@ -74,6 +75,7 @@ CKTterr(int qcap, CKTcircuit *ckt, double *timeStep)
             return;
         }
     }
+#endif
 
     {
         double diff[8];

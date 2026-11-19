@@ -197,6 +197,7 @@ Int KLU_refactor        /* returns TRUE if successful, FALSE otherwise */
     /* build lazy precomputed scatter map for KLU_refactor (reused every call) */
     /* ---------------------------------------------------------------------- */
 
+#if NGSPICE_OPT_GENERAL
     if (Numeric->ref_blk_col == NULL && n > 0 && Ap != NULL && Ai != NULL &&
         Ap [0] == 0 && Ap [n] >= 0)
     {
@@ -257,6 +258,13 @@ Int KLU_refactor        /* returns TRUE if successful, FALSE otherwise */
     const Int * restrict ref_blk_p   = Numeric->ref_blk_p ;
     const Int * restrict ref_blk_row = Numeric->ref_blk_row ;
     int have_ref_map = (ref_blk_col != NULL && Numeric->ref_nz == Ap [n]) ;
+#else
+    const Int * restrict ref_off_p   = NULL ;
+    const Int * restrict ref_blk_col = NULL ;
+    const Int * restrict ref_blk_p   = NULL ;
+    const Int * restrict ref_blk_row = NULL ;
+    int have_ref_map = 0 ;
+#endif
 
     /* ---------------------------------------------------------------------- */
     /* clear workspace X */
@@ -407,7 +415,7 @@ Int KLU_refactor        /* returns TRUE if successful, FALSE otherwise */
                         if (IS_NONZERO (ujk))
                         {
                             GET_POINTER (LU, Lip, Llen, Li, Lx, j, llen) ;
-#ifndef COMPLEX
+#if !defined(COMPLEX) && NGSPICE_OPT_GENERAL
                             double * restrict Xr = X ;
                             const Int * restrict Lir = Li ;
                             const double * restrict Lxr = Lx ;
@@ -466,7 +474,7 @@ Int KLU_refactor        /* returns TRUE if successful, FALSE otherwise */
                     Udiag [k+k1] = ukk ;
                     /* gather and divide by pivot to get kth column of L */
                     GET_POINTER (LU, Lip, Llen, Li, Lx, k, llen) ;
-#ifndef COMPLEX
+#if !defined(COMPLEX) && NGSPICE_OPT_GENERAL
                     if (llen > 0 && !IS_ZERO (ukk))
                     {
                         double inv_ukk = 1.0 / ukk ;
@@ -697,7 +705,7 @@ Int KLU_refactor        /* returns TRUE if successful, FALSE otherwise */
                         if (IS_NONZERO (ujk))
                         {
                             GET_POINTER (LU, Lip, Llen, Li, Lx, j, llen) ;
-#ifndef COMPLEX
+#if !defined(COMPLEX) && NGSPICE_OPT_GENERAL
                             double * restrict Xr = X ;
                             const Int * restrict Lir = Li ;
                             const double * restrict Lxr = Lx ;
@@ -756,7 +764,7 @@ Int KLU_refactor        /* returns TRUE if successful, FALSE otherwise */
                     Udiag [k+k1] = ukk ;
                     /* gather and divide by pivot to get kth column of L */
                     GET_POINTER (LU, Lip, Llen, Li, Lx, k, llen) ;
-#ifndef COMPLEX
+#if !defined(COMPLEX) && NGSPICE_OPT_GENERAL
                     if (llen > 0 && !IS_ZERO (ukk))
                     {
                         double inv_ukk = 1.0 / ukk ;
