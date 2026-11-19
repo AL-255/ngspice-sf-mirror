@@ -788,6 +788,18 @@ struct  MatrixFrame
     int                          FillinsRemaining;
     struct FillinListNodeStruct *FirstFillinListNode;
     struct FillinListNodeStruct *LastFillinListNode;
+#if NGSPICE_OPT_APPLE
+    int                          FlatValid;
+    int                          FlatFactored;
+    int                          FlatSize;
+    int                          FlatElements;
+    int                          FlatNnz;
+    int                         *FlatColStart;
+    int                         *FlatDiagIdx;
+    int                         *FlatRow;
+    double                      *FlatVal;
+    double                     **FlatElemPtr;
+#endif
 };
 
 
@@ -803,6 +815,9 @@ extern void spcCreateInternalVectors( MatrixPtr );
 extern void spcLinkRows( MatrixPtr );
 extern void spcColExchange( MatrixPtr, int, int );
 extern void spcRowExchange( MatrixPtr, int, int );
+#if NGSPICE_OPT_APPLE
+extern void spcSyncFlatToElems( MatrixPtr );
+#endif
 
 void spErrorMessage(MatrixPtr, FILE *, char *);
 

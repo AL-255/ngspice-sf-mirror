@@ -145,6 +145,72 @@ spSolve(MatrixPtr Matrix, RealVector RHS, RealVector Solution,
     Intermediate = Matrix->Intermediate;
     Size = Matrix->Size;
 
+#if NGSPICE_OPT_APPLE
+    if (Matrix->FlatValid && Matrix->FlatFactored)
+    {
+        const int * restrict colStart = Matrix->FlatColStart;
+        const int * restrict diagIdx  = Matrix->FlatDiagIdx;
+        const int * restrict row      = Matrix->FlatRow;
+        const double * restrict val   = Matrix->FlatVal;
+        double * restrict X           = (double *)Intermediate;
+        const int * restrict rmap     = Matrix->IntToExtRowMap;
+        const int * restrict cmap     = Matrix->IntToExtColMap;
+
+        /* Scramble RHS */
+        for (I = 1; I <= Size; I++)
+            X[I] = RHS[rmap[I]];
+
+        /* Forward elimination: Lc = b (contiguous CSC) */
+        for (I = 1; I <= Size; I++) {
+            double t = X[I];
+            if (t != 0.0) {
+                int rd = diagIdx[I];
+                t *= val[rd];
+                X[I] = t;
+                int l1 = colStart[I + 1];
+                int p = rd + 1;
+                for (; p + 3 < l1; p += 4) {
+                    int i0 = row[p], i1 = row[p + 1], i2 = row[p + 2], i3 = row[p + 3];
+                    double x0 = X[i0], x1 = X[i1], x2 = X[i2], x3 = X[i3];
+                    x0 -= t * val[p];
+                    x1 -= t * val[p + 1];
+                    x2 -= t * val[p + 2];
+                    x3 -= t * val[p + 3];
+                    X[i0] = x0; X[i1] = x1; X[i2] = x2; X[i3] = x3;
+                }
+                for (; p < l1; p++)
+                    X[row[p]] -= t * val[p];
+            }
+        }
+
+        /* Backward substitution: Ux = c (column-oriented over same contiguous CSC!) */
+        for (I = Size; I > 0; I--) {
+            double t = X[I];
+            if (t != 0.0) {
+                int c0 = colStart[I];
+                int cd = diagIdx[I];
+                int p = c0;
+                for (; p + 3 < cd; p += 4) {
+                    int i0 = row[p], i1 = row[p + 1], i2 = row[p + 2], i3 = row[p + 3];
+                    double x0 = X[i0], x1 = X[i1], x2 = X[i2], x3 = X[i3];
+                    x0 -= t * val[p];
+                    x1 -= t * val[p + 1];
+                    x2 -= t * val[p + 2];
+                    x3 -= t * val[p + 3];
+                    X[i0] = x0; X[i1] = x1; X[i2] = x2; X[i3] = x3;
+                }
+                for (; p < cd; p++)
+                    X[row[p]] -= t * val[p];
+            }
+        }
+
+        /* Unscramble Solution */
+        for (I = 1; I <= Size; I++)
+            Solution[cmap[I]] = X[I];
+        return;
+    }
+#endif
+
     /* Initialize Intermediate vector. */
     pExtOrder = &Matrix->IntToExtRowMap[Size];
     for (I = Size; I > 0; I--)
@@ -410,6 +476,10 @@ spSolveTransposed(MatrixPtr Matrix, RealVector RHS, RealVector Solution,
 
     /* Begin `spSolveTransposed'. */
     assert( IS_VALID(Matrix) && IS_FACTORED(Matrix) );
+#if NGSPICE_OPT_APPLE
+    if (Matrix->FlatFactored)
+        spcSyncFlatToElems(Matrix);
+#endif
 
     if (Matrix->Complex)
     {
