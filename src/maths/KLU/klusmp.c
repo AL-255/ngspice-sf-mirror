@@ -1024,6 +1024,104 @@ SMPsolve (SMPmatrix *Matrix, double RHS[], double Spare[])
     }
 }
 
+#if NGSPICE_OPT_GENERAL
+/*
+ * Shamanskii / Modified Chord Newton step for KLU:
+ * Computes exact nonlinear residual r = RHS - (A + Gmin*I) * Xold into
+ * KLUmatrixIntermediate, solves L_old U_old dx = r reusing the existing
+ * KLUmatrixNumeric factors, and returns max_j |dx[j]| in *dx_norm_out.
+ * Leaves RHS and KLUmatrixAx untouched so the caller can seamlessly fall
+ * back to SMPluFac + SMPsolve if contraction is insufficient.
+ */
+int
+SMPkluChordSolve (SMPmatrix *Matrix, const double RHS[], const double Xold[],
+                  double Gmin, double *dx_norm_out)
+{
+    KLUmatrix *km ;
+    unsigned int n, j ;
+    const unsigned int * restrict map ;
+    const int * restrict Ap ;
+    const int * restrict Ai ;
+    const double * restrict Ax ;
+    double * restrict r ;
+    int ret ;
+
+    if (!Matrix->CKTkluMODE)
+        return 0 ;
+    km = Matrix->SMPkluMatrix ;
+    if (!km || km->KLUmatrixN == 0 || !km->KLUmatrixSymbolic || !km->KLUmatrixNumeric)
+        return 0 ;
+
+    n   = km->KLUmatrixN ;
+    map = km->KLUmatrixNodeCollapsingNewToOld ;
+    Ap  = km->KLUmatrixAp ;
+    Ai  = km->KLUmatrixAi ;
+    Ax  = km->KLUmatrixAx ;
+    r   = km->KLUmatrixIntermediate ;
+
+    for (j = 0 ; j < n ; j++) {
+        unsigned int idx = map [j + 1] ;
+        r [j] = idx ? RHS [idx] : 0.0 ;
+    }
+
+    for (j = 0 ; j < n ; j++) {
+        unsigned int idx = map [j + 1] ;
+        double xj = idx ? Xold [idx] : 0.0 ;
+        if (xj == 0.0)
+            continue ;
+        if (Gmin != 0.0)
+            r [j] -= Gmin * xj ;
+        int p = Ap [j] ;
+        int pend = Ap [j + 1] ;
+        for ( ; p + 3 < pend ; p += 4) {
+            int i0 = Ai [p], i1 = Ai [p + 1], i2 = Ai [p + 2], i3 = Ai [p + 3] ;
+            double r0 = r [i0], r1 = r [i1], r2 = r [i2], r3 = r [i3] ;
+            r0 -= Ax [p]     * xj ;
+            r1 -= Ax [p + 1] * xj ;
+            r2 -= Ax [p + 2] * xj ;
+            r3 -= Ax [p + 3] * xj ;
+            r [i0] = r0 ; r [i1] = r1 ; r [i2] = r2 ; r [i3] = r3 ;
+        }
+        for ( ; p < pend ; p++)
+            r [Ai [p]] -= Ax [p] * xj ;
+    }
+
+    ret = klu_solve (km->KLUmatrixSymbolic, km->KLUmatrixNumeric, (int) n, 1,
+                     r, km->KLUmatrixCommon) ;
+    if (ret == 0)
+        return 0 ;
+
+    double max_dx = 0.0 ;
+    for (j = 0 ; j < n ; j++) {
+        double a = fabs (r [j]) ;
+        if (!(a < 1.0e100)) /* catches NaN / Inf / blowup */
+            return 0 ;
+        if (a > max_dx)
+            max_dx = a ;
+    }
+    *dx_norm_out = max_dx ;
+    return 1 ;
+}
+
+void
+SMPkluChordCommit (SMPmatrix *Matrix, double RHS[], const double Xold[])
+{
+    KLUmatrix *km = Matrix->SMPkluMatrix ;
+    unsigned int n = km->KLUmatrixN ;
+    const unsigned int * restrict map = km->KLUmatrixNodeCollapsingNewToOld ;
+    const double * restrict dx = km->KLUmatrixIntermediate ;
+    unsigned int j ;
+
+    if (km->KLUmatrixNrhs > 0)
+        memset (RHS, 0, (size_t) km->KLUmatrixNrhs * sizeof (double)) ;
+    for (j = 0 ; j < n ; j++) {
+        unsigned int idx = map [j + 1] ;
+        if (idx != 0)
+            RHS [idx] = Xold [idx] + dx [j] ;
+    }
+}
+#endif
+
 #ifdef CIDER
 void
 SMPsolveKLUforCIDER (SMPmatrix *Matrix, double RHS[], double RHSsolution[], double iRHS[], double iRHSsolution[])

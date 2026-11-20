@@ -33,6 +33,15 @@ NIiter(CKTcircuit *ckt, int maxIter)
 
     int iterno = 0;
     int ipass = 0;
+#if defined(KLU) && NGSPICE_OPT_GENERAL
+    double prev_dx_norm = 1.0e30;
+    double step_max_dx = 0.0;
+    static int chord_init = 0, chord_disabled = 0;
+    if (!chord_init) {
+        chord_disabled = (getenv("NGSPICE_NO_CHORD") != NULL);
+        chord_init = 1;
+    }
+#endif
 
     /* some convergence issues that get resolved by increasing max iter */
     if (maxIter < 100)
@@ -110,6 +119,9 @@ NIiter(CKTcircuit *ckt, int maxIter)
                 ckt->CKTniState |= NISHOULDREORDER;
             }
 
+#if defined(KLU) && NGSPICE_OPT_GENERAL
+            int used_chord = 0;
+#endif
             if (ckt->CKTniState & NISHOULDREORDER) {
                 startTime = SPfrontEnd->IFseconds();
 
@@ -144,7 +156,55 @@ NIiter(CKTcircuit *ckt, int maxIter)
                     return(error); /* can't handle these errors - pass up! */
                 }
                 ckt->CKTniState &= ~NISHOULDREORDER;
+#if defined(KLU) && NGSPICE_OPT_GENERAL
+                if (ckt->CKTkluMODE && (ckt->CKTmode & MODETRAN)) {
+                    ckt->CKTkluLuValid = 1;
+                    ckt->CKTkluLuAg0 = ckt->CKTag[0];
+                    ckt->CKTkluLuGmin = ckt->CKTdiagGmin;
+                    ckt->CKTkluChordCount = 0;
+                } else {
+                    ckt->CKTkluLuValid = 0;
+                }
+#endif
             } else {
+#if defined(KLU) && NGSPICE_OPT_GENERAL
+                if (!chord_disabled && ckt->CKTkluMODE &&
+                    (ckt->CKTmode & MODETRAN) &&
+                    !(ckt->CKTmode & (MODEINITTRAN | MODEINITJCT | MODEINITFIX)) &&
+                    ckt->CKTnoncon == 0 &&
+                    ckt->CKTkluLuValid &&
+                    ckt->CKTdiagGmin == ckt->CKTkluLuGmin &&
+                    ckt->CKTkluChordCount < 10)
+                {
+                    double ag0 = ckt->CKTag[0];
+                    double lu_ag0 = ckt->CKTkluLuAg0;
+                    /* Same-timestep polishing (iterno >= 2) or smooth constant-step reuse */
+                    int ok_iter = (iterno >= 2)
+                        ? (prev_dx_norm <= 0.05 && ag0 == lu_ag0)
+                        : (ckt->CKTkluLastStepSmooth && ag0 >= 0.90 * lu_ag0 && ag0 <= 1.11 * lu_ag0);
+                    if (ok_iter && lu_ag0 > 0.0)
+                    {
+                        double dx_norm = 1.0e30;
+                        startTime = SPfrontEnd->IFseconds();
+                        if (SMPkluChordSolve(ckt->CKTmatrix, ckt->CKTrhs, ckt->CKTrhsOld,
+                                             ckt->CKTdiagGmin, &dx_norm))
+                        {
+                            int accept = (iterno == 1)
+                                ? (dx_norm < 0.015)
+                                : (dx_norm < 0.04 && (dx_norm <= 0.35 * prev_dx_norm || dx_norm <= 5.0e-5));
+                            if (accept) {
+                                SMPkluChordCommit(ckt->CKTmatrix, ckt->CKTrhs, ckt->CKTrhsOld);
+                                ckt->CKTstat->STATsolveTime += SPfrontEnd->IFseconds() - startTime;
+                                ckt->CKTkluChordCount++;
+                                prev_dx_norm = dx_norm;
+                                if (dx_norm > step_max_dx) step_max_dx = dx_norm;
+                                used_chord = 1;
+                            }
+                        }
+                    }
+                }
+                if (!used_chord) {
+#endif
                 startTime = SPfrontEnd->IFseconds();
 
 #ifdef KLU
@@ -193,6 +253,9 @@ NIiter(CKTcircuit *ckt, int maxIter)
                         FREE(OldCKTstate0);
                         return(error);
                     }
+#if NGSPICE_OPT_GENERAL
+                    ckt->CKTniState &= ~NISHOULDREORDER;
+#endif
                 } else if (error) {
                     if (!(ckt->CKTkluMODE) && (error == E_SINGULAR)) {
 
@@ -239,7 +302,17 @@ NIiter(CKTcircuit *ckt, int maxIter)
                     return(error);
                 }
 #endif
-
+#if defined(KLU) && NGSPICE_OPT_GENERAL
+                if (ckt->CKTkluMODE && (ckt->CKTmode & MODETRAN)) {
+                    ckt->CKTkluLuValid = 1;
+                    ckt->CKTkluLuAg0 = ckt->CKTag[0];
+                    ckt->CKTkluLuGmin = ckt->CKTdiagGmin;
+                    ckt->CKTkluChordCount = 0;
+                } else {
+                    ckt->CKTkluLuValid = 0;
+                }
+                } /* !used_chord */
+#endif
             }
 
             /* moved it to here as if xspice is included then CKTload changes
@@ -263,10 +336,31 @@ NIiter(CKTcircuit *ckt, int maxIter)
                        (size_t) ckt->CKTnumStates * sizeof(double));
 #endif
 
+#if defined(KLU) && NGSPICE_OPT_GENERAL
+            if (!used_chord) {
+                startTime = SPfrontEnd->IFseconds();
+                SMPsolve(ckt->CKTmatrix, ckt->CKTrhs, ckt->CKTrhsSpare);
+                ckt->CKTstat->STATsolveTime +=
+                    SPfrontEnd->IFseconds() - startTime;
+                if (!chord_disabled && ckt->CKTkluMODE && (ckt->CKTmode & MODETRAN)) {
+                    int nmax = ckt->CKTmaxEqNum;
+                    const double * restrict rn = ckt->CKTrhs;
+                    const double * restrict ro = ckt->CKTrhsOld;
+                    double mx = 0.0;
+                    for (int k = 1; k < nmax; k++) {
+                        double d = fabs(rn[k] - ro[k]);
+                        if (d > mx) mx = d;
+                    }
+                    prev_dx_norm = mx;
+                    if (mx > step_max_dx) step_max_dx = mx;
+                }
+            }
+#else
             startTime = SPfrontEnd->IFseconds();
             SMPsolve(ckt->CKTmatrix, ckt->CKTrhs, ckt->CKTrhsSpare);
             ckt->CKTstat->STATsolveTime +=
                 SPfrontEnd->IFseconds() - startTime;
+#endif
 #ifdef STEPDEBUG
             /*XXXX*/
             if (ckt->CKTrhs[0] != 0.0)
@@ -343,6 +437,9 @@ NIiter(CKTcircuit *ckt, int maxIter)
                 ipass = 0;
             }
             if (ckt->CKTnoncon == 0) {
+#if defined(KLU) && NGSPICE_OPT_GENERAL
+                ckt->CKTkluLastStepSmooth = (iterno <= 4 && step_max_dx < 0.05);
+#endif
                 ckt->CKTstat->STATnumIter += iterno;
                 FREE(OldCKTstate0);
                 return(OK);

@@ -70,6 +70,11 @@ void SMPcaSolve(SMPmatrix *Matrix, double RHS[], double iRHS[],
 		double Spare[], double iSpare[]);
 void SMPcSolve( SMPmatrix *, double [], double [], double [], double []);
 void SMPsolve( SMPmatrix *, double [], double []);
+#if defined(KLU) && NGSPICE_OPT_GENERAL
+int SMPkluChordSolve(SMPmatrix *Matrix, const double RHS[], const double Xold[],
+                     double Gmin, double *dx_norm_out);
+void SMPkluChordCommit(SMPmatrix *Matrix, double RHS[], const double Xold[]);
+#endif
 int SMPmatSize( SMPmatrix *);
 int SMPnewMatrix( SMPmatrix *, int );
 void SMPdestroy( SMPmatrix *);

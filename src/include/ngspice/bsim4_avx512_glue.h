@@ -158,14 +158,19 @@ B4P(ensureAvxPack)(B4P(model) *head, CKTcircuit *ckt)
     int nBlocks = (nElig + 7) / 8;
     BSIM4Avx512Block *blocks = NULL;
     BSIM4Avx512Dyn *dyn = NULL;
+    BSIM4Avx512Inst *insts = NULL;
     if (nBlocks > 0) {
-        if (posix_memalign((void **)&blocks, 64, (size_t)nBlocks * sizeof(BSIM4Avx512Block)) != 0)
+        size_t blk_bytes = (size_t)nBlocks * sizeof(BSIM4Avx512Block);
+        size_t inst_bytes = (nBlocks > 4) ? ((size_t)nBlocks * 8u * sizeof(BSIM4Avx512Inst)) : 0u;
+        if (posix_memalign((void **)&blocks, 64, blk_bytes + inst_bytes) != 0)
             blocks = NULL;
         if (blocks && posix_memalign((void **)&dyn, 64, (size_t)nBlocks * sizeof(BSIM4Avx512Dyn)) != 0) {
             free(blocks);
             blocks = NULL;
             dyn = NULL;
         }
+        if (blocks && inst_bytes > 0)
+            insts = (BSIM4Avx512Inst *)(blocks + nBlocks);
         if (dyn)
             memset(dyn, 0, (size_t)nBlocks * sizeof(BSIM4Avx512Dyn));
     }
@@ -693,6 +698,43 @@ B4P(ensureAvxPack)(B4P(model) *head, CKTcircuit *ckt)
         blk->MJSWGD = v8_load(t_MJSWGD); blk->inv1mMJSWGD = v8_load(t_i1MJSWGD);
         blk->jctS_sum = v8_load(t_jSsum); blk->jctD_sum = v8_load(t_jDsum);
         blk->jctS_lin = v8_load(t_jSlin); blk->jctD_lin = v8_load(t_jDlin);
+
+        /* Mirror hot read-only topology/stamp metadata into dyn[bi] so L1 hits,
+         * convTest, terrBlock8, and KLU stamping never touch the 10 KiB cold block! */
+        dyn[bi].type_v     = blk->type;
+        dyn[bi].n_active   = blk->n_active;
+        dyn[bi].m_has_dint = blk->m_has_dint;
+        dyn[bi].m_has_sint = blk->m_has_sint;
+        for (int lane = 0; lane < 8; lane++) {
+            dyn[bi].dNodePrime[lane] = blk->dNodePrime[lane];
+            dyn[bi].gNodePrime[lane] = blk->gNodePrime[lane];
+            dyn[bi].sNodePrime[lane] = blk->sNodePrime[lane];
+            dyn[bi].bNodePrime[lane] = blk->bNodePrime[lane];
+            dyn[bi].stateBase[lane]  = blk->stateBase[lane];
+            for (int k = 0; k < 16; k++)
+                dyn[bi].kluOff16[lane][k] = blk->kluOff[lane][k];
+        }
+
+        /* Stage 10E: populate AoS per-instance parameter table for active-lane compaction */
+        if (insts) {
+            const double (*bvecs)[8] = (const double (*)[8])blk;
+            const uint8_t *bmasks = (const uint8_t *)&blk->m_ngate_valid;
+            for (int lane = 0; lane < 8; lane++) {
+                BSIM4Avx512Inst *ins = &insts[bi * 8 + lane];
+                for (size_t f = 0; f < B4_NUM_PARAM_V8; f++)
+                    ins->p[f] = bvecs[f][lane];
+                for (size_t f = B4_NUM_PARAM_V8; f < B4_PARAM_PADDED; f++)
+                    ins->p[f] = 0.0;
+                uint64_t mb = 0;
+                for (int mk = 0; mk < B4_NUM_MASKS; mk++) {
+                    if (bmasks[mk] & (1u << lane))
+                        mb |= (1ULL << mk);
+                }
+                if (blk->has_ud)
+                    mb |= (1ULL << B4_NUM_MASKS);
+                ins->mask_bits = mb;
+            }
+        }
     }
 
     FREE(eligIdx);
@@ -761,6 +803,43 @@ B4P(avxBypassTol)(const CKTcircuit *ckt)
     return (vt < 1.0e-6) ? vt : 1.0e-6;
 }
 
+static inline __mmask8
+B4P(laneCacheHitMask)(
+    const BSIM4Avx512Dyn * restrict d,
+    v8d vds, v8d vgs, v8d vbs,
+    double vtol, double reltol, double abstol,
+    __mmask8 active_mask,
+    __mmask8 *exact_zero_mask_out)
+{
+    v8d delvds = vds - d->last_vds;
+    v8d delvgs = vgs - d->last_vgs;
+    v8d delvbs = vbs - d->last_vbs;
+    v8d dv = v8_max(v8_abs(delvds), v8_max(v8_abs(delvgs), v8_abs(delvbs)));
+    __mmask8 ok = v8_le(dv, v8_set1(vtol)) & active_mask;
+    if (!ok) {
+        *exact_zero_mask_out = 0;
+        return 0;
+    }
+    __mmask8 m_flip = (v8_ge(vds, v8_set1(0.0)) ^ v8_ge(d->last_vds, v8_set1(0.0))) & ok;
+    ok &= ~m_flip;
+    if (!ok) {
+        *exact_zero_mask_out = 0;
+        return 0;
+    }
+    const v8d v_rel = v8_set1(0.1 * reltol);
+    const v8d v_abs = v8_set1(0.1 * abstol);
+    v8d cd_diff = d->cd_g * delvgs + d->cd_d * delvds + d->cd_b * delvbs;
+    v8d cdhat   = d->Idtot + cd_diff;
+    v8d tol0    = v_rel * v8_max(v8_abs(cdhat), v8_abs(d->Idtot)) + v_abs;
+    v8d cb_diff = d->cb_g * delvgs + d->cb_d * delvds + d->cb_b * delvbs;
+    v8d cbhat   = d->Ibtot + cb_diff;
+    v8d tol6    = v_rel * v8_max(v8_abs(cbhat), v8_abs(d->Ibtot)) + v_abs;
+    __mmask8 fail = (v8_ge(v8_abs(cd_diff), tol0) | v8_ge(v8_abs(cb_diff), tol6)) & ok;
+    __mmask8 hit = ok & ~fail;
+    *exact_zero_mask_out = v8_le(dv, v8_set1(1.0e-13)) & hit;
+    return hit;
+}
+
 static inline int
 B4P(blockCacheMatch)(
     const BSIM4Avx512Dyn * restrict d,
@@ -804,39 +883,75 @@ B4P(stampAvxDyn)(
     double * restrict my_rhs,
     int stamp_mode)
 {
-    int nact = blk->n_active;
+    int nact = dyn->n_active;
     double mgd_arr[8], mgs_arr[8];
-    if (blk->m_has_dint) v8_store(mgd_arr, blk->mgd);
-    if (blk->m_has_sint) v8_store(mgs_arr, blk->mgs);
+    if (dyn->m_has_dint) v8_store(mgd_arr, blk->mgd);
+    if (dyn->m_has_sint) v8_store(mgs_arr, blk->mgs);
 
     if (stamp_mode == 0) {
         for (int lane = 0; lane < nact; lane++) {
-            const int *off = blk->kluOff[lane];
-            my_rhs[blk->dNodePrime[lane]] += dyn->st_rhsd[lane];
-            my_rhs[blk->gNodePrime[lane]] -= dyn->st_rhsg[lane];
-            my_rhs[blk->bNodePrime[lane]] += dyn->st_rhsb[lane];
-            my_rhs[blk->sNodePrime[lane]] += dyn->st_rhss[lane];
+            const int *off = dyn->kluOff16[lane];
+            int dn = dyn->dNodePrime[lane];
+            int gn = dyn->gNodePrime[lane];
+            int sn = dyn->sNodePrime[lane];
+            int bn = dyn->bNodePrime[lane];
+            if (dn) my_rhs[dn] += dyn->st_rhsd[lane];
+            if (gn) my_rhs[gn] -= dyn->st_rhsg[lane];
+            if (bn) my_rhs[bn] += dyn->st_rhsb[lane];
+            if (sn) my_rhs[sn] += dyn->st_rhss[lane];
 
-            my_ax[off[0]]  += dyn->st_v34[lane];
-            my_ax[off[1]]  += dyn->st_v35[lane];
-            my_ax[off[2]]  += dyn->st_v36[lane];
-            my_ax[off[3]]  += dyn->st_v37[lane];
-            my_ax[off[4]]  += dyn->st_v44[lane];
-            my_ax[off[5]]  += dyn->st_v46[lane];
-            my_ax[off[6]]  -= dyn->st_v47[lane];
-            my_ax[off[7]]  -= dyn->st_v48[lane];
-            my_ax[off[8]]  -= dyn->st_v51[lane];
-            my_ax[off[9]]  += dyn->st_v52[lane];
-            my_ax[off[10]] += dyn->st_v53[lane];
-            my_ax[off[11]] -= dyn->st_v55[lane];
-            my_ax[off[12]] += dyn->st_v58[lane];
-            my_ax[off[13]] += dyn->st_v59[lane];
-            my_ax[off[14]] += dyn->st_v60[lane];
-            my_ax[off[15]] += dyn->st_v61[lane];
+            /* Skip grounded S/B matrix stamps to eliminate serialized my_ax[inz]
+             * store-to-load forwarding stalls with zero extra struct footprint! */
+            if (sn != 0 && bn != 0) {
+                my_ax[off[0]]  += dyn->st_v34[lane];
+                my_ax[off[1]]  += dyn->st_v35[lane];
+                my_ax[off[2]]  += dyn->st_v36[lane];
+                my_ax[off[3]]  += dyn->st_v37[lane];
+                my_ax[off[4]]  += dyn->st_v44[lane];
+                my_ax[off[5]]  += dyn->st_v46[lane];
+                my_ax[off[6]]  -= dyn->st_v47[lane];
+                my_ax[off[7]]  -= dyn->st_v48[lane];
+                my_ax[off[8]]  -= dyn->st_v51[lane];
+                my_ax[off[9]]  += dyn->st_v52[lane];
+                my_ax[off[10]] += dyn->st_v53[lane];
+                my_ax[off[11]] -= dyn->st_v55[lane];
+                my_ax[off[12]] += dyn->st_v58[lane];
+                my_ax[off[13]] += dyn->st_v59[lane];
+                my_ax[off[14]] += dyn->st_v60[lane];
+                my_ax[off[15]] += dyn->st_v61[lane];
+            } else if (sn != 0) {
+                /* Bulk grounded (b==0): only 9 (g,d,s)x(g,d,s) entries active */
+                my_ax[off[0]]  += dyn->st_v34[lane];
+                my_ax[off[1]]  += dyn->st_v35[lane];
+                my_ax[off[2]]  += dyn->st_v36[lane];
+                my_ax[off[4]]  += dyn->st_v44[lane];
+                my_ax[off[5]]  += dyn->st_v46[lane];
+                my_ax[off[6]]  -= dyn->st_v47[lane];
+                my_ax[off[8]]  -= dyn->st_v51[lane];
+                my_ax[off[9]]  += dyn->st_v52[lane];
+                my_ax[off[10]] += dyn->st_v53[lane];
+            } else if (bn != 0) {
+                /* Source grounded (s==0): only 9 (g,d,b)x(g,d,b) entries active */
+                my_ax[off[0]]  += dyn->st_v34[lane];
+                my_ax[off[1]]  += dyn->st_v35[lane];
+                my_ax[off[3]]  += dyn->st_v37[lane];
+                my_ax[off[4]]  += dyn->st_v44[lane];
+                my_ax[off[5]]  += dyn->st_v46[lane];
+                my_ax[off[7]]  -= dyn->st_v48[lane];
+                my_ax[off[12]] += dyn->st_v58[lane];
+                my_ax[off[13]] += dyn->st_v59[lane];
+                my_ax[off[15]] += dyn->st_v61[lane];
+            } else {
+                /* Both source & bulk grounded (common bottom NMOS): only 4 entries! */
+                my_ax[off[0]]  += dyn->st_v34[lane];
+                my_ax[off[1]]  += dyn->st_v35[lane];
+                my_ax[off[4]]  += dyn->st_v44[lane];
+                my_ax[off[5]]  += dyn->st_v46[lane];
+            }
         }
-        if (blk->m_has_dint) {
+        if (dyn->m_has_dint) {
             for (int lane = 0; lane < nact; lane++) {
-                if (blk->m_has_dint & (1u << lane)) {
+                if (dyn->m_has_dint & (1u << lane)) {
                     const int *off = blk->kluOff[lane];
                     double mgd = mgd_arr[lane];
                     my_ax[off[16]] -= mgd;
@@ -845,9 +960,9 @@ B4P(stampAvxDyn)(
                 }
             }
         }
-        if (blk->m_has_sint) {
+        if (dyn->m_has_sint) {
             for (int lane = 0; lane < nact; lane++) {
-                if (blk->m_has_sint & (1u << lane)) {
+                if (dyn->m_has_sint & (1u << lane)) {
                     const int *off = blk->kluOff[lane];
                     double mgs = mgs_arr[lane];
                     my_ax[off[19]] -= mgs;
@@ -860,39 +975,57 @@ B4P(stampAvxDyn)(
         for (int lane = 0; lane < nact; lane++) {
             B4P(instance) *here = InstArray[blk->instIdx[lane]];
             __mmask8 bit = (__mmask8)(1u << lane);
-            my_rhs[blk->dNodePrime[lane]] += dyn->st_rhsd[lane];
-            my_rhs[blk->gNodePrime[lane]] -= dyn->st_rhsg[lane];
-            my_rhs[blk->bNodePrime[lane]] += dyn->st_rhsb[lane];
-            my_rhs[blk->sNodePrime[lane]] += dyn->st_rhss[lane];
+            int dn = blk->dNodePrime[lane];
+            int gn = blk->gNodePrime[lane];
+            int sn = blk->sNodePrime[lane];
+            int bn = blk->bNodePrime[lane];
+            if (dn) my_rhs[dn] += dyn->st_rhsd[lane];
+            if (gn) my_rhs[gn] -= dyn->st_rhsg[lane];
+            if (bn) my_rhs[bn] += dyn->st_rhsb[lane];
+            if (sn) my_rhs[sn] += dyn->st_rhss[lane];
 
             *(here->B4P(GPgpPtr)) += dyn->st_v34[lane];
             *(here->B4P(GPdpPtr)) += dyn->st_v35[lane];
-            *(here->B4P(GPspPtr)) += dyn->st_v36[lane];
-            *(here->B4P(GPbpPtr)) += dyn->st_v37[lane];
             *(here->B4P(DPdpPtr)) += dyn->st_v44[lane];
             *(here->B4P(DPgpPtr)) += dyn->st_v46[lane];
-            *(here->B4P(DPspPtr)) -= dyn->st_v47[lane];
-            *(here->B4P(DPbpPtr)) -= dyn->st_v48[lane];
+            if (sn != 0 && bn != 0) {
+                *(here->B4P(GPspPtr)) += dyn->st_v36[lane];
+                *(here->B4P(GPbpPtr)) += dyn->st_v37[lane];
+                *(here->B4P(DPspPtr)) -= dyn->st_v47[lane];
+                *(here->B4P(DPbpPtr)) -= dyn->st_v48[lane];
+                *(here->B4P(SPdpPtr)) -= dyn->st_v51[lane];
+                *(here->B4P(SPgpPtr)) += dyn->st_v52[lane];
+                *(here->B4P(SPspPtr)) += dyn->st_v53[lane];
+                *(here->B4P(SPbpPtr)) -= dyn->st_v55[lane];
+                *(here->B4P(BPdpPtr)) += dyn->st_v58[lane];
+                *(here->B4P(BPgpPtr)) += dyn->st_v59[lane];
+                *(here->B4P(BPspPtr)) += dyn->st_v60[lane];
+                *(here->B4P(BPbpPtr)) += dyn->st_v61[lane];
+            } else if (sn != 0) {
+                *(here->B4P(GPspPtr)) += dyn->st_v36[lane];
+                *(here->B4P(DPspPtr)) -= dyn->st_v47[lane];
+                *(here->B4P(SPdpPtr)) -= dyn->st_v51[lane];
+                *(here->B4P(SPgpPtr)) += dyn->st_v52[lane];
+                *(here->B4P(SPspPtr)) += dyn->st_v53[lane];
+            } else if (bn != 0) {
+                *(here->B4P(GPbpPtr)) += dyn->st_v37[lane];
+                *(here->B4P(DPbpPtr)) -= dyn->st_v48[lane];
+                *(here->B4P(BPdpPtr)) += dyn->st_v58[lane];
+                *(here->B4P(BPgpPtr)) += dyn->st_v59[lane];
+                *(here->B4P(BPbpPtr)) += dyn->st_v61[lane];
+            }
             if (blk->m_has_dint & bit) {
                 double mgd = mgd_arr[lane];
                 *(here->B4P(DPdPtr)) -= mgd;
                 *(here->B4P(DdpPtr)) -= mgd;
                 *(here->B4P(DdPtr))  += mgd;
             }
-            *(here->B4P(SPdpPtr)) -= dyn->st_v51[lane];
-            *(here->B4P(SPgpPtr)) += dyn->st_v52[lane];
-            *(here->B4P(SPspPtr)) += dyn->st_v53[lane];
-            *(here->B4P(SPbpPtr)) -= dyn->st_v55[lane];
             if (blk->m_has_sint & bit) {
                 double mgs = mgs_arr[lane];
                 *(here->B4P(SPsPtr)) -= mgs;
                 *(here->B4P(SspPtr)) -= mgs;
                 *(here->B4P(SsPtr))  += mgs;
             }
-            *(here->B4P(BPdpPtr)) += dyn->st_v58[lane];
-            *(here->B4P(BPgpPtr)) += dyn->st_v59[lane];
-            *(here->B4P(BPspPtr)) += dyn->st_v60[lane];
-            *(here->B4P(BPbpPtr)) += dyn->st_v61[lane];
         }
     } else {
         for (int lane = 0; lane < nact; lane++) {
@@ -967,7 +1100,7 @@ B4P(evalAvxBlock)(
     double ag1 = dc_only ? 0.0 : ckt->CKTag[1];
     double ag2 = dc_only ? 0.0 : ckt->CKTag[2];
     double vtol = dc_only ? -1.0 : B4P(avxBypassTol)(ckt);
-    int nact = blk->n_active;
+    int nact = dyn->n_active;
     __mmask8 active_mask = (__mmask8)((1u << nact) - 1u);
 
     double a_vds[8], a_vgs[8], a_vbs[8];
@@ -982,25 +1115,24 @@ B4P(evalAvxBlock)(
         dyn->last_s0 == s0 && dyn->last_s1 == s1 && dyn->last_s2 == s2)
     {
         for (int lane = 0; lane < nact; lane++) {
-            double vs_node = rhsOld[blk->sNodePrime[lane]];
-            a_vds[lane] = rhsOld[blk->dNodePrime[lane]] - vs_node;
-            a_vgs[lane] = rhsOld[blk->gNodePrime[lane]] - vs_node;
-            a_vbs[lane] = rhsOld[blk->bNodePrime[lane]] - vs_node;
+            double vs_node = rhsOld[dyn->sNodePrime[lane]];
+            a_vds[lane] = rhsOld[dyn->dNodePrime[lane]] - vs_node;
+            a_vgs[lane] = rhsOld[dyn->gNodePrime[lane]] - vs_node;
+            a_vbs[lane] = rhsOld[dyn->bNodePrime[lane]] - vs_node;
         }
         for (int lane = nact; lane < 8; lane++) {
             a_vds[lane] = a_vds[0];
             a_vgs[lane] = a_vgs[0];
             a_vbs[lane] = a_vbs[0];
         }
-        v8d vds_r = v8_load(a_vds) * blk->type;
-        v8d vgs_r = v8_load(a_vgs) * blk->type;
-        v8d vbs_r = v8_load(a_vbs) * blk->type;
+        v8d vds_r = v8_load(a_vds) * dyn->type_v;
+        v8d vgs_r = v8_load(a_vgs) * dyn->type_v;
+        v8d vbs_r = v8_load(a_vbs) * dyn->type_v;
         int exact_zero = 0;
         if (B4P(blockCacheMatch)(dyn, vds_r, vgs_r, vbs_r, vtol,
                                  ckt->CKTreltol, ckt->CKTabstol, active_mask, &exact_zero)) {
             if (!exact_zero) {
-                bsim4_avx512_l1_sync_state(blk, dyn, vds_r, vgs_r, vbs_r,
-                                           ag0, ag1, ag2, is_gear2, is_trap2, s0, s1, s2);
+                bsim4_avx512_l1_sync_state(dyn, vds_r, vgs_r, vbs_r, ag0, s0);
             }
             B4P(stampAvxDyn)(blk, dyn, InstArray, my_ax, my_rhs, stamp_mode);
             return;
@@ -1219,6 +1351,439 @@ B4P(evalAvxBlock)(
 }
 
 /*
+ * Stage 10E: Dynamic Active-Lane SIMD Compaction (Stream Compaction for BSIM4 AVX-512).
+ * When a transient block has 1..compact_max moving lanes and >=1 stationary lanes,
+ * stationary lanes take their exact L1/L2 bypass path while moving lanes are packed
+ * across blocks into dense 8-wide AVX-512 batches (using 8x8 in-register AVX-512
+ * transpose of BSIM4Avx512Inst rows + vptestmq mask packing) before calling
+ * bsim4_avx512_eval_block once per 8 active transistors.
+ * Runtime toggles:
+ *   NGSPICE_NO_LANE_COMPACT=1   disable compaction (fall back to evalAvxBlock)
+ */
+typedef struct {
+    int     len;
+    int     src_bi[8];
+    uint8_t src_lane[8];
+    uint8_t is_last[8];
+    double  vds[8];
+    double  vgs[8];
+    double  vbs[8];
+} B4P(CompactQueue);
+
+static inline void
+B4P(flushCompactQueue)(
+    B4P(CompactQueue) * restrict q,
+    int has_trap_tunnel,
+    const BSIM4Avx512Block * restrict blocks,
+    const BSIM4Avx512Inst * restrict insts,
+    BSIM4Avx512Dyn * restrict dyn,
+    BSIM4Avx512Block * restrict sblk,
+    BSIM4Avx512Dyn * restrict sdyn,
+    B4P(instance) **InstArray,
+    CKTcircuit *ckt,
+    double * restrict my_ax,
+    double * restrict my_rhs,
+    int stamp_mode,
+    double ag0, double ag1, double ag2,
+    int is_gear2, int is_trap2, int int_mode,
+    double * restrict s0,
+    const double * restrict s1,
+    const double * restrict s2)
+{
+    const int qlen = q->len;
+    if (qlen <= 0)
+        return;
+
+    const BSIM4Avx512Inst *rows[8];
+    for (int k = 0; k < qlen; k++) {
+        int bi = q->src_bi[k];
+        int ln = (int)q->src_lane[k];
+        rows[k] = &insts[bi * 8 + ln];
+        sdyn->stateBase[k] = dyn[bi].stateBase[ln];
+    }
+    for (int k = qlen; k < 8; k++) {
+        rows[k] = rows[0];
+        q->vds[k] = q->vds[0];
+        q->vgs[k] = q->vgs[0];
+        q->vbs[k] = q->vbs[0];
+        sdyn->stateBase[k] = sdyn->stateBase[0];
+    }
+
+    /* 8x8 AVX-512 in-register transpose of all B4_NUM_PARAM_V8 AoS params -> SoA sblk */
+    v8d *dst_v = (v8d *)sblk;
+    const double *p0 = rows[0]->p, *p1 = rows[1]->p, *p2 = rows[2]->p, *p3 = rows[3]->p;
+    const double *p4 = rows[4]->p, *p5 = rows[5]->p, *p6 = rows[6]->p, *p7 = rows[7]->p;
+    size_t g = 0;
+    for (; g + 8 <= B4_NUM_PARAM_V8; g += 8) {
+        b4_transpose_8x8(p0 + g, p1 + g, p2 + g, p3 + g,
+                         p4 + g, p5 + g, p6 + g, p7 + g,
+                         dst_v + g);
+    }
+    if (g < B4_NUM_PARAM_V8) {
+        v8d tmp[8];
+        b4_transpose_8x8(p0 + g, p1 + g, p2 + g, p3 + g,
+                         p4 + g, p5 + g, p6 + g, p7 + g,
+                         tmp);
+        size_t rem = B4_NUM_PARAM_V8 - g;
+        for (size_t i = 0; i < rem; i++)
+            dst_v[g + i] = tmp[i];
+    }
+
+    /* Pack all 42 per-lane bitmasks + has_ud using 1-cycle AVX-512 vptestmq */
+    __m512i v_mb = _mm512_set_epi64(
+        (long long)rows[7]->mask_bits, (long long)rows[6]->mask_bits,
+        (long long)rows[5]->mask_bits, (long long)rows[4]->mask_bits,
+        (long long)rows[3]->mask_bits, (long long)rows[2]->mask_bits,
+        (long long)rows[1]->mask_bits, (long long)rows[0]->mask_bits);
+    const __m512i v_one = _mm512_set1_epi64(1LL);
+    uint8_t *dst_m = (uint8_t *)&sblk->m_ngate_valid;
+    for (int mk = 0; mk < B4_NUM_MASKS; mk++) {
+        dst_m[mk] = (uint8_t)_mm512_test_epi64_mask(v_mb, v_one);
+        v_mb = _mm512_srli_epi64(v_mb, 1);
+    }
+    sblk->has_ud = (_mm512_test_epi64_mask(v_mb, v_one) != 0) ? 1 : 0;
+    sblk->n_active = (uint8_t)qlen;
+    sdyn->n_active = (uint8_t)qlen;
+    sblk->has_trap_tunnel = (uint8_t)has_trap_tunnel;
+    {
+        __mmask8 m_lt = sblk->m_xpart_lt05;
+        __mmask8 m_gt = sblk->m_xpart_gt05;
+        if (m_lt == 0xFF) sblk->xpart_mode = 0;
+        else if (m_gt == 0xFF) sblk->xpart_mode = 1;
+        else if ((m_lt | m_gt) == 0) sblk->xpart_mode = 2;
+        else sblk->xpart_mode = 3;
+    }
+
+    BSIM4Avx512Out out;
+    bsim4_avx512_eval_block(sblk, sdyn,
+                            v8_load(q->vds), v8_load(q->vgs), v8_load(q->vbs),
+                            ckt->CKTgmin, ag0, ag1, ag2,
+                            is_gear2, is_trap2, s0, s1, s2, &out, 0, 0);
+
+    /* Scatter all 75 updated per-lane dyn fields back to each source block */
+    const double (*src1)[8] = (const double (*)[8])&sdyn->von;
+    const double (*src2)[8] = (const double (*)[8])&sdyn->hist_b;
+    for (int k = 0; k < qlen; k++) {
+        int bi = q->src_bi[k];
+        int dl = (int)q->src_lane[k];
+        BSIM4Avx512Dyn *d = &dyn[bi];
+        double (*dst1)[8] = (double (*)[8])&d->von;
+        for (int f = 0; f < B4_DYN_R1_VECS; f++)
+            dst1[f][dl] = src1[f][k];
+        double (*dst2)[8] = (double (*)[8])&d->hist_b;
+        for (int f = 0; f < B4_DYN_R2_VECS; f++)
+            dst2[f][dl] = src2[f][k];
+
+        if (q->is_last[k]) {
+            d->last_time = ckt->CKTtime;
+            d->last_ag0 = ag0; d->last_ag1 = ag1; d->last_ag2 = ag2;
+            d->last_gmin = ckt->CKTgmin;
+            d->last_int_mode = int_mode;
+            d->last_s0 = s0; d->last_s1 = s1; d->last_s2 = s2;
+            d->phys_valid = 1;
+            d->stamp_valid = 1;
+            if (stamp_mode == 0)
+                B4P(stampAvxDyn)(&blocks[bi], d, InstArray, my_ax, my_rhs, stamp_mode);
+        }
+    }
+    q->len = 0;
+}
+
+static inline void
+B4P(evalAvxRange)(
+    const BSIM4Avx512Block * restrict blocks,
+    BSIM4Avx512Dyn * restrict dyn,
+    int nBlocks,
+    B4P(instance) **InstArray,
+    CKTcircuit *ckt,
+    double * restrict my_ax,
+    double * restrict my_rhs,
+    int stamp_mode,
+    int dc_only,
+    int force_aos)
+{
+    static int compact_init = 0;
+    static int compact_max = 5;
+    if (!compact_init) {
+        if (getenv("NGSPICE_NO_LANE_COMPACT") != NULL)
+            compact_max = 0;
+        compact_init = 1;
+    }
+
+    int need_aos = B4P(AvxNeedAosSync) || force_aos;
+    double vtol = dc_only ? -1.0 : B4P(avxBypassTol)(ckt);
+    if (dc_only || need_aos || nBlocks <= 4 || vtol < 0.0 || compact_max <= 0) {
+        for (int bi = 0; bi < nBlocks; bi++) {
+            B4P(evalAvxBlock)(&blocks[bi], &dyn[bi], InstArray, ckt,
+                              my_ax, my_rhs, stamp_mode, dc_only, force_aos);
+        }
+        return;
+    }
+
+    const BSIM4Avx512Inst * restrict insts = (const BSIM4Avx512Inst *)(blocks + nBlocks);
+    const double * restrict rhsOld = ckt->CKTrhsOld;
+    double * restrict s0 = ckt->CKTstate0;
+    const double * restrict s1 = ckt->CKTstate1;
+    const double * restrict s2 = ckt->CKTstate2;
+    const int is_pred = ((ckt->CKTmode & MODEINITPRED) != 0);
+    const int is_gear2 = (ckt->CKTintegrateMethod == GEAR && ckt->CKTorder == 2);
+    const int is_trap2 = (ckt->CKTintegrateMethod == TRAPEZOIDAL && ckt->CKTorder == 2);
+    const int int_mode = is_gear2 ? 2 : (is_trap2 ? 1 : 0);
+    const double ag0 = ckt->CKTag[0];
+    const double ag1 = ckt->CKTag[1];
+    const double ag2 = ckt->CKTag[2];
+    const double reltol = ckt->CKTreltol;
+    const double abstol = ckt->CKTabstol;
+    const double xfact = is_pred ? (ckt->CKTdelta / ckt->CKTdeltaOld[1]) : 0.0;
+    const double one_p_xf = 1.0 + xfact;
+
+    B4P(CompactQueue) q[2];
+    q[0].len = 0;
+    q[1].len = 0;
+    BSIM4Avx512Block sblk;
+    BSIM4Avx512Dyn sdyn;
+    sblk.is_v6 = B4_IS_V6;
+
+    for (int bi = 0; bi < nBlocks; bi++) {
+        const BSIM4Avx512Block * restrict blk = &blocks[bi];
+        BSIM4Avx512Dyn * restrict d = &dyn[bi];
+        const int nact = d->n_active;
+        const __mmask8 active_mask = (__mmask8)((1u << nact) - 1u);
+
+        double a_vds[8], a_vgs[8], a_vbs[8];
+        double a_s0_vds[8], a_s0_vgs[8], a_s0_vbs[8], a_s0_vbd[8];
+        v8d vds, vgs, vbs;
+        __mmask8 chk_mask = 0;
+
+        int same_step = (!is_pred && d->stamp_valid &&
+            d->last_time == ckt->CKTtime &&
+            d->last_ag0 == ag0 && d->last_ag1 == ag1 && d->last_ag2 == ag2 &&
+            d->last_gmin == ckt->CKTgmin && d->last_int_mode == int_mode &&
+            d->last_s0 == s0 && d->last_s1 == s1 && d->last_s2 == s2);
+
+        if (same_step) {
+            for (int lane = 0; lane < nact; lane++) {
+                double vs_node = rhsOld[d->sNodePrime[lane]];
+                a_vds[lane] = rhsOld[d->dNodePrime[lane]] - vs_node;
+                a_vgs[lane] = rhsOld[d->gNodePrime[lane]] - vs_node;
+                a_vbs[lane] = rhsOld[d->bNodePrime[lane]] - vs_node;
+            }
+            for (int lane = nact; lane < 8; lane++) {
+                a_vds[lane] = a_vds[0];
+                a_vgs[lane] = a_vgs[0];
+                a_vbs[lane] = a_vbs[0];
+            }
+            vds = v8_load(a_vds) * d->type_v;
+            vgs = v8_load(a_vgs) * d->type_v;
+            vbs = v8_load(a_vbs) * d->type_v;
+            __mmask8 ez_mask = 0;
+            __mmask8 hm = B4P(laneCacheHitMask)(d, vds, vgs, vbs, vtol,
+                                                reltol, abstol, active_mask, &ez_mask);
+            if (hm == active_mask) {
+                if (ez_mask != active_mask)
+                    bsim4_avx512_l1_sync_state(d, vds, vgs, vbs, ag0, s0);
+                if (stamp_mode == 0)
+                    B4P(stampAvxDyn)(blk, d, InstArray, my_ax, my_rhs, stamp_mode);
+                continue;
+            }
+            /* L1 missed on >=1 lane: read s0 only (vds/vgs/vbs already loaded!) */
+            for (int lane = 0; lane < nact; lane++) {
+                int st = d->stateBase[lane];
+                a_s0_vbd[lane] = s0[st + 0];
+                a_s0_vbs[lane] = s0[st + 1];
+                a_s0_vgs[lane] = s0[st + 2];
+                a_s0_vds[lane] = s0[st + 3];
+            }
+            for (int lane = nact; lane < 8; lane++) {
+                a_s0_vbd[lane] = a_s0_vbd[0];
+                a_s0_vbs[lane] = a_s0_vbs[0];
+                a_s0_vgs[lane] = a_s0_vgs[0];
+                a_s0_vds[lane] = a_s0_vds[0];
+            }
+        } else {
+#ifndef PREDICTOR
+            if (is_pred) {
+                for (int lane = 0; lane < nact; lane++) {
+                    int st = d->stateBase[lane];
+                    double s1_vds = s1[st + 3], s1_vgs = s1[st + 2], s1_vbs = s1[st + 1];
+                    double s1_vbd = s1_vbs - s1_vds;
+                    s0[st + 3] = a_s0_vds[lane] = s1_vds;
+                    s0[st + 2] = a_s0_vgs[lane] = s1_vgs;
+                    s0[st + 1] = a_s0_vbs[lane] = s1_vbs;
+                    s0[st + 0] = a_s0_vbd[lane] = s1_vbd;
+                    a_vds[lane] = one_p_xf * s1_vds - xfact * s2[st + 3];
+                    a_vgs[lane] = one_p_xf * s1_vgs - xfact * s2[st + 2];
+                    a_vbs[lane] = one_p_xf * s1_vbs - xfact * s2[st + 1];
+                }
+            } else
+#endif
+            {
+                for (int lane = 0; lane < nact; lane++) {
+                    int st = d->stateBase[lane];
+                    double vs_node = rhsOld[d->sNodePrime[lane]];
+                    a_vds[lane] = rhsOld[d->dNodePrime[lane]] - vs_node;
+                    a_vgs[lane] = rhsOld[d->gNodePrime[lane]] - vs_node;
+                    a_vbs[lane] = rhsOld[d->bNodePrime[lane]] - vs_node;
+                    a_s0_vbd[lane] = s0[st + 0];
+                    a_s0_vbs[lane] = s0[st + 1];
+                    a_s0_vgs[lane] = s0[st + 2];
+                    a_s0_vds[lane] = s0[st + 3];
+                }
+            }
+            for (int lane = nact; lane < 8; lane++) {
+                a_vds[lane] = a_vds[0];
+                a_vgs[lane] = a_vgs[0];
+                a_vbs[lane] = a_vbs[0];
+                a_s0_vbd[lane] = a_s0_vbd[0];
+                a_s0_vbs[lane] = a_s0_vbs[0];
+                a_s0_vgs[lane] = a_s0_vgs[0];
+                a_s0_vds[lane] = a_s0_vds[0];
+            }
+            vds = v8_load(a_vds);
+            vgs = v8_load(a_vgs);
+            vbs = v8_load(a_vbs);
+            if (!is_pred) {
+                vds = vds * d->type_v;
+                vgs = vgs * d->type_v;
+                vbs = vbs * d->type_v;
+            }
+        }
+
+        /* 8-wide AVX-512 DEVfetlim + DEVlimvds + DEVpnjlim */
+        {
+            v8d s0_vds = v8_load(a_s0_vds);
+            v8d s0_vgs = v8_load(a_s0_vgs);
+            v8d s0_vbs = v8_load(a_s0_vbs);
+            v8d s0_vbd = v8_load(a_s0_vbd);
+            v8d vgdo   = s0_vgs - s0_vds;
+            v8d vbd    = vbs - vds;
+            v8d vgd    = vgs - vds;
+            v8d von    = d->von;
+
+            __mmask8 m_s0_fwd = v8_ge(s0_vds, v8_set1(0.0));
+            v8d vgs_f = v8_fetlim(vgs, s0_vgs, von);
+            v8d vds_f = v8_limvds(vgs_f - vgd, s0_vds);
+
+            v8d vgd_r = v8_fetlim(vgd, vgdo, von);
+            v8d vds_r = -v8_limvds(-(vgs - vgd_r), -s0_vds);
+            v8d vgs_r = vgd_r + vds_r;
+
+            vgs = v8_sel(m_s0_fwd, vgs_f, vgs_r);
+            vds = v8_sel(m_s0_fwd, vds_f, vds_r);
+
+            __mmask8 m_vds_fwd = v8_ge(vds, v8_set1(0.0));
+            v8d vj_in  = v8_sel(m_vds_fwd, vbs, vbd);
+            v8d vj_old = v8_sel(m_vds_fwd, s0_vbs, s0_vbd);
+            v8d vj_lim = v8_pnjlim(vj_in, vj_old, CONSTvt0, blk->vcrit_v, &chk_mask);
+            vbs = v8_sel(m_vds_fwd, vj_lim, vj_lim + vds);
+            chk_mask &= active_mask;
+            if (chk_mask)
+                ckt->CKTnoncon += __builtin_popcount((unsigned int)chk_mask);
+        }
+
+        if (!chk_mask && d->phys_valid && d->last_gmin == ckt->CKTgmin) {
+            __mmask8 ez_mask = 0;
+            __mmask8 hit_mask = B4P(laneCacheHitMask)(d, vds, vgs, vbs, vtol,
+                                                      reltol, abstol, active_mask, &ez_mask);
+            if (hit_mask == active_mask) {
+                /* Full L2 (or post-limit L1) hit */
+                if (same_step) {
+                    if (ez_mask != active_mask)
+                        bsim4_avx512_l1_sync_state(d, vds, vgs, vbs, ag0, s0);
+                } else {
+                    bsim4_avx512_integrate_and_assemble(blk, d, vds, vgs, vbs,
+                                                        (ez_mask != active_mask),
+                                                        ag0, ag1, ag2, is_gear2, is_trap2,
+                                                        s0, s1, s2);
+                    d->last_time = ckt->CKTtime;
+                    d->last_ag0 = ag0; d->last_ag1 = ag1; d->last_ag2 = ag2;
+                    d->last_int_mode = int_mode;
+                    d->last_s0 = s0; d->last_s1 = s1; d->last_s2 = s2;
+                    d->stamp_valid = 1;
+                }
+                if (stamp_mode == 0)
+                    B4P(stampAvxDyn)(blk, d, InstArray, my_ax, my_rhs, stamp_mode);
+                continue;
+            }
+
+            __mmask8 miss_mask = active_mask & ~hit_mask;
+            int n_miss = __builtin_popcount((unsigned int)miss_mask);
+            if (hit_mask && n_miss <= compact_max) {
+                /* Partial miss: service stationary lanes in-place, compact moving lanes! */
+                if (same_step) {
+                    __mmask8 sync_m = hit_mask & ~ez_mask;
+                    if (sync_m)
+                        bsim4_avx512_l1_sync_state_mask(d, vds, vgs, vbs, ag0, s0, sync_m);
+                } else {
+                    bsim4_avx512_integrate_and_assemble_mask(blk, d, vds, vgs, vbs, 1,
+                                                             ag0, ag1, ag2, is_gear2, is_trap2,
+                                                             s0, s1, s2, hit_mask);
+                }
+
+                double lvds[8], lvgs[8], lvbs[8];
+                v8_store(lvds, vds);
+                v8_store(lvgs, vgs);
+                v8_store(lvbs, vbs);
+                int t = blk->has_trap_tunnel ? 1 : 0;
+                B4P(CompactQueue) *qt = &q[t];
+                unsigned int mm = (unsigned int)miss_mask;
+                int last_lane = 31 - __builtin_clz(mm);
+                while (mm) {
+                    int lane = __builtin_ctz(mm);
+                    mm &= mm - 1u;
+                    int pos = qt->len++;
+                    qt->src_bi[pos]   = bi;
+                    qt->src_lane[pos] = (uint8_t)lane;
+                    qt->is_last[pos]  = (uint8_t)(lane == last_lane);
+                    qt->vds[pos]      = lvds[lane];
+                    qt->vgs[pos]      = lvgs[lane];
+                    qt->vbs[pos]      = lvbs[lane];
+                    if (qt->len == 8) {
+                        B4P(flushCompactQueue)(qt, t, blocks, insts, dyn, &sblk, &sdyn,
+                                               InstArray, ckt, my_ax, my_rhs, stamp_mode,
+                                               ag0, ag1, ag2, is_gear2, is_trap2, int_mode,
+                                               s0, s1, s2);
+                    }
+                }
+                continue;
+            }
+        }
+
+        /* Full or heavy miss: evaluate block in-place directly (zero copy overhead) */
+        BSIM4Avx512Out out;
+        bsim4_avx512_eval_block(blk, d, vds, vgs, vbs,
+                                ckt->CKTgmin, ag0, ag1, ag2,
+                                is_gear2, is_trap2, s0, s1, s2, &out, 0, 0);
+        d->last_time = ckt->CKTtime;
+        d->last_ag0 = ag0; d->last_ag1 = ag1; d->last_ag2 = ag2;
+        d->last_gmin = ckt->CKTgmin;
+        d->last_int_mode = int_mode;
+        d->last_s0 = s0; d->last_s1 = s1; d->last_s2 = s2;
+        d->phys_valid = 1;
+        d->stamp_valid = 1;
+        if (stamp_mode == 0)
+            B4P(stampAvxDyn)(blk, d, InstArray, my_ax, my_rhs, stamp_mode);
+    }
+
+    if (q[0].len > 0) {
+        B4P(flushCompactQueue)(&q[0], 0, blocks, insts, dyn, &sblk, &sdyn,
+                               InstArray, ckt, my_ax, my_rhs, stamp_mode,
+                               ag0, ag1, ag2, is_gear2, is_trap2, int_mode,
+                               s0, s1, s2);
+    }
+    if (q[1].len > 0) {
+        B4P(flushCompactQueue)(&q[1], 1, blocks, insts, dyn, &sblk, &sdyn,
+                               InstArray, ckt, my_ax, my_rhs, stamp_mode,
+                               ag0, ag1, ag2, is_gear2, is_trap2, int_mode,
+                               s0, s1, s2);
+    }
+    if (stamp_mode != 0) {
+        for (int bi = 0; bi < nBlocks; bi++)
+            B4P(stampAvxDyn)(&blocks[bi], &dyn[bi], InstArray, my_ax, my_rhs, stamp_mode);
+    }
+}
+
+/*
  * 8-wide AVX-512 convergence test over AvxBlocks + AvxDyn (zero AoS/state chase!).
  * Returns: -1 if AVX-512 convTest not applicable, 0 if all AVX blocks converged, 1 if noncon.
  */
@@ -1232,7 +1797,6 @@ B4P(convTestAvx)(GENmodel *inModel, CKTcircuit *ckt)
     if (head->B4P(AvxFallbackCount) != 0)
         return -1;
 
-    const BSIM4Avx512Block *blocks = (const BSIM4Avx512Block *)head->B4P(AvxBlocks);
     const BSIM4Avx512Dyn *dyn = (const BSIM4Avx512Dyn *)head->B4P(AvxDyn);
     int nBlocks = head->B4P(AvxBlockCount);
     const double * restrict rhsOld = ckt->CKTrhsOld;
@@ -1245,22 +1809,21 @@ B4P(convTestAvx)(GENmodel *inModel, CKTcircuit *ckt)
         #pragma omp parallel for reduction(|:noncon)
         for (int bi = 0; bi < nBlocks; bi++) {
             if (noncon) continue;
-            const BSIM4Avx512Block *blk = &blocks[bi];
             const BSIM4Avx512Dyn *d = &dyn[bi];
-            int nact = blk->n_active;
+            int nact = d->n_active;
             double a_vds[8], a_vgs[8], a_vbs[8];
             for (int lane = 0; lane < nact; lane++) {
-                double vs = rhsOld[blk->sNodePrime[lane]];
-                a_vds[lane] = rhsOld[blk->dNodePrime[lane]] - vs;
-                a_vgs[lane] = rhsOld[blk->gNodePrime[lane]] - vs;
-                a_vbs[lane] = rhsOld[blk->bNodePrime[lane]] - vs;
+                double vs = rhsOld[d->sNodePrime[lane]];
+                a_vds[lane] = rhsOld[d->dNodePrime[lane]] - vs;
+                a_vgs[lane] = rhsOld[d->gNodePrime[lane]] - vs;
+                a_vbs[lane] = rhsOld[d->bNodePrime[lane]] - vs;
             }
             for (int lane = nact; lane < 8; lane++) {
                 a_vds[lane] = a_vds[0]; a_vgs[lane] = a_vgs[0]; a_vbs[lane] = a_vbs[0];
             }
-            v8d delvds = v8_load(a_vds) * blk->type - d->last_vds;
-            v8d delvgs = v8_load(a_vgs) * blk->type - d->last_vgs;
-            v8d delvbs = v8_load(a_vbs) * blk->type - d->last_vbs;
+            v8d delvds = v8_load(a_vds) * d->type_v - d->last_vds;
+            v8d delvgs = v8_load(a_vgs) * d->type_v - d->last_vgs;
+            v8d delvbs = v8_load(a_vbs) * d->type_v - d->last_vbs;
 
             v8d cd_diff = d->cd_g * delvgs + d->cd_d * delvds + d->cd_b * delvbs;
             v8d cdhat = d->Idtot + cd_diff;
@@ -1279,22 +1842,21 @@ B4P(convTestAvx)(GENmodel *inModel, CKTcircuit *ckt)
     }
 #endif
     for (int bi = 0; bi < nBlocks; bi++) {
-        const BSIM4Avx512Block *blk = &blocks[bi];
         const BSIM4Avx512Dyn *d = &dyn[bi];
-        int nact = blk->n_active;
+        int nact = d->n_active;
         double a_vds[8], a_vgs[8], a_vbs[8];
         for (int lane = 0; lane < nact; lane++) {
-            double vs = rhsOld[blk->sNodePrime[lane]];
-            a_vds[lane] = rhsOld[blk->dNodePrime[lane]] - vs;
-            a_vgs[lane] = rhsOld[blk->gNodePrime[lane]] - vs;
-            a_vbs[lane] = rhsOld[blk->bNodePrime[lane]] - vs;
+            double vs = rhsOld[d->sNodePrime[lane]];
+            a_vds[lane] = rhsOld[d->dNodePrime[lane]] - vs;
+            a_vgs[lane] = rhsOld[d->gNodePrime[lane]] - vs;
+            a_vbs[lane] = rhsOld[d->bNodePrime[lane]] - vs;
         }
         for (int lane = nact; lane < 8; lane++) {
             a_vds[lane] = a_vds[0]; a_vgs[lane] = a_vgs[0]; a_vbs[lane] = a_vbs[0];
         }
-        v8d delvds = v8_load(a_vds) * blk->type - d->last_vds;
-        v8d delvgs = v8_load(a_vgs) * blk->type - d->last_vgs;
-        v8d delvbs = v8_load(a_vbs) * blk->type - d->last_vbs;
+        v8d delvds = v8_load(a_vds) * d->type_v - d->last_vds;
+        v8d delvgs = v8_load(a_vgs) * d->type_v - d->last_vgs;
+        v8d delvbs = v8_load(a_vbs) * d->type_v - d->last_vbs;
 
         v8d cd_diff = d->cd_g * delvgs + d->cd_d * delvds + d->cd_b * delvbs;
         v8d cdhat = d->Idtot + cd_diff;
@@ -1319,7 +1881,7 @@ B4P(convTestAvx)(GENmodel *inModel, CKTcircuit *ckt)
  */
 static inline double
 B4P(terrBlock8)(
-    const BSIM4Avx512Block * restrict blk,
+    const BSIM4Avx512Dyn * restrict dyn,
     const double * restrict s0,
     const double * restrict s1,
     const double * restrict s2,
@@ -1330,13 +1892,13 @@ B4P(terrBlock8)(
     v8d v_w0, v8d v_w1, v8d v_w2, v8d v_w3,
     double cur)
 {
-    int nact = blk->n_active;
+    int nact = dyn->n_active;
     __mmask8 active_mask = (__mmask8)((1u << nact) - 1u);
     double aq0[3][8], aq1[3][8], aq2[3][8], aq3[3][8], ac0[3][8], ac1[3][8];
 
     if (ord == 2) {
         for (int lane = 0; lane < nact; lane++) {
-            int st = blk->stateBase[lane];
+            int st = dyn->stateBase[lane];
             aq0[0][lane] = s0[st + 11]; ac0[0][lane] = s0[st + 12];
             aq0[1][lane] = s0[st + 13]; ac0[1][lane] = s0[st + 14];
             aq0[2][lane] = s0[st + 15]; ac0[2][lane] = s0[st + 16];
@@ -1378,7 +1940,7 @@ B4P(terrBlock8)(
         }
     } else {
         for (int lane = 0; lane < nact; lane++) {
-            int st = blk->stateBase[lane];
+            int st = dyn->stateBase[lane];
             aq0[0][lane] = s0[st + 11]; ac0[0][lane] = s0[st + 12];
             aq0[1][lane] = s0[st + 13]; ac0[1][lane] = s0[st + 14];
             aq0[2][lane] = s0[st + 15]; ac0[2][lane] = s0[st + 16];
@@ -1427,7 +1989,7 @@ B4P(truncAvx)(GENmodel *inModel, CKTcircuit *ckt, double *timeStep)
     if (!head->B4P(AvxBuilt) || !ckt->CKTterrCacheValid || (ord != 1 && ord != 2))
         return -1;
 
-    const BSIM4Avx512Block *blocks = (const BSIM4Avx512Block *)head->B4P(AvxBlocks);
+    const BSIM4Avx512Dyn *dyn = (const BSIM4Avx512Dyn *)head->B4P(AvxDyn);
     int nBlocks = head->B4P(AvxBlockCount);
     const double * restrict s0 = ckt->CKTstate0;
     const double * restrict s1 = ckt->CKTstate1;
@@ -1451,7 +2013,7 @@ B4P(truncAvx)(GENmodel *inModel, CKTcircuit *ckt, double *timeStep)
     if (nBlocks > 32 && omp_get_max_threads() > 1) {
         #pragma omp parallel for reduction(min:minStep)
         for (int bi = 0; bi < nBlocks; bi++) {
-            minStep = B4P(terrBlock8)(&blocks[bi], s0, s1, s2, s3, ord,
+            minStep = B4P(terrBlock8)(&dyn[bi], s0, s1, s2, s3, ord,
                                       v_abstol, v_reltol, v_relInvD, v_chgtol,
                                       v_trtol, v_tfac, v_w0, v_w1, v_w2, v_w3, minStep);
         }
@@ -1459,7 +2021,7 @@ B4P(truncAvx)(GENmodel *inModel, CKTcircuit *ckt, double *timeStep)
 #endif
     {
         for (int bi = 0; bi < nBlocks; bi++) {
-            minStep = B4P(terrBlock8)(&blocks[bi], s0, s1, s2, s3, ord,
+            minStep = B4P(terrBlock8)(&dyn[bi], s0, s1, s2, s3, ord,
                                       v_abstol, v_reltol, v_relInvD, v_chgtol,
                                       v_trtol, v_tfac, v_w0, v_w1, v_w2, v_w3, minStep);
         }

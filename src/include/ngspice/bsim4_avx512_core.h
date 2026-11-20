@@ -576,7 +576,20 @@ typedef struct __attribute__((aligned(64))) {
 
 /* Compact 64B-aligned per-block dynamic state, Level-1 stamp cache & Level-2 physics cache */
 typedef struct __attribute__((aligned(64))) {
-    /* Hot Level-1 / convTest / limiting fields (first cache lines) */
+    /* Hot read-only topology/stamp metadata co-located here so L1 hits, convTest,
+     * terrBlock8, and KLU stamping never stride through the 10 KiB cold physics block! */
+    v8d type_v;
+    int dNodePrime[8];
+    int gNodePrime[8];
+    int sNodePrime[8];
+    int bNodePrime[8];
+    int stateBase[8];
+    int kluOff16[8][16];
+    uint8_t n_active;
+    uint8_t m_has_dint;
+    uint8_t m_has_sint;
+
+    /* Hot Level-1 / convTest / limiting fields */
     v8d von;
     v8d last_vds, last_vgs, last_vbs;
     v8d Idtot, cd_g, cd_d, cd_b;
@@ -599,6 +612,9 @@ typedef struct __attribute__((aligned(64))) {
     int last_int_mode;
     uint8_t phys_valid;
     uint8_t stamp_valid;
+
+    /* Cached timestep charge-integration history (invariant across Newton iters of same step) */
+    v8d hist_b, hist_g, hist_d;
 
     /* Level-2 cached time-independent physics (DC + unscaled C + charges) */
     v8d Cggb, Cgdb, Cgsb;
@@ -627,21 +643,98 @@ typedef struct __attribute__((aligned(64))) {
 } BSIM4Avx512Out;
 
 /*
- * Fast Level-1 state sync helper: when a block hits Level-1 with small nonzero dv,
- * update CKTstate0 voltages & first-order Taylor-corrected charges/currents so
- * the next timestep's s1/s2 and CKTtrunc stay accurate to O(dv^2), without
- * re-evaluating BSIM4 physics or matrix/RHS stamps (which are invariant to O(dv^2)).
+ * Stage 10E: Per-instance AoS constant record for dynamic active-lane SIMD compaction.
+ * Allocated contiguously right after BSIM4Avx512Block[nBlocks] so a single free()
+ * releases both. Stores all B4_NUM_PARAM_V8 doubles contiguously plus all 42
+ * per-lane bitmasks (+ has_ud at bit 42) in a single uint64_t for 1-cycle
+ * AVX-512 8x8 transpose + vptestmq mask packing.
+ */
+#define B4_NUM_PARAM_V8   (offsetof(BSIM4Avx512Block, m_ngate_valid) / sizeof(v8d))
+#define B4_PARAM_PADDED   (((B4_NUM_PARAM_V8) + 7u) & ~7u)
+#define B4_NUM_MASKS      42
+#define B4_DYN_R1_VECS    32
+#define B4_DYN_R2_VECS    43
+
+typedef struct __attribute__((aligned(64))) {
+    double   p[B4_PARAM_PADDED];
+    uint64_t mask_bits;
+} BSIM4Avx512Inst;
+
+_Static_assert(offsetof(BSIM4Avx512Block, m_ngate_valid) % sizeof(v8d) == 0,
+               "BSIM4Avx512Block v8d params must be contiguous");
+_Static_assert(offsetof(BSIM4Avx512Block, m_tt_dswg) -
+               offsetof(BSIM4Avx512Block, m_ngate_valid) + 1 == B4_NUM_MASKS,
+               "BSIM4Avx512Block masks must be contiguous");
+_Static_assert(sizeof(BSIM4Avx512Block) % 64 == 0,
+               "BSIM4Avx512Block must be 64B aligned");
+_Static_assert(offsetof(BSIM4Avx512Dyn, st_v61) +
+               sizeof(((BSIM4Avx512Dyn *)0)->st_v61) -
+               offsetof(BSIM4Avx512Dyn, von) == B4_DYN_R1_VECS * 64,
+               "BSIM4Avx512Dyn Region 1 must be contiguous");
+_Static_assert(offsetof(BSIM4Avx512Dyn, a_qd) +
+               sizeof(((BSIM4Avx512Dyn *)0)->a_qd) -
+               offsetof(BSIM4Avx512Dyn, hist_b) == B4_DYN_R2_VECS * 64,
+               "BSIM4Avx512Dyn Region 2 must be contiguous");
+
+/* In-register 8x8 AVX-512 double transpose: 8 AoS rows -> 8 SoA v8d columns */
+static inline void
+b4_transpose_8x8(
+    const double * restrict r0, const double * restrict r1,
+    const double * restrict r2, const double * restrict r3,
+    const double * restrict r4, const double * restrict r5,
+    const double * restrict r6, const double * restrict r7,
+    v8d * restrict dst)
+{
+    v8d a0 = _mm512_load_pd(r0);
+    v8d a1 = _mm512_load_pd(r1);
+    v8d a2 = _mm512_load_pd(r2);
+    v8d a3 = _mm512_load_pd(r3);
+    v8d a4 = _mm512_load_pd(r4);
+    v8d a5 = _mm512_load_pd(r5);
+    v8d a6 = _mm512_load_pd(r6);
+    v8d a7 = _mm512_load_pd(r7);
+
+    v8d b0 = _mm512_unpacklo_pd(a0, a1);
+    v8d b1 = _mm512_unpackhi_pd(a0, a1);
+    v8d b2 = _mm512_unpacklo_pd(a2, a3);
+    v8d b3 = _mm512_unpackhi_pd(a2, a3);
+    v8d b4 = _mm512_unpacklo_pd(a4, a5);
+    v8d b5 = _mm512_unpackhi_pd(a4, a5);
+    v8d b6 = _mm512_unpacklo_pd(a6, a7);
+    v8d b7 = _mm512_unpackhi_pd(a6, a7);
+
+    v8d c0 = _mm512_shuffle_f64x2(b0, b2, 0x88);
+    v8d c1 = _mm512_shuffle_f64x2(b1, b3, 0x88);
+    v8d c2 = _mm512_shuffle_f64x2(b0, b2, 0xdd);
+    v8d c3 = _mm512_shuffle_f64x2(b1, b3, 0xdd);
+    v8d c4 = _mm512_shuffle_f64x2(b4, b6, 0x88);
+    v8d c5 = _mm512_shuffle_f64x2(b5, b7, 0x88);
+    v8d c6 = _mm512_shuffle_f64x2(b4, b6, 0xdd);
+    v8d c7 = _mm512_shuffle_f64x2(b5, b7, 0xdd);
+
+    dst[0] = _mm512_shuffle_f64x2(c0, c4, 0x88);
+    dst[1] = _mm512_shuffle_f64x2(c1, c5, 0x88);
+    dst[2] = _mm512_shuffle_f64x2(c2, c6, 0x88);
+    dst[3] = _mm512_shuffle_f64x2(c3, c7, 0x88);
+    dst[4] = _mm512_shuffle_f64x2(c0, c4, 0xdd);
+    dst[5] = _mm512_shuffle_f64x2(c1, c5, 0xdd);
+    dst[6] = _mm512_shuffle_f64x2(c2, c6, 0xdd);
+    dst[7] = _mm512_shuffle_f64x2(c3, c7, 0xdd);
+}
+
+/*
+ * Fast Level-1 state sync helper: when a block (or subset of lanes in write_mask)
+ * hits Level-1 with small nonzero dv, update CKTstate0 voltages & first-order
+ * Taylor-corrected charges/currents so the next timestep's s1/s2 and CKTtrunc
+ * stay accurate to O(dv^2), without re-evaluating BSIM4 physics or stamps.
  */
 static inline void
-bsim4_avx512_l1_sync_state(
-    const BSIM4Avx512Block * restrict b,
+bsim4_avx512_l1_sync_state_mask(
     const BSIM4Avx512Dyn * restrict dyn,
     v8d vds, v8d vgs, v8d vbs,
-    double ag0, double ag1, double ag2,
-    int is_gear2, int is_trap2,
+    double ag0,
     double * restrict s0,
-    const double * restrict s1,
-    const double * restrict s2)
+    __mmask8 write_mask)
 {
     v8d dvds = vds - dyn->last_vds;
     v8d dvgs = vgs - dyn->last_vgs;
@@ -653,52 +746,58 @@ bsim4_avx512_l1_sync_state(
     v8d qd_new = dyn->qd_st + (dyn->Cdgb * dvgb - dyn->Cddb * dvbd - dyn->Cdsb * dvbs);
     v8d qb_new = dyn->qb_st + (dyn->Cbgb * dvgb - dyn->Cbdb * dvbd - dyn->Cbsb * dvbs);
 
+    v8d v_ag0 = v8_set1(ag0);
+    v8d cqb_v = dyn->hist_b + v_ag0 * qb_new;
+    v8d cqg_v = dyn->hist_g + v_ag0 * qg_new;
+    v8d cqd_v = dyn->hist_d + v_ag0 * qd_new;
+
     double lvds[8], lvgs[8], lvbs[8], lvbd[8];
     double lqb[8], lqg[8], lqd[8];
+    double lcqb[8], lcqg[8], lcqd[8];
     v8_store(lvds, vds); v8_store(lvgs, vgs);
     v8_store(lvbs, vbs); v8_store(lvbd, vbs - vds);
     v8_store(lqb, qb_new); v8_store(lqg, qg_new); v8_store(lqd, qd_new);
+    v8_store(lcqb, cqb_v); v8_store(lcqg, cqg_v); v8_store(lcqd, cqd_v);
 
-    const int nact = b->n_active;
-    for (int lane = 0; lane < nact; lane++) {
-        int st = b->stateBase[lane];
-        double qb = lqb[lane], qg = lqg[lane], qd = lqd[lane];
+    unsigned int m = (unsigned int)write_mask;
+    while (m) {
+        int lane = __builtin_ctz(m);
+        m &= m - 1u;
+        int st = dyn->stateBase[lane];
         s0[st + 0]  = lvbd[lane];
         s0[st + 1]  = lvbs[lane];
         s0[st + 2]  = lvgs[lane];
         s0[st + 3]  = lvds[lane];
-        s0[st + 11] = qb;
-        s0[st + 13] = qg;
-        s0[st + 15] = qd;
-
-        double cqb, cqg, cqd;
-        if (is_gear2) {
-            cqb = ag2 * s2[st + 11] + ag1 * s1[st + 11] + ag0 * qb;
-            cqg = ag2 * s2[st + 13] + ag1 * s1[st + 13] + ag0 * qg;
-            cqd = ag2 * s2[st + 15] + ag1 * s1[st + 15] + ag0 * qd;
-        } else if (is_trap2) {
-            cqb = -s1[st + 12] * ag1 + ag0 * (qb - s1[st + 11]);
-            cqg = -s1[st + 14] * ag1 + ag0 * (qg - s1[st + 13]);
-            cqd = -s1[st + 16] * ag1 + ag0 * (qd - s1[st + 15]);
-        } else {
-            cqb = ag0 * qb + ag1 * s1[st + 11];
-            cqg = ag0 * qg + ag1 * s1[st + 13];
-            cqd = ag0 * qd + ag1 * s1[st + 15];
-        }
-        s0[st + 12] = cqb;
-        s0[st + 14] = cqg;
-        s0[st + 16] = cqd;
+        s0[st + 11] = lqb[lane];
+        s0[st + 12] = lcqb[lane];
+        s0[st + 13] = lqg[lane];
+        s0[st + 14] = lcqg[lane];
+        s0[st + 15] = lqd[lane];
+        s0[st + 16] = lcqd[lane];
     }
+}
+
+static inline void
+bsim4_avx512_l1_sync_state(
+    const BSIM4Avx512Dyn * restrict dyn,
+    v8d vds, v8d vgs, v8d vbs,
+    double ag0,
+    double * restrict s0)
+{
+    bsim4_avx512_l1_sync_state_mask(dyn, vds, vgs, vbs, ag0, s0,
+                                    (__mmask8)((1u << dyn->n_active) - 1u));
 }
 
 /*
  * Fast Level-2 helper: integrate cached charges (with optional first-order
- * Taylor correction dq = C * dv when has_dv != 0) into CKTstate0 and assemble
- * the 20 matrix/RHS stamps in dyn->st_* from cached DC + C matrices.
- * Used on BOTH full evaluations (has_dv=0) and Level-2 cross-step hits (has_dv=1).
+ * Taylor correction dq = C * dv when has_dv != 0) into CKTstate0 (for lanes
+ * in write_mask) and assemble the 20 matrix/RHS stamps in dyn->st_* from
+ * cached DC + C matrices.
+ * Used on full evaluations (has_dv=0), Level-2 hits (has_dv=1), and partial-miss
+ * cross-step stationary-lane updates (has_dv=1, write_mask=hit_mask).
  */
 static inline void
-bsim4_avx512_integrate_and_assemble(
+bsim4_avx512_integrate_and_assemble_mask(
     const BSIM4Avx512Block * restrict b,
     BSIM4Avx512Dyn * restrict dyn,
     v8d vds, v8d vgs, v8d vbs,
@@ -707,10 +806,11 @@ bsim4_avx512_integrate_and_assemble(
     int is_gear2, int is_trap2,
     double * restrict s0,
     const double * restrict s1,
-    const double * restrict s2)
+    const double * restrict s2,
+    __mmask8 write_mask)
 {
-    double a_cqb[8], a_cqg[8], a_cqd[8];
-    const int nact = b->n_active;
+    double a_cqb[8] = {0}, a_cqg[8] = {0}, a_cqd[8] = {0};
+    double a_hb[8] = {0}, a_hg[8] = {0}, a_hd[8] = {0};
     v8d dqg = v8_set1(0.0), dqd = v8_set1(0.0), dqb = v8_set1(0.0);
 
     if (has_dv) {
@@ -731,8 +831,11 @@ bsim4_avx512_integrate_and_assemble(
         v8_store(lqg, dyn->qg_st + dqg);
         v8_store(lqd, dyn->qd_st + dqd);
 
-        for (int lane = 0; lane < nact; lane++) {
-            int st = b->stateBase[lane];
+        unsigned int m = (unsigned int)write_mask;
+        while (m) {
+            int lane = __builtin_ctz(m);
+            m &= m - 1u;
+            int st = dyn->stateBase[lane];
             double qb = lqb[lane], qg = lqg[lane], qd = lqd[lane];
             s0[st + 0]  = lvbd[lane];
             s0[st + 1]  = lvbs[lane];
@@ -742,27 +845,31 @@ bsim4_avx512_integrate_and_assemble(
             s0[st + 13] = qg;
             s0[st + 15] = qd;
 
-            double cqb, cqg, cqd;
+            double hb, hg, hd;
             if (is_gear2) {
-                cqb = ag2 * s2[st + 11] + ag1 * s1[st + 11] + ag0 * qb;
-                cqg = ag2 * s2[st + 13] + ag1 * s1[st + 13] + ag0 * qg;
-                cqd = ag2 * s2[st + 15] + ag1 * s1[st + 15] + ag0 * qd;
+                hb = ag2 * s2[st + 11] + ag1 * s1[st + 11];
+                hg = ag2 * s2[st + 13] + ag1 * s1[st + 13];
+                hd = ag2 * s2[st + 15] + ag1 * s1[st + 15];
             } else if (is_trap2) {
-                cqb = -s1[st + 12] * ag1 + ag0 * (qb - s1[st + 11]);
-                cqg = -s1[st + 14] * ag1 + ag0 * (qg - s1[st + 13]);
-                cqd = -s1[st + 16] * ag1 + ag0 * (qd - s1[st + 15]);
+                hb = -s1[st + 12] * ag1 - ag0 * s1[st + 11];
+                hg = -s1[st + 14] * ag1 - ag0 * s1[st + 13];
+                hd = -s1[st + 16] * ag1 - ag0 * s1[st + 15];
             } else {
-                cqb = ag0 * qb + ag1 * s1[st + 11];
-                cqg = ag0 * qg + ag1 * s1[st + 13];
-                cqd = ag0 * qd + ag1 * s1[st + 15];
+                hb = ag1 * s1[st + 11];
+                hg = ag1 * s1[st + 13];
+                hd = ag1 * s1[st + 15];
             }
-            s0[st + 12] = a_cqb[lane] = cqb;
-            s0[st + 14] = a_cqg[lane] = cqg;
-            s0[st + 16] = a_cqd[lane] = cqd;
+            a_hb[lane] = hb; a_hg[lane] = hg; a_hd[lane] = hd;
+            s0[st + 12] = a_cqb[lane] = hb + ag0 * qb;
+            s0[st + 14] = a_cqg[lane] = hg + ag0 * qg;
+            s0[st + 16] = a_cqd[lane] = hd + ag0 * qd;
         }
     } else {
-        for (int lane = 0; lane < nact; lane++) {
-            int st = b->stateBase[lane];
+        unsigned int m = (unsigned int)write_mask;
+        while (m) {
+            int lane = __builtin_ctz(m);
+            m &= m - 1u;
+            int st = dyn->stateBase[lane];
             double qb = dyn->a_qb[lane];
             double qg = dyn->a_qg[lane];
             double qd = dyn->a_qd[lane];
@@ -774,28 +881,29 @@ bsim4_avx512_integrate_and_assemble(
             s0[st + 13] = qg;
             s0[st + 15] = qd;
 
-            double cqb, cqg, cqd;
+            double hb, hg, hd;
             if (is_gear2) {
-                cqb = ag2 * s2[st + 11] + ag1 * s1[st + 11] + ag0 * qb;
-                cqg = ag2 * s2[st + 13] + ag1 * s1[st + 13] + ag0 * qg;
-                cqd = ag2 * s2[st + 15] + ag1 * s1[st + 15] + ag0 * qd;
+                hb = ag2 * s2[st + 11] + ag1 * s1[st + 11];
+                hg = ag2 * s2[st + 13] + ag1 * s1[st + 13];
+                hd = ag2 * s2[st + 15] + ag1 * s1[st + 15];
             } else if (is_trap2) {
-                cqb = -s1[st + 12] * ag1 + ag0 * (qb - s1[st + 11]);
-                cqg = -s1[st + 14] * ag1 + ag0 * (qg - s1[st + 13]);
-                cqd = -s1[st + 16] * ag1 + ag0 * (qd - s1[st + 15]);
+                hb = -s1[st + 12] * ag1 - ag0 * s1[st + 11];
+                hg = -s1[st + 14] * ag1 - ag0 * s1[st + 13];
+                hd = -s1[st + 16] * ag1 - ag0 * s1[st + 15];
             } else {
-                cqb = ag0 * qb + ag1 * s1[st + 11];
-                cqg = ag0 * qg + ag1 * s1[st + 13];
-                cqd = ag0 * qd + ag1 * s1[st + 15];
+                hb = ag1 * s1[st + 11];
+                hg = ag1 * s1[st + 13];
+                hd = ag1 * s1[st + 15];
             }
-            s0[st + 12] = a_cqb[lane] = cqb;
-            s0[st + 14] = a_cqg[lane] = cqg;
-            s0[st + 16] = a_cqd[lane] = cqd;
+            a_hb[lane] = hb; a_hg[lane] = hg; a_hd[lane] = hd;
+            s0[st + 12] = a_cqb[lane] = hb + ag0 * qb;
+            s0[st + 14] = a_cqg[lane] = hg + ag0 * qg;
+            s0[st + 16] = a_cqd[lane] = hd + ag0 * qd;
         }
     }
-    for (int lane = nact; lane < 8; lane++) {
-        a_cqb[lane] = a_cqg[lane] = a_cqd[lane] = 0.0;
-    }
+    dyn->hist_b = v8_load(a_hb);
+    dyn->hist_g = v8_load(a_hg);
+    dyn->hist_d = v8_load(a_hd);
 
     v8d v_ag0 = v8_set1(ag0);
     v8d vm_ag0 = b->m * v_ag0;
@@ -844,6 +952,24 @@ bsim4_avx512_integrate_and_assemble(
     v8_store(dyn->st_v59, dyn->mdc59 + mgcbgb);
     v8_store(dyn->st_v60, dyn->mdc60 + mgcbsb);
     v8_store(dyn->st_v61, dyn->mdc61 - (mgcbgb + mgcbdb + mgcbsb));
+}
+
+static inline void
+bsim4_avx512_integrate_and_assemble(
+    const BSIM4Avx512Block * restrict b,
+    BSIM4Avx512Dyn * restrict dyn,
+    v8d vds, v8d vgs, v8d vbs,
+    int has_dv,
+    double ag0, double ag1, double ag2,
+    int is_gear2, int is_trap2,
+    double * restrict s0,
+    const double * restrict s1,
+    const double * restrict s2)
+{
+    bsim4_avx512_integrate_and_assemble_mask(b, dyn, vds, vgs, vbs, has_dv,
+                                             ag0, ag1, ag2, is_gear2, is_trap2,
+                                             s0, s1, s2,
+                                             (__mmask8)((1u << dyn->n_active) - 1u));
 }
 
 /*

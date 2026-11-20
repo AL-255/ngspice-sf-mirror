@@ -21,6 +21,9 @@ Runtime diagnostic switches (no rebuild required):
 - `NGSPICE_NO_AVX512=1` — disable AVX-512 BSIM4 kernels at runtime
 - `NGSPICE_NO_BLOCK_BYPASS=1` — disable the two-level stationary BSIM4 block cache
 - `NGSPICE_AVX_BYPASS_TOL=<volts>` — override the stationary block cache voltage threshold (default: `min(CKTvoltTol, 1e-6)`)
+- `NGSPICE_NO_CHORD=1` — disable Shamanskii / Modified Chord Newton KLU Jacobian reuse
+- `NGSPICE_NO_PARTIAL_KLU=1` — disable incremental / partial KLU column refactorization & reciprocal-multiply `KLU_solve`
+- `NGSPICE_NO_LANE_COMPACT=1` — disable dynamic active-lane SIMD compaction inside AVX-512 BSIM4 evaluation
 
 ---
 
@@ -168,3 +171,33 @@ Precompiling the full GF180 typical PDK (`design.ngspice` + `sm141064.ngspice` c
      - Added inline scalar Zen 4 `b4_s_exp`/`b4_s_log` (`<= 2 ULP`, hardware `vscalefsd`/`vgetexpsd`/`vgetmantsd`) for scalar `MODEINITSMSIG`/`MODEINITTRAN` paths.
   5. **Compact active-device dispatch, DCOP KLU `AxResConst`, & lazy-calibrated invariant-TSC `seconds()`** (`cktdefs.h`, `cktsetup.c`, `cktload.c`, `acan.c`, `resload.c`, `misc_time.c`):
      - Compact `CKTactiveDevs[]` list avoids scanning 70 empty device slots per `CKTload`/`CKTacLoad`; enabled KLU `AxResConst` pre-baked resistor stamping during `MODEDCOP`/`MODETRANOP` (computing `REScurrent` only on `MODEINITSMSIG` where noise analysis reads it); removed dead duplicate `IFseconds()` in `CKTload`; lazy-calibrated invariant-TSC `seconds()` under `NGSPICE_OPT_ZEN4`.
+
+### Stage 10: Literature-Driven Advanced Solvers & Dynamic SIMD Compaction (`NGSPICE_OPT_GENERAL` + `NGSPICE_OPT_ZEN4`)
+- **Literature basis:**
+  - **Shamanskii / Modified Chord Newton** (Hindmarsh et al., SUNDIALS IDA, *ACM TOMS* 2005; Spectre / Xyce transient Newton reuse)
+  - **Incremental / Partial KLU Refactorization** (Dinkelbach et al. 2021; NICSLU / Chen et al. *IEEE TCAD*)
+  - **Division-free KLU Triangular Solve** (`invUdiag` + `invRsPerm` eliminating `2n` serial double divisions per solve)
+  - **Dynamic Active-Lane SIMD Stream Compaction** (Kapre & DeHon; Gulati & Khatri; Shen et al. *DAC/TCAD*)
+- **Gain (single-core 1t on Ryzen 9 7940HX vs Stage 9 / vs Stock Sparse 1t):**
+  - `sar12_hero_16cyc`: KLU **`70.30 s -> 60.64 s`** (**-13.7%**, **10.36×** vs stock Sparse `628.48 s` — breaks 10× single-core on the 10-minute hero benchmark; 16/16 SAR codes exact!)
+  - `pll_ring_150m_4us`: KLU **`29.29 s -> 22.70 s`** (**-22.5%**, **7.46×** vs stock `169.36 s`); Sparse **`36.00 s -> 30.54 s`** (**-15.2%**)
+  - `sdm16_120cyc`: KLU **`30.60 s -> 24.70 s`** (**-19.3%**, **10.17×** vs stock `251.23 s`; 115/115 bit-exact PDM, `rel_rms = 6.77e-3`); Sparse **`70.26 s -> 69.33 s`** (`rel_rms = 5.25e-3`)
+  - `ti12_full_300ns`: KLU **`45.34 s -> 39.16 s`** (**-13.6%**, **5.55×** vs stock `217.50 s`, `rel_rms = 1.72e-6`; `.uselib` **`38.87 s`**); Sparse **`84.10 s -> 77.01 s`** (**-8.4%**, `rel_rms = 3.04e-11`)
+  - `sar12_probe_2cyc`: KLU **`9.01 s -> 8.13 s`** (**-9.8%**, **12.17×** vs stock `98.94 s`; `.uselib` **`8.00 s`**, 2/2 SAR codes exact)
+  - `opa1k_pvt16`: KLU **`138.61 s -> 134.76 s`** (`-2.8%`; `.uselib` **`132.37 s -> 127.31 s`**, **4.92×** vs stock `626.47 s`)
+  - **18/18** golden PASS across `opt_std (klu + sparse)` and `opt_uselib (klu)`, bit-identical KLU `rel_rms` between Standard and `.uselib`, all 3 compile-flag profiles verified (`GENERAL=1/ZEN4=1`, portable `GENERAL=1/ZEN4=0` with `0` `%zmm` instructions, and `GENERAL=0/ZEN4=0`), and built-in `tests/bsim4` (`test1..14`) PASS.
+- **Major changes:**
+  1. **Shamanskii / Modified Chord Newton for KLU** (`cktdefs.h`, `smpdefs.h`, `klusmp.c`, `nireinit.c`, `niiter.c`, `NGSPICE_OPT_GENERAL`, toggle `NGSPICE_NO_CHORD=1`):
+     - Reuses untouched `KLU_numeric` on polishing Newton iterations (`iterno >= 2`, `ag0 == lu_ag0`, `prev_dx <= 0.05`, `CKTnoncon == 0`) and smooth constant-step first iterations (`iterno == 1`, `0.90 <= ag0/lu_ag0 <= 1.11`, `dx < 0.015`, `CKTkluChordCount < 10`) by computing exact residual `r = RHS - (A + Gmin*I)*Xold` and solving `L*U*dx = r` without overwriting `RHS` or `Ax`. Seamless same-iteration fallback to `SMPluFac + SMPsolve` whenever contraction fails (`dx >= 0.35 * prev_dx && dx > 5e-5`). Cuts `klu_refactor` calls by 37–49%.
+  2. **Exact Incremental / Partial KLU Refactorization & Division-Free `KLU_solve`** (`klu.h`, `klu_internal.h`, `klu_version.h`, `klu_factor.c`, `klu_free_numeric.c`, `klu_refactor.c`, `klu.c`, `klu_solve.c`, `NGSPICE_OPT_GENERAL`, toggle `NGSPICE_NO_PARTIAL_KLU=1`):
+     - Freezes row scaling `Rs` after the first refactor (keeping exact numerical LU via frozen `invRs`), tracks `ref_az_prev[0..nz-1]` and per-column dirty propagation through `Ui` dependencies, and skips every unchanged BTF column `k` bit-exactly.
+     - Caches reciprocal pivot diagonals `ref_inv_udiag[k] = 1.0 / Udiag[k]` and permuted inverse row scale `ref_inv_rs_perm[k] = invRs[Pnum[k]]`, replacing all `2n` serial double divisions per solve with multiplies in `KLU_solve` and `KLU_usolve_inv`.
+  3. **Complex Sparse `FactorComplexMatrix` Zero-Skip** (`spfactor.c`, `NGSPICE_OPT_GENERAL`):
+     - Skips complex multiply-subtract inner loops when `dc.Real == 0.0 && dc.Imag == 0.0` (accelerates `opa1k_pvt16` AC analysis).
+  4. **Zero-Bloat 4-Way Ground-Skip Stamping, Hot-in-`Dyn` L2 Co-location, & Cached Charge History** (`bsim4_avx512_core.h`, `bsim4_avx512_glue.h`, `NGSPICE_OPT_ZEN4`):
+     - Mirrors hot read-only topology/stamp metadata (`type_v`, `d/g/s/bNodePrime`, `stateBase`, `kluOff16`) into `BSIM4Avx512Dyn` so L1 hits, `convTestAvx`, `terrBlock8`, and KLU stamping never stride across cold 10.5 KiB `BSIM4Avx512Block` structs.
+     - 4-way `(sn != 0, bn != 0)` ground-skip stamping eliminates the 12-deep serialized `my_ax[inz]` store-forwarding stall chain on grounded MOSFETs with zero struct bloat.
+     - Caches timestep integration history `hist_b/g/d` in `dyn` so `bsim4_avx512_l1_sync_state` updates `CKTstate0` in pure AVX-512 with zero `CKTstate1`/`CKTstate2` reads.
+  5. **Dynamic Active-Lane SIMD Compaction** (`bsim4_avx512_core.h`, `bsim4_avx512_glue.h`, `b4v5ld.c`, `b4v6ld.c`, `NGSPICE_OPT_ZEN4`, toggle `NGSPICE_NO_LANE_COMPACT=1`):
+     - In partially active 8-wide BSIM4 blocks (`1..5` moving lanes with `>=1` stationary lanes), stationary lanes take their exact L1/L2 bypass path while moving lanes are packed across blocks into dense 8-wide AVX-512 batches using an in-register 8×8 AVX-512 `double` transpose (`b4_transpose_8x8`) over contiguous per-instance `BSIM4Avx512Inst` records (allocated contiguously after `blocks[nBlocks]` when `nBlocks > 4`) and 1-cycle `_mm512_test_epi64_mask` (`vptestmq`) mask packing.
+     - Preserves exact `0..nBlocks-1` stamping summation order on Sparse 1t (`stamp_mode != 0`) while eliminating 25–47% of redundant BSIM4 lane evaluations on large mixed-signal workloads (`ti12_full_300ns`, `pll_ring_150m_4us`, `sar12_hero_16cyc`).

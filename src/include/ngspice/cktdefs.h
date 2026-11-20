@@ -343,6 +343,11 @@ struct CKTcircuit {
     short CKTactiveDevs[256];
     int CKTnumActiveDevs;
     int CKTactiveDevsValid;
+    int CKTkluLuValid;
+    int CKTkluChordCount;
+    int CKTkluLastStepSmooth;
+    double CKTkluLuAg0;
+    double CKTkluLuGmin;
 #endif
 };
 

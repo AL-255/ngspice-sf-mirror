@@ -653,6 +653,57 @@ void KLU_ltsolve
     }
 }
 
+#if !defined(COMPLEX) && NGSPICE_OPT_GENERAL
+void KLU_usolve_inv
+(
+    Int n,
+    Int Uip [ ],
+    Int Ulen [ ],
+    Unit LU [ ],
+    const double invUdiag [ ],
+    double X [ ]
+)
+{
+    Int *Ui ;
+    double *Ux ;
+    Int k, p, len ;
+    double * restrict Xr = X ;
+    const double * restrict invUd = invUdiag ;
+
+    for (k = n - 1 ; k >= 0 ; k--)
+    {
+        double xk = Xr [k] * invUd [k] ;
+        Xr [k] = xk ;
+        if (xk == 0.0) continue ;
+        GET_POINTER (LU, Uip, Ulen, Ui, Ux, k, len) ;
+        const Int * restrict Uir = Ui ;
+        const double * restrict Uxr = Ux ;
+        for (p = 0 ; p + 3 < len ; p += 4)
+        {
+            Int i0 = Uir [p] ;
+            Int i1 = Uir [p + 1] ;
+            Int i2 = Uir [p + 2] ;
+            Int i3 = Uir [p + 3] ;
+            double x0 = Xr [i0] ;
+            double x1 = Xr [i1] ;
+            double x2 = Xr [i2] ;
+            double x3 = Xr [i3] ;
+            x0 -= Uxr [p]     * xk ;
+            x1 -= Uxr [p + 1] * xk ;
+            x2 -= Uxr [p + 2] * xk ;
+            x3 -= Uxr [p + 3] * xk ;
+            Xr [i0] = x0 ;
+            Xr [i1] = x1 ;
+            Xr [i2] = x2 ;
+            Xr [i3] = x3 ;
+        }
+        for ( ; p < len ; p++)
+        {
+            Xr [Uir [p]] -= Uxr [p] * xk ;
+        }
+    }
+}
+#endif
 
 /* ========================================================================== */
 /* === KLU_utsolve ========================================================== */

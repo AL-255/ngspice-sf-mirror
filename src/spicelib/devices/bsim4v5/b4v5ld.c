@@ -234,9 +234,7 @@ BSIM4v5loadKluPar(GENmodel *inModel, CKTcircuit *ckt, double *my_ax, double *my_
             }
             return error;
         }
-        for (int bi = 0; bi < nBlocks; bi++) {
-            BSIM4v5evalAvxBlock(&blocks[bi], &dyn[bi], InstArray, ckt, my_ax, my_rhs, 0, is_dc_avx, force_aos);
-        }
+        BSIM4v5evalAvxRange(blocks, dyn, nBlocks, InstArray, ckt, my_ax, my_rhs, 0, is_dc_avx, force_aos);
         for (int fi = 0; fi < nFb; fi++) {
             int idx = fbIdx[fi];
             int local_error = BSIM4v5LoadOMP_core(InstArray[idx], ckt, my_ax, my_rhs, &koffArr[idx]);
@@ -292,9 +290,7 @@ CKTcircuit *ckt)
             int force_aos = (nFb > 0) ? 1 : 0;
             if (omp_get_max_threads() == 1 && nFb == 0) {
                 double *rhs = ckt->CKTrhs;
-                for (int bi = 0; bi < nBlocks; bi++) {
-                    BSIM4v5evalAvxBlock(&blocks[bi], &dyn[bi], InstArray, ckt, NULL, rhs, 1, is_dc_avx, 0);
-                }
+                BSIM4v5evalAvxRange(blocks, dyn, nBlocks, InstArray, ckt, NULL, rhs, 1, is_dc_avx, 0);
                 return OK;
             }
             #pragma omp parallel for schedule(static) if(omp_get_max_threads() > 1)
