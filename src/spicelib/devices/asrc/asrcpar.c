@@ -21,10 +21,18 @@ ASRCparam(int param, IFvalue *value, GENinstance *fast, IFvalue *select)
     case ASRC_VOLTAGE:
         here->ASRCtype = ASRC_VOLTAGE;
         here->ASRCtree = value->tValue;
+#if NGSPICE_OPT_GENERAL
+        here->ASRCisAffine = 0;
+        here->ASRCaffValid = 0;
+#endif
         break;
     case ASRC_CURRENT:
         here->ASRCtype = ASRC_CURRENT;
         here->ASRCtree = value->tValue;
+#if NGSPICE_OPT_GENERAL
+        here->ASRCisAffine = 0;
+        here->ASRCaffValid = 0;
+#endif
         break;
     case ASRC_TC1:
         here->ASRCtc1 = value->rValue;

@@ -73,10 +73,67 @@ Author: 1985 Wayne A. Christopher
 
 #define VALIDCHARS "!$%_#?@.[]&"
 
+#if NGSPICE_OPT_GENERAL
+#include <sys/stat.h>
+
+struct NgDeckIndex;
+
+typedef struct {
+    char  *path;
+    dev_t  st_dev;
+    ino_t  st_ino;
+    off_t  st_size;
+    time_t mtime_sec;
+    long   mtime_nsec;
+} NgLibDep;
+
+typedef struct {
+    char               *sec_name;
+    struct NgDeckIndex *idx;
+} NgLibSecCache;
+
+static uint32_t nglib_current_compat_mask(void);
+static void nglib_get_stat_mtime(const struct stat *st, time_t *sec, long *nsec);
+static struct NgDeckIndex *ng_deck_index_create_from_cards(struct card *first,
+                                                           struct card *stop_excl);
+static void ng_deck_index_destroy(struct NgDeckIndex *idx);
+static const struct NgDeckIndex *nglib_get_cached_index(const char *blob_path);
+static void ng_deck_index_splice_multi(struct card *deck_root,
+                                       int n_anchors,
+                                       struct card **anchors,
+                                       const struct NgDeckIndex * const *indices,
+                                       char **src_tags,
+                                       int *line_num_io,
+                                       int allow_filter);
+
+typedef struct {
+    struct card              *anchor;
+    const struct NgDeckIndex *idx;
+    char                     *src_tag;
+} NgPendingSplice;
+
+#define NG_MAX_PENDING_SPLICE 64
+static NgPendingSplice ng_pending_nglibs[NG_MAX_PENDING_SPLICE];
+static int ng_num_pending_nglibs = 0;
+static int ng_reading_a_lib = 0;
+static struct library *ng_dep_collector_lib = NULL;
+#endif
+
 static struct library {
     char *realpath;
     char *habitat;
     struct card *deck;
+#if NGSPICE_OPT_GENERAL
+    char          *orig_path;
+    uint32_t       compat_mask;
+    int            soacheck;
+    NgLibDep      *deps;
+    int            num_deps;
+    int            cap_deps;
+    NgLibSecCache *secs;
+    int            num_secs;
+    int            cap_secs;
+#endif
 } libraries[N_LIBRARIES];
 
 static int num_libraries;
@@ -477,19 +534,102 @@ static struct card *insert_deck(struct card *card, struct card *new_card)
 }
 
 
+#if NGSPICE_OPT_GENERAL
+static void free_one_lib(struct library *lib)
+{
+    tfree(lib->realpath);
+    tfree(lib->habitat);
+    tfree(lib->orig_path);
+    line_free_x(lib->deck, TRUE);
+    lib->deck = NULL;
+    for (int i = 0; i < lib->num_deps; i++)
+        tfree(lib->deps[i].path);
+    FREE(lib->deps);
+    lib->num_deps = 0;
+    lib->cap_deps = 0;
+    for (int i = 0; i < lib->num_secs; i++) {
+        tfree(lib->secs[i].sec_name);
+        ng_deck_index_destroy(lib->secs[i].idx);
+    }
+    FREE(lib->secs);
+    lib->num_secs = 0;
+    lib->cap_secs = 0;
+}
+
+static void lib_add_dep(struct library *lib, const char *path)
+{
+    if (!path || !*path || strcmp(path, "internal") == 0)
+        return;
+    for (int i = 0; i < lib->num_deps; i++)
+        if (strcmp(lib->deps[i].path, path) == 0)
+            return;
+    struct stat st;
+    if (stat(path, &st) != 0)
+        return;
+    if (lib->num_deps >= lib->cap_deps) {
+        lib->cap_deps = (lib->cap_deps == 0) ? 8 : (lib->cap_deps * 2);
+        lib->deps = TREALLOC(NgLibDep, lib->deps, lib->cap_deps);
+    }
+    NgLibDep *d = &lib->deps[lib->num_deps++];
+    d->path = copy(path);
+    d->st_dev = st.st_dev;
+    d->st_ino = st.st_ino;
+    d->st_size = st.st_size;
+    nglib_get_stat_mtime(&st, &d->mtime_sec, &d->mtime_nsec);
+}
+
+static int lib_is_valid(const struct library *lib, uint32_t cur_mask, int cur_soa)
+{
+    if (lib->compat_mask != cur_mask || lib->soacheck != cur_soa)
+        return 0;
+    if (lib->num_deps == 0)
+        return 0;
+    for (int i = 0; i < lib->num_deps; i++) {
+        struct stat st;
+        if (stat(lib->deps[i].path, &st) != 0)
+            return 0;
+        time_t ms; long mn;
+        nglib_get_stat_mtime(&st, &ms, &mn);
+        if (st.st_dev != lib->deps[i].st_dev ||
+            st.st_ino != lib->deps[i].st_ino ||
+            st.st_size != lib->deps[i].st_size ||
+            ms != lib->deps[i].mtime_sec ||
+            mn != lib->deps[i].mtime_nsec)
+            return 0;
+    }
+    return 1;
+}
+#endif
+
 static struct library *new_lib(void)
 {
+#if NGSPICE_OPT_GENERAL
+    if (num_libraries >= N_LIBRARIES) {
+        free_one_lib(&libraries[0]);
+        memmove(&libraries[0], &libraries[1],
+                (size_t)(N_LIBRARIES - 1) * sizeof(struct library));
+        num_libraries = N_LIBRARIES - 1;
+    }
+    struct library *l = &libraries[num_libraries++];
+    memset(l, 0, sizeof(*l));
+    return l;
+#else
     if (num_libraries >= N_LIBRARIES) {
         fprintf(stderr, "ERROR, number of libraries > %d, N_LIBRARIES overflow\n", N_LIBRARIES);
         controlled_exit(EXIT_FAILURE);
     }
 
     return &libraries[num_libraries++];
+#endif
 }
 
 
 static void delete_libs(void)
 {
+#if NGSPICE_OPT_GENERAL
+    /* Keep persistent stat-validated library cache across inp_readall() calls */
+    return;
+#else
     int i;
 
     for (i = 0; i < num_libraries; i++) {
@@ -497,18 +637,35 @@ static void delete_libs(void)
         tfree(libraries[i].habitat);
         line_free_x(libraries[i].deck, TRUE);
     }
+#endif
 }
 
 
 static struct library *find_lib(char *name)
 {
     int i;
-
+#if NGSPICE_OPT_GENERAL
+    uint32_t cur_mask = nglib_current_compat_mask();
+    int cur_soa = cp_getvar("soacheck", CP_BOOL, NULL, 0) ? 1 : 0;
+    for (i = 0; i < num_libraries; i++) {
+        if (cieq(libraries[i].realpath, name)) {
+            if (lib_is_valid(&libraries[i], cur_mask, cur_soa))
+                return &libraries[i];
+            free_one_lib(&libraries[i]);
+            memmove(&libraries[i], &libraries[i + 1],
+                    (size_t)(num_libraries - i - 1) * sizeof(struct library));
+            num_libraries--;
+            return NULL;
+        }
+    }
+    return NULL;
+#else
     for (i = 0; i < num_libraries; i++)
         if (cieq(libraries[i].realpath, name))
             return &libraries[i];
 
     return NULL;
+#endif
 }
 
 
@@ -557,6 +714,33 @@ static struct library *read_a_lib(const char *y, const char *dir_name)
 
     struct library *lib;
 
+#if NGSPICE_OPT_GENERAL
+    /* Fast path for absolute paths: avoid inp_pathresolve_at() + realpath() readlink syscalls */
+    if (y && y[0] == DIR_TERM) {
+        uint32_t cur_mask = nglib_current_compat_mask();
+        int cur_soa = cp_getvar("soacheck", CP_BOOL, NULL, 0) ? 1 : 0;
+        for (int i = 0; i < num_libraries; i++) {
+            if ((libraries[i].orig_path && strcmp(libraries[i].orig_path, y) == 0) ||
+                (libraries[i].realpath && strcmp(libraries[i].realpath, y) == 0))
+            {
+                if (lib_is_valid(&libraries[i], cur_mask, cur_soa)) {
+                    lib = &libraries[i];
+                    if (ng_dep_collector_lib && lib != ng_dep_collector_lib) {
+                        for (int di = 0; di < lib->num_deps; di++)
+                            lib_add_dep(ng_dep_collector_lib, lib->deps[di].path);
+                    }
+                    return lib;
+                }
+                free_one_lib(&libraries[i]);
+                memmove(&libraries[i], &libraries[i + 1],
+                        (size_t)(num_libraries - i - 1) * sizeof(struct library));
+                num_libraries--;
+                break;
+            }
+        }
+    }
+#endif
+
     y_resolved = inp_pathresolve_at(y, dir_name);
 
     if (!y_resolved) {
@@ -594,16 +778,37 @@ static struct library *read_a_lib(const char *y, const char *dir_name)
         lib->realpath = copy(yy);
         lib->habitat = ngdirname(yy);
 
+#if NGSPICE_OPT_GENERAL
+        lib->orig_path = (y && y[0] == DIR_TERM) ? copy(y) : NULL;
+        lib->compat_mask = nglib_current_compat_mask();
+        lib->soacheck = cp_getvar("soacheck", CP_BOOL, NULL, 0) ? 1 : 0;
+        lib_add_dep(lib, lib->realpath);
+        ng_reading_a_lib++;
+#endif
         lib->deck =
             inp_read(newfp, 1 /*dummy*/, lib->habitat, lib->realpath, FALSE, FALSE).cc;
+#if NGSPICE_OPT_GENERAL
+        ng_reading_a_lib--;
+#endif
 
         struct card* tmpdeck;
         int cnumber = 1;
-        for (tmpdeck = lib->deck; tmpdeck; tmpdeck = tmpdeck->nextcard)
+        for (tmpdeck = lib->deck; tmpdeck; tmpdeck = tmpdeck->nextcard) {
             tmpdeck->linenum_orig = cnumber++;
+#if NGSPICE_OPT_GENERAL
+            if (tmpdeck->linesource && tmpdeck->linesource != lib->realpath)
+                lib_add_dep(lib, tmpdeck->linesource);
+#endif
+        }
 
         fclose(newfp);
     }
+#if NGSPICE_OPT_GENERAL
+    if (lib && ng_dep_collector_lib && lib != ng_dep_collector_lib) {
+        for (int di = 0; di < lib->num_deps; di++)
+            lib_add_dep(ng_dep_collector_lib, lib->deps[di].path);
+    }
+#endif
 
     txfree(yy);
     txfree(y_resolved);
@@ -779,7 +984,7 @@ static void inp_cider_models(struct card* working)
         for (s = working->line; (c = *s) != '\0' && c <= ' '; s++)
             ;
 
-        if(!iscmod)
+        if (!iscmod && c == '.')
             iscmod = is_cider_model(s);
 
 #ifdef TRACE
@@ -1053,7 +1258,9 @@ struct card *inp_readall(FILE *fp, const char *dir_name, const char* file_name,
     struct card *cc;
     struct inp_read_t rv;
 
+#if !NGSPICE_OPT_GENERAL
     num_libraries = 0;
+#endif
     /* set the members of the compatibility structure */
     set_compat_mode();
 
@@ -1366,6 +1573,11 @@ static struct inp_read_t inp_read(FILE* fp, int call_depth, const char* dir_name
 
     wl_append_word(&sourceinfo, &sourceinfo, sourcelineinfo);
 
+#if NGSPICE_OPT_GENERAL
+    if (call_depth == 0 && !ng_reading_a_lib)
+        ng_num_pending_nglibs = 0;
+#endif
+
     /* First read in all lines & put them in the struct cc */
     for (;;) {
         /* derive lines from circarray */
@@ -1517,6 +1729,31 @@ static struct inp_read_t inp_read(FILE* fp, int call_depth, const char* dir_name
             }
             char *src_tag = copy(y_resolved);
             wl_append_word(&sourceinfo, &sourceinfo, src_tag);
+#if NGSPICE_OPT_GENERAL
+            if (!nglib_precompiling && !ng_reading_a_lib &&
+                ng_num_pending_nglibs < NG_MAX_PENDING_SPLICE)
+            {
+                const struct NgDeckIndex *ngidx = nglib_get_cached_index(y_resolved);
+                tfree(y_resolved);
+                if (!ngidx) {
+                    tfree(buffer);
+                    controlled_exit(EXIT_FAILURE);
+                }
+                *buffer = '*';
+                if (end)
+                    end = insert_new_line(end, copy(buffer), line_number++, end->linenum_orig, end->linesource);
+                else
+                    end = insert_new_line(end, copy(buffer), line_number++, 1, (char *)file_name);
+                if (!cc)
+                    cc = end;
+                ng_pending_nglibs[ng_num_pending_nglibs].anchor = end;
+                ng_pending_nglibs[ng_num_pending_nglibs].idx = ngidx;
+                ng_pending_nglibs[ng_num_pending_nglibs].src_tag = src_tag;
+                ng_num_pending_nglibs++;
+                tfree(buffer);
+                continue;
+            }
+#endif
             struct card *newcard = nglib_load_blob(y_resolved, &line_number);
             tfree(y_resolved);
             if (!newcard) {
@@ -1976,10 +2213,12 @@ static struct inp_read_t inp_read(FILE* fp, int call_depth, const char* dir_name
             fprintf(stdout, "Note: gnd in a subcircuit is not set to 0 automatically\n");
         }
 
+#if !NGSPICE_OPT_GENERAL
         if (!newcompat.lt && !newcompat.ps && !newcompat.s3) {
             /* process all library section references */
             expand_section_references(cc, dir_name);
         }
+#endif
     }
 
     /*
@@ -2009,6 +2248,30 @@ static struct inp_read_t inp_read(FILE* fp, int call_depth, const char* dir_name
 #endif
 
     inp_stitch_continuation_lines(cc->nextcard);
+
+#if NGSPICE_OPT_GENERAL
+    if (call_depth == 0 && !comfile && !newcompat.lt && !newcompat.ps && !newcompat.s3) {
+        /* Expand .lib sections AFTER stripping/stitching the small top-level deck:
+         * cached library decks are already stripped and stitched. */
+        expand_section_references(cc, dir_name);
+    }
+#endif
+
+#if NGSPICE_OPT_GENERAL
+    if (call_depth == 0 && !ng_reading_a_lib && ng_num_pending_nglibs > 0) {
+        struct card *anchors[NG_MAX_PENDING_SPLICE];
+        const struct NgDeckIndex *indices[NG_MAX_PENDING_SPLICE];
+        char *tags[NG_MAX_PENDING_SPLICE];
+        int n = ng_num_pending_nglibs;
+        for (int pi = 0; pi < n; pi++) {
+            anchors[pi] = ng_pending_nglibs[pi].anchor;
+            indices[pi] = ng_pending_nglibs[pi].idx;
+            tags[pi] = ng_pending_nglibs[pi].src_tag;
+        }
+        ng_num_pending_nglibs = 0;
+        ng_deck_index_splice_multi(cc, n, anchors, indices, tags, &line_number, 1);
+    }
+#endif
 
     rv.line_number = line_number;
     rv.cc = cc;
@@ -2356,6 +2619,68 @@ static char *inp_pathresolve_at(const char *name, const char *dir)
 
 static char *readline(FILE *fd)
 {
+#if NGSPICE_OPT_GENERAL
+    char sbuf[1024];
+    char acc[1024];
+    char *heap = NULL;
+    size_t len = 0;
+    size_t cap = sizeof(acc);
+
+    while (fgets(sbuf, (int)sizeof(sbuf), fd) != NULL) {
+        char *p = sbuf;
+        if (len == 0) {
+            while (*p == ' ' || *p == '\t')
+                p++;
+        }
+        int saw_nl = 0;
+        while (*p != '\0') {
+            char ch = *p++;
+            if (ch == '\r')
+                continue;
+            if (len + 1 >= cap) {
+                size_t new_cap = cap * 2;
+                if (!heap) {
+                    heap = TMALLOC(char, new_cap);
+                    if (!heap)
+                        return NULL;
+                    memcpy(heap, acc, len);
+                } else {
+                    heap = TREALLOC(char, heap, new_cap);
+                    if (!heap)
+                        return NULL;
+                }
+                cap = new_cap;
+            }
+            if (heap)
+                heap[len++] = ch;
+            else
+                acc[len++] = ch;
+            if (ch == '\n') {
+                saw_nl = 1;
+                break;
+            }
+        }
+        if (saw_nl)
+            break;
+    }
+
+    if (len == 0) {
+        tfree(heap);
+        return NULL;
+    }
+
+    if (!heap) {
+        char *out = TMALLOC(char, len + 1);
+        if (!out)
+            return NULL;
+        memcpy(out, acc, len);
+        out[len] = '\0';
+        return out;
+    }
+    heap = TREALLOC(char, heap, len + 1);
+    heap[len] = '\0';
+    return heap;
+#else
     int c;
     int memlen;
     char *strptr;
@@ -2396,6 +2721,7 @@ static char *readline(FILE *fd)
     strptr[strlen] = '\0';
 
     return (strptr);
+#endif
 }
 
 
@@ -3909,8 +4235,14 @@ char *inp_remove_ws(char *s)
 
     *d = '\0';
 
+#if NGSPICE_OPT_GENERAL
+    /* Shrink in-place; only reallocate if substantial memory (>512 bytes) can be reclaimed */
+    if ((size_t)(s - d) <= 512u)
+        return x;
+#else
     if (d == s)
         return x;
+#endif
 
     s = copy(x);
     tfree(x);
@@ -4103,6 +4435,129 @@ static struct card *expand_section_ref(struct card *c, const char *dir_name)
 
 static void expand_section_references(struct card *c, const char *dir_name)
 {
+#if NGSPICE_OPT_GENERAL
+    if (!nglib_precompiling && c) {
+        int can_batch = 1;
+        int n_libs = 0;
+        for (struct card *p = c; p; p = p->nextcard) {
+            if (ciprefix(".libsave", p->line)) {
+                can_batch = 0;
+                break;
+            }
+            if (ciprefix(".if", p->line) && (p->line[3] <= ' ' || p->line[3] == '(')) {
+                can_batch = 0;
+                break;
+            }
+            if (ciprefix(".lib", p->line))
+                n_libs++;
+        }
+        if (can_batch && n_libs > 0 && n_libs <= NG_MAX_PENDING_SPLICE) {
+            struct card *anchors[NG_MAX_PENDING_SPLICE];
+            const struct NgDeckIndex *indices[NG_MAX_PENDING_SPLICE];
+            char *tags[NG_MAX_PENDING_SPLICE];
+            int n_anchors = 0;
+            bool soa = cp_getvar("soacheck", CP_BOOL, NULL, 0) ? TRUE : FALSE;
+
+            for (struct card *p = c; p; p = p->nextcard) {
+                if (!ciprefix(".lib", p->line))
+                    continue;
+                char *line = p->line;
+                char *s = skip_non_ws(line);
+                while (isspace_c(*s)) s++;
+                char *s_e;
+                if (isquote(*s)) {
+                    for (s_e = ++s; *s_e && !isquote(*s_e); s_e++);
+                    if (!*s_e) {
+                        fprintf(stderr, "\nError: Missing second quote in line \n      %s", line);
+                        controlled_exit(EXIT_FAILURE);
+                    }
+                } else {
+                    for (s_e = s; *s_e && !isspace_c(*s_e) && !isquote(*s_e); s_e++);
+                }
+                char *y = s_e;
+                if (y && isquote(*y)) ++y;
+                while (isspace_c(*y)) y++;
+                if (!*y)
+                    continue;
+
+                char *y_e;
+                if (isquote(*y))
+                    for (y_e = ++y; *y_e && !isquote(*y_e); y_e++);
+                else
+                    for (y_e = y; *y_e && !isspace_c(*y_e) && !isquote(*y_e); y_e++);
+
+                char keep1 = *s_e, keep2 = *y_e;
+                *s_e = '\0';
+                *y_e = '\0';
+
+                if (soa)
+                    insert_new_line(p, copy(".param SWSOA=1"), p->linenum + 1, 0, "internal");
+
+                struct library *lib = read_a_lib(s, dir_name);
+                if (!lib) {
+                    fprintf(stderr, "ERROR, library file %s not found\n", s);
+                    controlled_exit(EXIT_FAILURE);
+                }
+
+                struct NgDeckIndex *sec_idx = NULL;
+                for (int si = 0; si < lib->num_secs; si++) {
+                    if (cieq(lib->secs[si].sec_name, y)) {
+                        sec_idx = lib->secs[si].idx;
+                        break;
+                    }
+                }
+                if (!sec_idx) {
+                    struct card *section_def = find_section_definition(lib->deck, y);
+                    if (!section_def) {
+                        fprintf(stderr,
+                                "ERROR, library file %s, section definition %s not found\n",
+                                s, y);
+                        controlled_exit(EXIT_FAILURE);
+                    }
+                    struct library *prev_collector = ng_dep_collector_lib;
+                    ng_dep_collector_lib = lib;
+                    struct card *t = section_def;
+                    for (; t; t = t->nextcard) {
+                        if (ciprefix(".endl", t->line))
+                            break;
+                        if (ciprefix(".lib", t->line))
+                            t = expand_section_ref(t, lib->habitat);
+                    }
+                    ng_dep_collector_lib = prev_collector;
+                    if (!t) {
+                        fprintf(stderr, "ERROR, .endl not found\n");
+                        controlled_exit(EXIT_FAILURE);
+                    }
+                    sec_idx = ng_deck_index_create_from_cards(section_def->nextcard, t);
+                    if (lib->num_secs >= lib->cap_secs) {
+                        lib->cap_secs = (lib->cap_secs == 0) ? 8 : (lib->cap_secs * 2);
+                        lib->secs = TREALLOC(NgLibSecCache, lib->secs, lib->cap_secs);
+                    }
+                    lib->secs[lib->num_secs].sec_name = copy(y);
+                    lib->secs[lib->num_secs].idx = sec_idx;
+                    lib->num_secs++;
+                }
+
+                *line = '*';
+                *s_e = keep1;
+                *y_e = keep2;
+
+                char *tag = copy(lib->realpath);
+                wl_append_word(&sourceinfo, &sourceinfo, tag);
+                anchors[n_anchors] = p;
+                indices[n_anchors] = sec_idx;
+                tags[n_anchors] = tag;
+                n_anchors++;
+            }
+
+            if (n_anchors > 0) {
+                int dummy_lnum = 1;
+                ng_deck_index_splice_multi(c, n_anchors, anchors, indices, tags, &dummy_lnum, 1);
+            }
+            return;
+        }
+    }
+#endif
     for (; c; c = c->nextcard) {
         struct card* p = c;
         if (ciprefix(".libsave", c->line)) {

@@ -37,7 +37,10 @@ CKTload(CKTcircuit *ckt)
 {
     int i;
     int size;
-    double startTime, td0;
+    double startTime;
+#ifdef PER_DEVICE_STATS
+    double td0;
+#endif
     CKTnode *node;
     int error;
 #ifdef STEPDEBUG
@@ -54,9 +57,8 @@ CKTload(CKTcircuit *ckt)
     /* gtri - begin - Put resistors to ground at all nodes */
 #endif
 
-    td0 = SPfrontEnd->IFseconds();
-
 #ifdef PER_DEVICE_STATS
+    td0 = SPfrontEnd->IFseconds();
     ckt->CKTstat->devTimes[DEVmaxnum] += SPfrontEnd->IFseconds() - td0;
     ckt->CKTstat->devCounts[DEVmaxnum]++;
 #endif
@@ -67,13 +69,25 @@ CKTload(CKTcircuit *ckt)
     noncon = ckt->CKTnoncon;
 #endif /* STEPDEBUG */
 
+#if NGSPICE_OPT_GENERAL
+    if (!ckt->CKTactiveDevsValid && DEVmaxnum <= 256) {
+        int na = 0;
+        for (i = 0; i < DEVmaxnum; i++) {
+            if (DEVices[i] && ckt->CKThead[i])
+                ckt->CKTactiveDevs[na++] = (short)i;
+        }
+        ckt->CKTnumActiveDevs = na;
+        ckt->CKTactiveDevsValid = 1;
+    }
+#endif
+
 #if NGSPICE_OPT_GENERAL && defined(KLU) && defined(USE_OMP)
     if (ckt->CKTmatrix->CKTkluMODE &&
         ckt->CKTmatrix->SMPkluMatrix &&
         ckt->CKTmatrix->SMPkluMatrix->KLUmatrixIsComplex == KLUmatrixReal &&
         ckt->CKTmatrix->SMPkluMatrix->KLUmatrixAx != NULL &&
         ckt->CKTmatrix->SMPkluMatrix->KLUmatrixNZ > 0 &&
-        !(ckt->CKTmode & MODEDC))
+        !(ckt->CKTmode & MODEINITSMSIG))
     {
         KLUmatrix *km = ckt->CKTmatrix->SMPkluMatrix;
         int nz = (int)km->KLUmatrixNZ;
@@ -89,19 +103,45 @@ CKTload(CKTcircuit *ckt)
         int has_res_base = 0;
         unsigned char handled[256];
         int use_handled = (DEVmaxnum <= 256);
-        if (use_handled)
-            memset(handled, 0, (size_t)DEVmaxnum);
+        int use_active = ckt->CKTactiveDevsValid;
+        int n_active = ckt->CKTnumActiveDevs;
+        const short * restrict active_devs = ckt->CKTactiveDevs;
+        if (use_handled) {
+            if (use_active) {
+                for (int ai = 0; ai < n_active; ai++)
+                    handled[active_devs[ai]] = 0;
+            } else {
+                memset(handled, 0, (size_t)DEVmaxnum);
+            }
+        }
 
-        for (i = 0; i < DEVmaxnum; i++) {
-            if (DEVices[i] && DEVices[i]->DEVkluPrep && ckt->CKThead[i]) {
-                int prep = DEVices[i]->DEVkluPrep(ckt->CKThead[i], ckt);
-                if (prep == 2) {
-                    has_res_base = 1;
-                    skip_mask_res = i;
-                    if (use_handled) handled[i] = 1;
-                } else if (prep == 1 && DEVices[i]->DEVkluLoadPar && par_count < 16) {
-                    par_devs[par_count++] = i;
-                    if (use_handled) handled[i] = 1;
+        if (use_active) {
+            for (int ai = 0; ai < n_active; ai++) {
+                i = active_devs[ai];
+                if (DEVices[i]->DEVkluPrep) {
+                    int prep = DEVices[i]->DEVkluPrep(ckt->CKThead[i], ckt);
+                    if (prep == 2) {
+                        has_res_base = 1;
+                        skip_mask_res = i;
+                        if (use_handled) handled[i] = 1;
+                    } else if (prep == 1 && DEVices[i]->DEVkluLoadPar && par_count < 16) {
+                        par_devs[par_count++] = i;
+                        if (use_handled) handled[i] = 1;
+                    }
+                }
+            }
+        } else {
+            for (i = 0; i < DEVmaxnum; i++) {
+                if (DEVices[i] && DEVices[i]->DEVkluPrep && ckt->CKThead[i]) {
+                    int prep = DEVices[i]->DEVkluPrep(ckt->CKThead[i], ckt);
+                    if (prep == 2) {
+                        has_res_base = 1;
+                        skip_mask_res = i;
+                        if (use_handled) handled[i] = 1;
+                    } else if (prep == 1 && DEVices[i]->DEVkluLoadPar && par_count < 16) {
+                        par_devs[par_count++] = i;
+                        if (use_handled) handled[i] = 1;
+                    }
                 }
             }
         }
@@ -187,20 +227,33 @@ CKTload(CKTcircuit *ckt)
         }
 
         /* Load all remaining devices (VSRC, ISRC, ASRC, DIO, etc.) */
-        for (i = 0; i < DEVmaxnum; i++) {
-            if (use_handled) {
+        if (use_active) {
+            for (int ai = 0; ai < n_active; ai++) {
+                i = active_devs[ai];
                 if (handled[i]) continue;
-            } else {
-                int skip = (i == skip_mask_res);
-                for (int k = 0; k < par_count && !skip; k++)
-                    if (par_devs[k] == i) skip = 1;
-                if (skip) continue;
+                if (DEVices[i]->DEVload) {
+                    error = DEVices[i]->DEVload(ckt->CKThead[i], ckt);
+                    if (ckt->CKTnoncon)
+                        ckt->CKTtroubleNode = 0;
+                    if (error) return(error);
+                }
             }
-            if (DEVices[i] && DEVices[i]->DEVload && ckt->CKThead[i]) {
-                error = DEVices[i]->DEVload(ckt->CKThead[i], ckt);
-                if (ckt->CKTnoncon)
-                    ckt->CKTtroubleNode = 0;
-                if (error) return(error);
+        } else {
+            for (i = 0; i < DEVmaxnum; i++) {
+                if (use_handled) {
+                    if (handled[i]) continue;
+                } else {
+                    int skip = (i == skip_mask_res);
+                    for (int k = 0; k < par_count && !skip; k++)
+                        if (par_devs[k] == i) skip = 1;
+                    if (skip) continue;
+                }
+                if (DEVices[i] && DEVices[i]->DEVload && ckt->CKThead[i]) {
+                    error = DEVices[i]->DEVload(ckt->CKThead[i], ckt);
+                    if (ckt->CKTnoncon)
+                        ckt->CKTtroubleNode = 0;
+                    if (error) return(error);
+                }
             }
         }
         goto after_device_loads;
@@ -210,6 +263,35 @@ CKTload(CKTcircuit *ckt)
     memset(ckt->CKTrhs, 0, (size_t)(size + 1) * sizeof(double));
     SMPclear(ckt->CKTmatrix);
 
+#if NGSPICE_OPT_GENERAL
+    if (ckt->CKTactiveDevsValid) {
+        int n_active = ckt->CKTnumActiveDevs;
+        const short * restrict active_devs = ckt->CKTactiveDevs;
+        for (int ai = 0; ai < n_active; ai++) {
+            i = active_devs[ai];
+            if (DEVices[i]->DEVload) {
+#ifdef PER_DEVICE_STATS
+                td0 = SPfrontEnd->IFseconds();
+#endif
+                error = DEVices[i]->DEVload (ckt->CKThead[i], ckt);
+#ifdef PER_DEVICE_STATS
+                ckt->CKTstat->devTimes[i] += SPfrontEnd->IFseconds() - td0;
+                ckt->CKTstat->devCounts[i]++;
+#endif
+                if (ckt->CKTnoncon)
+                    ckt->CKTtroubleNode = 0;
+#ifdef STEPDEBUG
+                if (noncon != ckt->CKTnoncon) {
+                    printf("device type %s nonconvergence\n",
+                           DEVices[i]->DEVpublic.name);
+                    noncon = ckt->CKTnoncon;
+                }
+#endif /* STEPDEBUG */
+                if (error) return(error);
+            }
+        }
+    } else
+#endif
     for (i = 0; i < DEVmaxnum; i++) {
         if (DEVices[i] && DEVices[i]->DEVload && ckt->CKThead[i]) {
 #ifdef PER_DEVICE_STATS

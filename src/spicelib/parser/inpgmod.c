@@ -268,6 +268,7 @@ parse_line(char *line, char *tokens[], int num_tokens, double values[], bool fou
 {
     int get_index = -1;
     int i;
+    int nfound = 0;
     size_t tok_lens[8];
 
     for (i = 0; i < num_tokens; i++) {
@@ -279,7 +280,11 @@ parse_line(char *line, char *tokens[], int num_tokens, double values[], bool fou
         if (get_index != -1) {
             int error;
             values[get_index] = INPevaluate(&line, &error, 1);
-            found[get_index] = TRUE;
+            if (!found[get_index]) {
+                found[get_index] = TRUE;
+                if (++nfound == num_tokens)
+                    return TRUE;
+            }
             get_index = -1;
             continue;
         }
@@ -296,11 +301,7 @@ parse_line(char *line, char *tokens[], int num_tokens, double values[], bool fou
         }
     }
 
-    for (i = 0; i < num_tokens; i++)
-        if (!found[i])
-            return FALSE;
-
-    return TRUE;
+    return (nfound == num_tokens) ? TRUE : FALSE;
 }
 
 

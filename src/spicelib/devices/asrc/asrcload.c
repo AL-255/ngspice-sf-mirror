@@ -8,6 +8,7 @@ Author: 1987 Kanwar Jit Singh
 #include "asrcdefs.h"
 #include "ngspice/sperror.h"
 #include "ngspice/suffix.h"
+#include <math.h>
 
 
 int    asrc_nvals = 0;
@@ -63,6 +64,83 @@ ASRCload(GENmodel *inModel, CKTcircuit *ckt)
              * Get the function and its derivatives evaluated
              */
             i = here->ASRCtree->numVars;
+#if NGSPICE_OPT_GENERAL
+            if (here->ASRCisAffine) {
+                int nvars = i;
+                if (!here->ASRCaffValid ||
+                    (here->ASRCaffHasTemp && here->ASRCaffTemp != ckt->CKTtemp) ||
+                    here->ASRCaffGmin != ckt->CKTgmin)
+                {
+                    if (asrc_nvals < nvars) {
+                        asrc_nvals = nvars;
+                        asrc_vals = TREALLOC(double, asrc_vals, nvars);
+                        asrc_derivs = TREALLOC(double, asrc_derivs, nvars);
+                    }
+                    for (i = 0; i < nvars; i++)
+                        asrc_vals[i] = 0.0;
+                    if (here->ASRCtree->IFeval(here->ASRCtree, ckt->CKTgmin,
+                                               &here->ASRCaffC0, asrc_vals,
+                                               nvars > 0 ? here->ASRCaffDerivs : asrc_derivs) != OK)
+                    {
+                        fprintf(stderr, "    in line %s\n\n", here->gen.GENname);
+                        return(E_BADPARM);
+                    }
+                    int all_fin = isfinite(here->ASRCaffC0);
+                    for (i = 0; i < nvars && all_fin; i++)
+                        if (!isfinite(here->ASRCaffDerivs[i]))
+                            all_fin = 0;
+                    if (all_fin) {
+                        here->ASRCaffTemp = ckt->CKTtemp;
+                        here->ASRCaffGmin = ckt->CKTgmin;
+                        here->ASRCaffValid = 1;
+                    } else {
+                        here->ASRCisAffine = 0;
+                    }
+                }
+                if (here->ASRCisAffine && here->ASRCaffValid) {
+                    const double * restrict g = here->ASRCaffDerivs;
+                    const int * restrict vars = here->ASRCvars;
+                    const double * restrict rhsOld = ckt->CKTrhsOld;
+                    double ** restrict ptrs = here->ASRCposPtr;
+                    double c0 = here->ASRCaffC0;
+                    double val = c0;
+                    for (i = 0; i < nvars; i++)
+                        val += rhsOld[vars[i]] * g[i];
+
+                    here->ASRCprev_value = val;
+
+                    if (ckt->CKTmode & MODEINITSMSIG) {
+                        for (i = 0; i < nvars; i++)
+                            here->ASRCacValues[i] = g[i];
+                        here->ASRCacValues[nvars] = factor * c0;
+                    }
+
+                    j = 0;
+                    if (here->ASRCtype == ASRC_VOLTAGE) {
+                        *(ptrs[j++]) += 1.0;
+                        *(ptrs[j++]) -= 1.0;
+                        *(ptrs[j++]) -= 1.0;
+                        *(ptrs[j++]) += 1.0;
+                        for (i = 0; i < nvars; i++)
+                            *(ptrs[j++]) -= g[i] * factor;
+                        if (c0 != 0.0)
+                            ckt->CKTrhs[here->ASRCbranch] += factor * c0;
+                    } else {
+                        for (i = 0; i < nvars; i++) {
+                            double gf = g[i] * factor;
+                            *(ptrs[j++]) += gf;
+                            *(ptrs[j++]) -= gf;
+                        }
+                        if (c0 != 0.0) {
+                            double fc0 = factor * c0;
+                            ckt->CKTrhs[here->ASRCposNode] -= fc0;
+                            ckt->CKTrhs[here->ASRCnegNode] += fc0;
+                        }
+                    }
+                    continue;
+                }
+            }
+#endif
             if (asrc_nvals < i) {
                 asrc_nvals = i;
                 asrc_vals = TREALLOC(double, asrc_vals, i);

@@ -21,9 +21,12 @@ B4P(cmpEligIdx)(const void *pa, const void *pb)
     int ib = *(const int *)pb;
     B4P(instance) *ha = B4P(sort_inst_arr)[ia];
     B4P(instance) *hb = B4P(sort_inst_arr)[ib];
-    uintptr_t ma = (uintptr_t)B4P(modPtr)(ha);
-    uintptr_t mb = (uintptr_t)B4P(modPtr)(hb);
-    if (ma != mb) return (ma < mb) ? -1 : 1;
+    B4P(model) *ma = B4P(modPtr)(ha);
+    B4P(model) *mb = B4P(modPtr)(hb);
+    if (ma != mb) {
+        int mc = strcmp(ma->gen.GENmodName, mb->gen.GENmodName);
+        if (mc != 0) return mc;
+    }
     int ta = ha->B4P(hasTrapTunnel) ? 1 : 0;
     int tb = hb->B4P(hasTrapTunnel) ? 1 : 0;
     if (ta != tb) return ta - tb;
@@ -54,6 +57,27 @@ B4P(isAvxEligibleTran)(CKTcircuit *ckt)
         return 0;
     if ((ckt->CKTintegrateMethod != GEAR && ckt->CKTintegrateMethod != TRAPEZOIDAL) ||
         (ckt->CKTorder != 1 && ckt->CKTorder != 2))
+        return 0;
+    return 1;
+}
+
+static inline int
+B4P(isAvxEligibleDcOp)(CKTcircuit *ckt)
+{
+    static int disabled = -1;
+    if (disabled < 0)
+        disabled = (getenv("NGSPICE_NO_AVX512") != NULL) ? 1 : 0;
+    if (disabled)
+        return 0;
+
+    long mode = ckt->CKTmode;
+    if (!(mode & (MODEDCOP | MODETRANOP)))
+        return 0;
+    if (!(mode & (MODEINITFLOAT | MODEINITJCT | MODEINITFIX)))
+        return 0;
+    if (mode & (MODEINITSMSIG | MODEINITTRAN | MODEUIC | MODEDCTRANCURVE | MODEAC | MODETRAN))
+        return 0;
+    if (ckt->CKTbypass)
         return 0;
     return 1;
 }
@@ -926,19 +950,23 @@ B4P(evalAvxBlock)(
     CKTcircuit *ckt,
     double * restrict my_ax,
     double * restrict my_rhs,
-    int stamp_mode)
+    int stamp_mode,
+    int dc_only,
+    int force_aos)
 {
     const double * restrict rhsOld = ckt->CKTrhsOld;
     double * restrict s0 = ckt->CKTstate0;
-    const double * restrict s1 = ckt->CKTstate1;
-    const double * restrict s2 = ckt->CKTstate2;
-    int is_pred = (ckt->CKTmode & MODEINITPRED) != 0;
-    int is_gear2 = (ckt->CKTintegrateMethod == GEAR && ckt->CKTorder == 2);
-    int is_trap2 = (ckt->CKTintegrateMethod == TRAPEZOIDAL && ckt->CKTorder == 2);
+    const double * restrict s1 = dc_only ? NULL : ckt->CKTstate1;
+    const double * restrict s2 = dc_only ? NULL : ckt->CKTstate2;
+    int is_pred = (!dc_only && (ckt->CKTmode & MODEINITPRED) != 0);
+    int is_gear2 = (!dc_only && ckt->CKTintegrateMethod == GEAR && ckt->CKTorder == 2);
+    int is_trap2 = (!dc_only && ckt->CKTintegrateMethod == TRAPEZOIDAL && ckt->CKTorder == 2);
     int int_mode = is_gear2 ? 2 : (is_trap2 ? 1 : 0);
-    int need_aos = B4P(AvxNeedAosSync);
-    double ag0 = ckt->CKTag[0], ag1 = ckt->CKTag[1], ag2 = ckt->CKTag[2];
-    double vtol = B4P(avxBypassTol)(ckt);
+    int need_aos = B4P(AvxNeedAosSync) || force_aos;
+    double ag0 = dc_only ? 0.0 : ckt->CKTag[0];
+    double ag1 = dc_only ? 0.0 : ckt->CKTag[1];
+    double ag2 = dc_only ? 0.0 : ckt->CKTag[2];
+    double vtol = dc_only ? -1.0 : B4P(avxBypassTol)(ckt);
     int nact = blk->n_active;
     __mmask8 active_mask = (__mmask8)((1u << nact) - 1u);
 
@@ -947,7 +975,7 @@ B4P(evalAvxBlock)(
 
     /* Level-1 fast path: exact same timestep/integration & stationary voltages ->
      * skip CKTstate0 read/write, voltage limiting, physics, and integration! */
-    if (!is_pred && !need_aos && vtol >= 0.0 && dyn->stamp_valid &&
+    if (!dc_only && !is_pred && !need_aos && vtol >= 0.0 && dyn->stamp_valid &&
         dyn->last_time == ckt->CKTtime &&
         dyn->last_ag0 == ag0 && dyn->last_ag1 == ag1 && dyn->last_ag2 == ag2 &&
         dyn->last_gmin == ckt->CKTgmin && dyn->last_int_mode == int_mode &&
@@ -981,7 +1009,46 @@ B4P(evalAvxBlock)(
 
     double xfact = is_pred ? (ckt->CKTdelta / ckt->CKTdeltaOld[1]) : 0.0;
     double one_p_xf = 1.0 + xfact;
+    int is_initjct = (dc_only && (ckt->CKTmode & MODEINITJCT) != 0);
 
+    v8d vds, vgs, vbs;
+    __mmask8 chk_mask = 0;
+
+    if (is_initjct) {
+        int any_ic = 0;
+        for (int lane = 0; lane < nact; lane++) {
+            B4P(instance) *h = InstArray[blk->instIdx[lane]];
+            if (h->B4P(icVDS) != 0.0 || h->B4P(icVGS) != 0.0 || h->B4P(icVBS) != 0.0) {
+                any_ic = 1;
+                break;
+            }
+        }
+        if (!any_ic) {
+            vds = v8_set1(0.1);
+            vgs = blk->vth0_signed + v8_set1(0.1);
+            vbs = v8_set1(0.0);
+        } else {
+            double t_vth0[8], t_type[8];
+            v8_store(t_vth0, blk->vth0_signed);
+            v8_store(t_type, blk->type);
+            for (int lane = 0; lane < nact; lane++) {
+                B4P(instance) *h = InstArray[blk->instIdx[lane]];
+                double d = t_type[lane] * h->B4P(icVDS);
+                double g = t_type[lane] * h->B4P(icVGS);
+                double b = t_type[lane] * h->B4P(icVBS);
+                if (d == 0.0 && g == 0.0 && b == 0.0) {
+                    d = 0.1; g = t_vth0[lane] + 0.1; b = 0.0;
+                }
+                a_vds[lane] = d; a_vgs[lane] = g; a_vbs[lane] = b;
+            }
+            for (int lane = nact; lane < 8; lane++) {
+                a_vds[lane] = a_vds[0]; a_vgs[lane] = a_vgs[0]; a_vbs[lane] = a_vbs[0];
+            }
+            vds = v8_load(a_vds);
+            vgs = v8_load(a_vgs);
+            vbs = v8_load(a_vbs);
+        }
+    } else {
 #ifndef PREDICTOR
     if (is_pred) {
         for (int lane = 0; lane < nact; lane++) {
@@ -1021,9 +1088,9 @@ B4P(evalAvxBlock)(
         a_s0_vds[lane] = a_s0_vds[0];
     }
 
-    v8d vds = v8_load(a_vds);
-    v8d vgs = v8_load(a_vgs);
-    v8d vbs = v8_load(a_vbs);
+    vds = v8_load(a_vds);
+    vgs = v8_load(a_vgs);
+    vbs = v8_load(a_vbs);
     if (!is_pred) {
         vds = vds * blk->type;
         vgs = vgs * blk->type;
@@ -1054,7 +1121,6 @@ B4P(evalAvxBlock)(
     }
 
     /* 8-wide AVX-512 DEVpnjlim */
-    __mmask8 chk_mask = 0;
     {
         __mmask8 m_vds_fwd = v8_ge(vds, v8_set1(0.0));
         v8d vj_in  = v8_sel(m_vds_fwd, vbs, vbd);
@@ -1075,10 +1141,11 @@ B4P(evalAvxBlock)(
             }
         }
     }
+    }
 
     /* Level-2 fast path: cross-timestep stationary voltages -> reuse cached DC+C+Q
      * physics and only run charge integration + ag0 stamp assembly! */
-    if (!need_aos && !chk_mask && vtol >= 0.0 && dyn->phys_valid &&
+    if (!dc_only && !need_aos && !chk_mask && vtol >= 0.0 && dyn->phys_valid &&
         dyn->last_gmin == ckt->CKTgmin)
     {
         int exact_zero = 0;
@@ -1099,15 +1166,24 @@ B4P(evalAvxBlock)(
     BSIM4Avx512Out out;
     bsim4_avx512_eval_block(blk, dyn, vds, vgs, vbs,
                             ckt->CKTgmin, ag0, ag1, ag2,
-                            is_gear2, is_trap2, s0, s1, s2, &out, need_aos);
+                            is_gear2, is_trap2, s0, s1, s2, &out, need_aos, dc_only);
 
-    dyn->last_time = ckt->CKTtime;
-    dyn->last_ag0 = ag0; dyn->last_ag1 = ag1; dyn->last_ag2 = ag2;
-    dyn->last_gmin = ckt->CKTgmin;
-    dyn->last_int_mode = int_mode;
-    dyn->last_s0 = s0; dyn->last_s1 = s1; dyn->last_s2 = s2;
-    dyn->phys_valid = 1;
-    dyn->stamp_valid = !need_aos;
+    if (dc_only) {
+        dyn->phys_valid = 0;
+        dyn->stamp_valid = 0;
+        if (!need_aos) {
+            for (int lane = 0; lane < nact; lane++)
+                InstArray[blk->instIdx[lane]]->B4P(von) = out.von[lane];
+        }
+    } else {
+        dyn->last_time = ckt->CKTtime;
+        dyn->last_ag0 = ag0; dyn->last_ag1 = ag1; dyn->last_ag2 = ag2;
+        dyn->last_gmin = ckt->CKTgmin;
+        dyn->last_int_mode = int_mode;
+        dyn->last_s0 = s0; dyn->last_s1 = s1; dyn->last_s2 = s2;
+        dyn->phys_valid = 1;
+        dyn->stamp_valid = !need_aos;
+    }
 
     if (need_aos) {
         for (int lane = 0; lane < nact; lane++) {
@@ -1150,7 +1226,8 @@ int
 B4P(convTestAvx)(GENmodel *inModel, CKTcircuit *ckt)
 {
     B4P(model) *head = (B4P(model) *)inModel;
-    if (!head->B4P(AvxBuilt) || !head->B4P(AvxDynValid) || !B4P(isAvxEligibleTran)(ckt))
+    if (!head->B4P(AvxBuilt) || !head->B4P(AvxDynValid) ||
+        (!B4P(isAvxEligibleTran)(ckt) && !B4P(isAvxEligibleDcOp)(ckt)))
         return -1;
     if (head->B4P(AvxFallbackCount) != 0)
         return -1;

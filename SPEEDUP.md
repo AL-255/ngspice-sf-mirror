@@ -143,3 +143,28 @@ Precompiling the full GF180 typical PDK (`design.ngspice` + `sm141064.ngspice` c
   1. Default Zen 4 (`NGSPICE_OPT_GENERAL=1, NGSPICE_OPT_ZEN4=1`)
   2. Portable General-Only (`NGSPICE_OPT_GENERAL=1, NGSPICE_OPT_ZEN4=0`, `-march=x86-64 -mno-avx512f`, 0 `%zmm` instructions)
   3. Stock-Equivalent (`NGSPICE_OPT_GENERAL=0, NGSPICE_OPT_ZEN4=0`, `-march=x86-64 -mno-avx512f`)
+
+### Stage 9: Scattered-Task Frontend/Cache, `INPparseTree` Folding + Affine `ASRC`, & AVX-512 BSIM4 DCOP (`NGSPICE_OPT_GENERAL` + `NGSPICE_OPT_ZEN4`)
+- **Gain (single-core 1t on Ryzen 9 7940HX):**
+  - `opa1k_pvt16` (1,000 post-PEX GF180 op-amps × 16 PVT corners = 16,000 `OP + AC + Tran` tasks):
+    - Standard Sparse: **`483.27 s -> 133.66 s`** (**3.62×** vs Stage 8, **4.69×** vs stock `626.47 s`, `rel_rms = 2.90e-6`)
+    - Standard KLU: **`497.39 s -> 138.61 s`** (**3.59×** vs Stage 8, **4.59×** vs stock KLU `636.08 s`, `rel_rms = 5.30e-5`)
+    - `.uselib` KLU: **`366.78 s -> 132.37 s`** (**2.77×** vs Stage 8, **4.73×** vs stock `626.47 s`, `rel_rms = 5.30e-5`)
+  - Also accelerates all 5 hero/probe transient workloads (`pll_ring_150m_4us` KLU `31.59 s -> 29.29 s`, `ti12_full_300ns` KLU `48.56 s -> 45.34 s`, `sar12_hero_16cyc` Sparse `149.74 s -> 137.49 s`, `sdm16_120cyc` `.uselib` KLU `30.55 s -> 29.96 s`), with **18/18 golden PASS** and bit-exact determinism between Standard and `.uselib`.
+- **Major changes:**
+  1. **`INPparseTree` constant-folding & affine `ASRC` fast-path** (`inpptree.c`, `inpptree.h`, `asrc{defs.h,set,load,conv,del,par}.c`, `NGSPICE_OPT_GENERAL`):
+     - Added recursive finite-safe `PTsimplify()` before `PTdifferentiate()` in `INPgetTree()`, eliminating `0 * abs(v(11,21))` bloat in GF180 `ppolyf_u_1k` behavioral resistors and folding constant subexpressions.
+     - Added structural `INPtreeIsAffine()` detection (including `temper`-parameterized coefficients) with cached `(c0, g_i)` evaluation in `ASRCload` and `ASRCconvTest`, eliminating the `14.5%` `PTeval` hotspot completely.
+  2. **Stat-validated in-memory `.nglib` & `.lib` caches + transitive `.subckt`/`.model` filtering** (`nglib_cache.h`, `inpcom.c`, `NGSPICE_OPT_GENERAL`):
+     - Shared `NgDeckIndex` pre-indexes top-level `.subckt` spans (FNV-1a hash table) and `.model` base names once per cached library, validated on every hit via `stat()` `(st_dev, st_ino, st_size, mtime, compat_mask)` across the file and all transitive `.lib`/`.include` dependencies.
+     - Materializes only top-level cards + transitively referenced `.subckt`/`.model` entries via multi-anchor BFS (cutting GF180 PDK materialization from `5,757` cards to `~100` cards per op-amp), spliced after comment-stripping/continuation-stitching of the top-level netlist.
+     - Direct absolute-path `orig_path` lookup in `read_a_lib()` eliminates redundant `realpath()`/`readlink()` syscalls.
+  3. **Fast frontend string & I/O primitives** (`ngspice.h`, `stringutil.h`, `string.c`, `inpcom.c`, `inpgmod.c`, `NGSPICE_OPT_GENERAL`):
+     - Inline pure-ASCII `tolower_c`/`toupper_c`/`isspace_c`/`isdigit_c`/`isalpha_c`/`isalnum_c` and `extern inline` `ciprefix()`/`cieq()` eliminating glibc locale TLS overhead.
+     - Buffered `fgets()` + 1 KiB stack-buffer `readline()` replacing byte-by-byte `getc()` + `TREALLOC`; in-place `inp_remove_ws()`; fast `.` guard in `inp_cider_models()`; early-exit `parse_line()` in `inpgmod.c`.
+  4. **8-wide AVX-512 BSIM4v5/v6 DCOP/TRANOP fast path + deterministic packing + inline scalar Zen 4 `exp`/`log`** (`bsim4_avx512_core.h`, `bsim4_avx512_glue.h`, `b4v5ld.c`, `b4v6ld.c`, `NGSPICE_OPT_ZEN4`):
+     - Extended AVX-512 SoA evaluation and `convTestAvx` to `MODEDCOP`/`MODETRANOP` (`MODEINITJCT`, `MODEINITFIX`, `MODEINITFLOAT`), skipping the C-V charge/integration block (`dc_only`) while preserving all `CKTstate0[st+0..10, 27]` and `here->von` handoffs for `MODEINITSMSIG`/`MODEINITTRAN`.
+     - Fixed latent ASLR sensitivity in `cmpEligIdx` by sorting on `GENmodName` instead of raw model pointer address.
+     - Added inline scalar Zen 4 `b4_s_exp`/`b4_s_log` (`<= 2 ULP`, hardware `vscalefsd`/`vgetexpsd`/`vgetmantsd`) for scalar `MODEINITSMSIG`/`MODEINITTRAN` paths.
+  5. **Compact active-device dispatch, DCOP KLU `AxResConst`, & lazy-calibrated invariant-TSC `seconds()`** (`cktdefs.h`, `cktsetup.c`, `cktload.c`, `acan.c`, `resload.c`, `misc_time.c`):
+     - Compact `CKTactiveDevs[]` list avoids scanning 70 empty device slots per `CKTload`/`CKTacLoad`; enabled KLU `AxResConst` pre-baked resistor stamping during `MODEDCOP`/`MODETRANOP` (computing `REScurrent` only on `MODEINITSMSIG` where noise analysis reads it); removed dead duplicate `IFseconds()` in `CKTload`; lazy-calibrated invariant-TSC `seconds()` under `NGSPICE_OPT_ZEN4`.

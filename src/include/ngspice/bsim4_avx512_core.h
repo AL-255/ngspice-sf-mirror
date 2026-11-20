@@ -128,6 +128,62 @@ static inline v8d v8_exp_clamped(v8d x, double lo, double hi) {
     return v8_exp(v8_min(v8_max(x, v8_set1(lo)), v8_set1(hi)));
 }
 
+/*
+ * Inline IEEE-754 double scalar exp(x) & log(x) using Zen 4 AVX-512 scalar
+ * hardware instructions (vroundscalesd/vscalefsd/vgetexpsd/vgetmantsd).
+ * <= 2 ULP over normal BSIM4 range; falls back to libm for out-of-range/NaN.
+ */
+static inline double b4_s_exp(double x) {
+    if (__builtin_expect(!(x >= -700.0 && x <= 700.0), 0))
+        return (exp)(x);
+    __m128d vx = _mm_set_sd(x);
+    __m128d n = _mm_roundscale_sd(vx, _mm_mul_sd(vx, _mm_set_sd(1.44269504088896340736)),
+                                  _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+    double nd = _mm_cvtsd_f64(n);
+    double r = (x - nd * 6.93147180369123816490e-01) - nd * 1.90821492927058770002e-10;
+    double r2 = r * r;
+    double r4 = r2 * r2;
+    double r8 = r4 * r4;
+    double p01 = 1.0 + r;
+    double p23 = 0.5 + r * (1.0 / 6.0);
+    double p45 = (1.0 / 24.0) + r * (1.0 / 120.0);
+    double p67 = (1.0 / 720.0) + r * (1.0 / 5040.0);
+    double p89 = (1.0 / 40320.0) + r * (1.0 / 362880.0);
+    double pAB = (1.0 / 3628800.0) + r * (1.0 / 39916800.0);
+    double pCD = (1.0 / 479001600.0) + r * (1.0 / 6227020800.0);
+    double q0 = p01 + r2 * p23;
+    double q1 = p45 + r2 * p67;
+    double q2 = p89 + r2 * pAB;
+    double s0 = q0 + r4 * q1;
+    double s1 = q2 + r4 * pCD;
+    double poly = s0 + r8 * s1;
+    return _mm_cvtsd_f64(_mm_scalef_sd(_mm_set_sd(poly), n));
+}
+
+static inline double b4_s_log(double x) {
+    if (__builtin_expect(!(x >= 1.0e-300 && x <= 1.0e300), 0))
+        return (log)(x);
+    __m128d vx = _mm_set_sd(x);
+    double k = _mm_cvtsd_f64(_mm_getexp_sd(vx, vx));
+    double m = _mm_cvtsd_f64(_mm_getmant_sd(vx, vx, _MM_MANT_NORM_p75_1p5, _MM_MANT_SIGN_zero));
+    if (m < 1.0)
+        k += 1.0;
+    double u = (m - 1.0) / (m + 1.0);
+    double u2 = u * u;
+    double u4 = u2 * u2;
+    double u8 = u4 * u4;
+    double p0 = (2.0 / 3.0) + u2 * (2.0 / 5.0);
+    double p1 = (2.0 / 7.0) + u2 * (2.0 / 9.0);
+    double p2 = (2.0 / 11.0) + u2 * (2.0 / 13.0);
+    double p3 = (2.0 / 15.0) + u2 * (2.0 / 17.0);
+    double p4 = (2.0 / 19.0) + u2 * (2.0 / 21.0);
+    double q0 = p0 + u4 * p1;
+    double q1 = p2 + u4 * p3;
+    double poly = q0 + u8 * (q1 + u8 * p4);
+    double res = (k * 1.90821492927058770002e-10 + u * u2 * poly) + 2.0 * u;
+    return k * 6.93147180369123816490e-01 + res;
+}
+
 static inline v8d v8_log_pos(v8d x) {
     return v8_log(v8_max(x, v8_set1(1.0e-300)));
 }
@@ -807,7 +863,8 @@ bsim4_avx512_eval_block(
     const double * restrict s1,
     const double * restrict s2,
     BSIM4Avx512Out * restrict out,
-    int need_aos)
+    int need_aos,
+    int dc_only)
 {
     const v8d z0 = v8_set1(0.0);
     const v8d one = v8_set1(1.0);
@@ -1047,7 +1104,7 @@ bsim4_avx512_eval_block(
         dVth_dVb = v8_sel(b->m_dvtp0, dVth_dVb - dDITS_dVb, dVth_dVb);
     }
     dyn->von = Vth;
-    if (need_aos)
+    if (need_aos || dc_only)
         v8_store(out->von, Vth);
 
     /* ===================================================================== */
@@ -1870,6 +1927,12 @@ bsim4_avx512_eval_block(
     /* ===================================================================== */
     /* 9. Intrinsic C-V (capMod == 2, Charge-Thickness Model)                */
     /* ===================================================================== */
+    v8d Cggb = z0, Cgdb = z0, Cgsb = z0;
+    v8d Cdgb = z0, Cddb = z0, Cdsb = z0;
+    v8d Csgb = z0, Csdb = z0, Cssb = z0;
+    v8d Cbgb = z0, Cbdb = z0, Cbsb = z0;
+
+    if (!dc_only) {
     /* Note: if Vbseff < 0 -> VbseffCV = Vbseff, dVbseffCV_dVb = 1.0;
      *       else -> VbseffCV = phi - Phis = Vbseff, dVbseffCV_dVb = -(-1.0) = 1.0! */
     v8d VbseffCV = Vbseff;
@@ -2305,24 +2368,24 @@ bsim4_avx512_eval_block(
     v8d qsrc_tot  = v8_sel(m_fwd, qsrc_fwd, qsrc_rev);
 
     /* Unscaled (time-independent) terminal capacitances */
-    v8d Cggb = cggb + cgdo + cgso + b->cgbo;
-    v8d Cgdb = v8_sel(m_fwd, cgdb, cgsb) - cgdo;
-    v8d Cgsb = v8_sel(m_fwd, cgsb, cgdb) - cgso;
+    Cggb = cggb + cgdo + cgso + b->cgbo;
+    Cgdb = v8_sel(m_fwd, cgdb, cgsb) - cgdo;
+    Cgsb = v8_sel(m_fwd, cgsb, cgdb) - cgso;
 
     v8d cgg_bg_dg = cggb + cbgb + cdgb;
-    v8d Cdgb = v8_sel(m_fwd, cdgb - cgdo, -(cgg_bg_dg + cgdo));
-    v8d Csgb = v8_sel(m_fwd, -(cgg_bg_dg + cgso), cdgb - cgso);
-    v8d Cbgb = cbgb - b->cgbo;
+    Cdgb = v8_sel(m_fwd, cdgb - cgdo, -(cgg_bg_dg + cgdo));
+    Csgb = v8_sel(m_fwd, -(cgg_bg_dg + cgso), cdgb - cgso);
+    Cbgb = cbgb - b->cgbo;
 
     v8d c_sum_d = cgdb + cbdb + cddb;
     v8d c_sum_s = cgsb + cbsb + cdsb;
-    v8d Cddb = v8_sel(m_fwd, cddb + capbd + cgdo, capbd + cgdo - c_sum_s);
-    v8d Cdsb = v8_sel(m_fwd, cdsb, -c_sum_d);
-    v8d Csdb = v8_sel(m_fwd, -c_sum_d, cdsb);
-    v8d Cssb = v8_sel(m_fwd, capbs + cgso - c_sum_s, cddb + capbs + cgso);
+    Cddb = v8_sel(m_fwd, cddb + capbd + cgdo, capbd + cgdo - c_sum_s);
+    Cdsb = v8_sel(m_fwd, cdsb, -c_sum_d);
+    Csdb = v8_sel(m_fwd, -c_sum_d, cdsb);
+    Cssb = v8_sel(m_fwd, capbs + cgso - c_sum_s, cddb + capbs + cgso);
 
-    v8d Cbdb = v8_sel(m_fwd, cbdb, cbsb) - capbd;
-    v8d Cbsb = v8_sel(m_fwd, cbsb, cbdb) - capbs;
+    Cbdb = v8_sel(m_fwd, cbdb, cbsb) - capbd;
+    Cbsb = v8_sel(m_fwd, cbsb, cbdb) - capbs;
 
     /* ===================================================================== */
     /* 12. Cache Time-Independent Physics (DC + C + Charges) in dyn          */
@@ -2353,6 +2416,25 @@ bsim4_avx512_eval_block(
             s0[st + 21] = a_qbd[lane];
             s0[st + 27] = 0.0;              /* qdef */
             s0[st + 28] = a_qs[lane];
+        }
+    }
+    } else {
+        v8_store(dyn->a_vds, vds); v8_store(dyn->a_vgs, vgs);
+        v8_store(dyn->a_vbs, vbs); v8_store(dyn->a_vbd, vbd);
+        for (int lane = 0; lane < b->n_active; lane++) {
+            int st = b->stateBase[lane];
+            s0[st + 0]  = dyn->a_vbd[lane];
+            s0[st + 1]  = dyn->a_vbs[lane];
+            s0[st + 2]  = dyn->a_vgs[lane];
+            s0[st + 3]  = dyn->a_vds[lane];
+            s0[st + 4]  = dyn->a_vbs[lane]; /* vdbs */
+            s0[st + 5]  = dyn->a_vbd[lane]; /* vdbd */
+            s0[st + 6]  = dyn->a_vbs[lane]; /* vsbs */
+            s0[st + 7]  = dyn->a_vgs[lane]; /* vges */
+            s0[st + 8]  = dyn->a_vgs[lane]; /* vgms */
+            s0[st + 9]  = 0.0;              /* vses */
+            s0[st + 10] = dyn->a_vds[lane]; /* vdes */
+            s0[st + 27] = 0.0;              /* qdef */
         }
     }
 
@@ -2414,15 +2496,38 @@ bsim4_avx512_eval_block(
     dyn->mdc_rhsb = vm * (ceqbd + ceqbs - ceqjd - ceqjs);
     dyn->mdc_rhss = vm * (ceqdrn - ceqbs + ceqjs);
 
-    dyn->q_lin_g = -Cggb * vgb + Cgdb * vbd + Cgsb * vbs;
-    dyn->q_lin_d = -Cdgb * vgb + Cddb * vbd + Cdsb * vbs;
-    dyn->q_lin_b = -Cbgb * vgb + Cbdb * vbd + Cbsb * vbs;
+    if (!dc_only) {
+        dyn->q_lin_g = -Cggb * vgb + Cgdb * vbd + Cgsb * vbs;
+        dyn->q_lin_d = -Cdgb * vgb + Cddb * vbd + Cdsb * vbs;
+        dyn->q_lin_b = -Cbgb * vgb + Cbdb * vbd + Cbsb * vbs;
 
-    /* ===================================================================== */
-    /* 13. Integrate Charges & Assemble Matrix/RHS Stamps in dyn->st_*       */
-    /* ===================================================================== */
-    bsim4_avx512_integrate_and_assemble(b, dyn, vds, vgs, vbs, 0,
-                                        ag0, ag1, ag2, is_gear2, is_trap2, s0, s1, s2);
+        /* ===================================================================== */
+        /* 13. Integrate Charges & Assemble Matrix/RHS Stamps in dyn->st_*       */
+        /* ===================================================================== */
+        bsim4_avx512_integrate_and_assemble(b, dyn, vds, vgs, vbs, 0,
+                                            ag0, ag1, ag2, is_gear2, is_trap2, s0, s1, s2);
+    } else {
+        v8_store(dyn->st_rhsd, dyn->mdc_rhsd);
+        v8_store(dyn->st_rhsg, z0);
+        v8_store(dyn->st_rhsb, dyn->mdc_rhsb);
+        v8_store(dyn->st_rhss, dyn->mdc_rhss);
+        v8_store(dyn->st_v34, z0);
+        v8_store(dyn->st_v35, z0);
+        v8_store(dyn->st_v36, z0);
+        v8_store(dyn->st_v37, z0);
+        v8_store(dyn->st_v44, dyn->mdc44);
+        v8_store(dyn->st_v46, dyn->mdc46);
+        v8_store(dyn->st_v47, dyn->mdc47);
+        v8_store(dyn->st_v48, dyn->mdc48);
+        v8_store(dyn->st_v51, dyn->mdc51);
+        v8_store(dyn->st_v52, dyn->mdc52);
+        v8_store(dyn->st_v53, dyn->mdc53);
+        v8_store(dyn->st_v55, dyn->mdc55);
+        v8_store(dyn->st_v58, dyn->mdc58);
+        v8_store(dyn->st_v59, dyn->mdc59);
+        v8_store(dyn->st_v60, dyn->mdc60);
+        v8_store(dyn->st_v61, dyn->mdc61);
+    }
 
     /* Pre-assemble compact SoA convTest coefficients in dyn (exact match to b4v*cvtest.c) */
     {

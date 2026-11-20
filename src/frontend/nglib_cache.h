@@ -22,6 +22,9 @@
 #include <string.h>
 #include <ctype.h>
 #include <time.h>
+#if NGSPICE_OPT_GENERAL
+#include <sys/stat.h>
+#endif
 #include "subckt.h"
 
 static double
@@ -838,9 +841,791 @@ nglib_precompile(const char *in_file, const char *out_file)
     return 0;
 }
 
+#if NGSPICE_OPT_GENERAL
+/*
+ * Stat-validated in-memory deck index & filtered splicer shared by both
+ * .uselib (.nglib blobs) and persistent .lib section caches.
+ */
+typedef struct {
+    char     *name;       /* lowercased subckt name */
+    uint32_t  hash;
+    uint32_t  start;      /* inclusive .subckt card index */
+    uint32_t  end;        /* inclusive .ends card index */
+    int       next_same;  /* next subckt with same name, or -1 */
+} NgSubcktSpan;
+
+typedef struct {
+    char     *name;       /* lowercased full model name */
+    uint32_t  name_hash;
+    char     *base;       /* lowercased prefix before last '.', or NULL */
+    uint32_t  base_hash;
+    uint32_t  card_idx;
+} NgModelSpan;
+
+typedef struct NgDeckIndex {
+    uint32_t      num_cards;
+    char         *payload;        /* contiguous NUL-terminated strings */
+    uint64_t      total_str_bytes;
+    uint32_t     *lens;
+    uint64_t     *offsets;
+    int          *linenum_orig;
+    int           index_valid;    /* 1 if clean top-level .subckt/.ends, no .if/.control/.macro */
+    int           has_ako;        /* 1 if any top-level .model references ako: */
+    uint8_t      *card_kind;      /* 0=top, 1=subckt, 2=top-.model, 3=comment */
+    int          *card_aux_id;    /* subckt_id for .subckt start, model_id for .model, else -1 */
+    NgSubcktSpan *subckts;
+    int           num_subckts;
+    int          *sub_buckets;    /* power-of-2 hash table -> subckt index or -1 */
+    int           sub_hash_mask;
+    NgModelSpan  *models;
+    int           num_models;
+} NgDeckIndex;
+
+static inline uint32_t
+ng_fnv1a_lower(const char *s, size_t len)
+{
+    uint32_t h = 2166136261u;
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if ((unsigned)(c - 'A') < 26u) c |= 0x20u;
+        h ^= (uint32_t)c;
+        h *= 16777619u;
+    }
+    return h;
+}
+
+static inline int
+ng_is_tok_delim(unsigned char c)
+{
+    return c <= ' ' || c == '=' || c == '(' || c == ')' || c == ',' ||
+           c == '\'' || c == '"' || c == '{' || c == '}';
+}
+
+static int
+ng_line_has_ako(const char *s)
+{
+    for (; *s; s++) {
+        if ((s[0] == 'a' || s[0] == 'A') &&
+            (s[1] == 'k' || s[1] == 'K') &&
+            (s[2] == 'o' || s[2] == 'O') &&
+            s[3] == ':')
+            return 1;
+    }
+    return 0;
+}
+
+static void
+ng_deck_index_free(NgDeckIndex *idx)
+{
+    if (!idx) return;
+    FREE(idx->payload);
+    FREE(idx->lens);
+    FREE(idx->offsets);
+    FREE(idx->linenum_orig);
+    FREE(idx->card_kind);
+    FREE(idx->card_aux_id);
+    if (idx->subckts) {
+        for (int i = 0; i < idx->num_subckts; i++)
+            tfree(idx->subckts[i].name);
+        FREE(idx->subckts);
+    }
+    FREE(idx->sub_buckets);
+    if (idx->models) {
+        for (int i = 0; i < idx->num_models; i++) {
+            tfree(idx->models[i].name);
+            tfree(idx->models[i].base);
+        }
+        FREE(idx->models);
+    }
+    memset(idx, 0, sizeof(*idx));
+}
+
+static void
+ng_deck_index_build(NgDeckIndex *idx)
+{
+    uint32_t n = idx->num_cards;
+    idx->index_valid = 1;
+    idx->has_ako = 0;
+    idx->num_subckts = 0;
+    idx->num_models = 0;
+    if (n == 0)
+        return;
+
+    idx->card_kind = TMALLOC(uint8_t, n);
+    idx->card_aux_id = TMALLOC(int, n);
+    for (uint32_t i = 0; i < n; i++) {
+        idx->card_kind[i] = 0;
+        idx->card_aux_id[i] = -1;
+    }
+
+    int sub_cap = 64, mod_cap = 64;
+    idx->subckts = TMALLOC(NgSubcktSpan, sub_cap);
+    idx->models = TMALLOC(NgModelSpan, mod_cap);
+
+    int sub_depth = 0;
+    int cur_sub = -1;
+
+    for (uint32_t i = 0; i < n; i++) {
+        const char *s = idx->payload + idx->offsets[i];
+        while (*s == ' ' || *s == '\t') s++;
+        if (*s == '\0' || *s == '*') {
+            idx->card_kind[i] = (sub_depth > 0) ? 1 : 3;
+            continue;
+        }
+        if (*s == '.') {
+            if ((ciprefix(".if", s) && (s[3] <= ' ' || s[3] == '(')) ||
+                (ciprefix(".elseif", s) && (s[7] <= ' ' || s[7] == '(')) ||
+                (ciprefix(".else", s) && s[5] <= ' ') ||
+                (ciprefix(".endif", s) && s[6] <= ' ') ||
+                (ciprefix(".control", s) && s[8] <= ' ') ||
+                (ciprefix(".endc", s) && s[5] <= ' ') ||
+                (ciprefix(".macro", s) && s[6] <= ' ') ||
+                (ciprefix(".eom", s) && s[4] <= ' '))
+            {
+                idx->index_valid = 0;
+                break;
+            }
+            if (ciprefix(".subckt", s) && (s[7] == ' ' || s[7] == '\t')) {
+                if (sub_depth == 0) {
+                    const char *p = s + 7;
+                    while (*p == ' ' || *p == '\t') p++;
+                    const char *pe = p;
+                    while (*pe && !ng_is_tok_delim((unsigned char)*pe)) pe++;
+                    if (pe == p) {
+                        idx->index_valid = 0;
+                        break;
+                    }
+                    if (idx->num_subckts >= sub_cap) {
+                        sub_cap *= 2;
+                        idx->subckts = TREALLOC(NgSubcktSpan, idx->subckts, sub_cap);
+                    }
+                    size_t nl = (size_t)(pe - p);
+                    char *nm = TMALLOC(char, nl + 1);
+                    for (size_t k = 0; k < nl; k++) nm[k] = tolower_c(p[k]);
+                    nm[nl] = '\0';
+                    cur_sub = idx->num_subckts++;
+                    idx->subckts[cur_sub].name = nm;
+                    idx->subckts[cur_sub].hash = ng_fnv1a_lower(nm, nl);
+                    idx->subckts[cur_sub].start = i;
+                    idx->subckts[cur_sub].end = i;
+                    idx->subckts[cur_sub].next_same = -1;
+                    idx->card_aux_id[i] = cur_sub;
+                }
+                sub_depth++;
+                idx->card_kind[i] = 1;
+                continue;
+            }
+            if (ciprefix(".ends", s) && (s[5] == '\0' || s[5] <= ' ')) {
+                if (sub_depth <= 0) {
+                    idx->index_valid = 0;
+                    break;
+                }
+                idx->card_kind[i] = 1;
+                sub_depth--;
+                if (sub_depth == 0) {
+                    idx->subckts[cur_sub].end = i;
+                    cur_sub = -1;
+                }
+                continue;
+            }
+            if (sub_depth == 0 && ciprefix(".model", s) && (s[6] == ' ' || s[6] == '\t')) {
+                if (ng_line_has_ako(s + 6))
+                    idx->has_ako = 1;
+                const char *p = s + 6;
+                while (*p == ' ' || *p == '\t') p++;
+                const char *pe = p;
+                while (*pe && !ng_is_tok_delim((unsigned char)*pe)) pe++;
+                if (pe > p) {
+                    if (idx->num_models >= mod_cap) {
+                        mod_cap *= 2;
+                        idx->models = TREALLOC(NgModelSpan, idx->models, mod_cap);
+                    }
+                    size_t nl = (size_t)(pe - p);
+                    char *nm = TMALLOC(char, nl + 1);
+                    for (size_t k = 0; k < nl; k++) nm[k] = tolower_c(p[k]);
+                    nm[nl] = '\0';
+                    char *dot = strrchr(nm, '.');
+                    char *base = NULL;
+                    uint32_t bh = 0;
+                    if (dot && dot > nm) {
+                        size_t bl = (size_t)(dot - nm);
+                        base = TMALLOC(char, bl + 1);
+                        memcpy(base, nm, bl);
+                        base[bl] = '\0';
+                        bh = ng_fnv1a_lower(base, bl);
+                    }
+                    int mid = idx->num_models++;
+                    idx->models[mid].name = nm;
+                    idx->models[mid].name_hash = ng_fnv1a_lower(nm, nl);
+                    idx->models[mid].base = base;
+                    idx->models[mid].base_hash = bh;
+                    idx->models[mid].card_idx = i;
+                    idx->card_kind[i] = 2;
+                    idx->card_aux_id[i] = mid;
+                    continue;
+                }
+            }
+        }
+        idx->card_kind[i] = (sub_depth > 0) ? 1 : 0;
+    }
+
+    if (sub_depth != 0)
+        idx->index_valid = 0;
+
+    if (idx->index_valid && idx->num_subckts > 0) {
+        int hcap = 64;
+        while (hcap < idx->num_subckts * 2) hcap *= 2;
+        idx->sub_hash_mask = hcap - 1;
+        idx->sub_buckets = TMALLOC(int, hcap);
+        for (int b = 0; b < hcap; b++) idx->sub_buckets[b] = -1;
+        for (int si = 0; si < idx->num_subckts; si++) {
+            uint32_t h = idx->subckts[si].hash;
+            int slot = (int)(h & (uint32_t)idx->sub_hash_mask);
+            while (idx->sub_buckets[slot] != -1) {
+                int existing = idx->sub_buckets[slot];
+                if (idx->subckts[existing].hash == h &&
+                    strcmp(idx->subckts[existing].name, idx->subckts[si].name) == 0)
+                {
+                    idx->subckts[si].next_same = idx->subckts[existing].next_same;
+                    idx->subckts[existing].next_same = si;
+                    goto inserted;
+                }
+                slot = (slot + 1) & idx->sub_hash_mask;
+            }
+            idx->sub_buckets[slot] = si;
+        inserted:
+            ;
+        }
+    }
+}
+
+static inline int
+ng_deck_index_find_subckt(const NgDeckIndex *idx, const char *name_lower, uint32_t h)
+{
+    if (!idx->sub_buckets) return -1;
+    int slot = (int)(h & (uint32_t)idx->sub_hash_mask);
+    while (idx->sub_buckets[slot] != -1) {
+        int si = idx->sub_buckets[slot];
+        if (idx->subckts[si].hash == h && strcmp(idx->subckts[si].name, name_lower) == 0)
+            return si;
+        slot = (slot + 1) & idx->sub_hash_mask;
+    }
+    return -1;
+}
+
+typedef struct {
+    uint32_t  *key_offs;   /* offset + 1 into arena; 0 = empty */
+    uint32_t  *hashes;
+    int        cap;
+    int        count;
+    char      *arena;
+    size_t     arena_used;
+    size_t     arena_cap;
+} NgTokSet;
+
+static void
+ng_tokset_init(NgTokSet *ts)
+{
+    ts->cap = 512;
+    ts->count = 0;
+    ts->key_offs = TMALLOC(uint32_t, ts->cap);
+    memset(ts->key_offs, 0, (size_t)ts->cap * sizeof(uint32_t));
+    ts->hashes = TMALLOC(uint32_t, ts->cap);
+    ts->arena_cap = 16384;
+    ts->arena_used = 0;
+    ts->arena = TMALLOC(char, ts->arena_cap);
+}
+
+static void
+ng_tokset_free(NgTokSet *ts)
+{
+    FREE(ts->key_offs);
+    FREE(ts->hashes);
+    FREE(ts->arena);
+}
+
+static inline int
+ng_tokset_has(const NgTokSet *ts, const char *tok, uint32_t h)
+{
+    int mask = ts->cap - 1;
+    int slot = (int)(h & (uint32_t)mask);
+    while (ts->key_offs[slot] != 0) {
+        if (ts->hashes[slot] == h &&
+            strcmp(ts->arena + (ts->key_offs[slot] - 1), tok) == 0)
+            return 1;
+        slot = (slot + 1) & mask;
+    }
+    return 0;
+}
+
+static int
+ng_tokset_add(NgTokSet *ts, const char *tok, size_t len, uint32_t h)
+{
+    if (ts->count * 2 >= ts->cap) {
+        int new_cap = ts->cap * 2;
+        int new_mask = new_cap - 1;
+        uint32_t *noffs = TMALLOC(uint32_t, new_cap);
+        memset(noffs, 0, (size_t)new_cap * sizeof(uint32_t));
+        uint32_t *nhashes = TMALLOC(uint32_t, new_cap);
+        for (int i = 0; i < ts->cap; i++) {
+            if (ts->key_offs[i] != 0) {
+                int sl = (int)(ts->hashes[i] & (uint32_t)new_mask);
+                while (noffs[sl] != 0) sl = (sl + 1) & new_mask;
+                noffs[sl] = ts->key_offs[i];
+                nhashes[sl] = ts->hashes[i];
+            }
+        }
+        FREE(ts->key_offs);
+        FREE(ts->hashes);
+        ts->key_offs = noffs;
+        ts->hashes = nhashes;
+        ts->cap = new_cap;
+    }
+    int mask = ts->cap - 1;
+    int slot = (int)(h & (uint32_t)mask);
+    while (ts->key_offs[slot] != 0) {
+        if (ts->hashes[slot] == h &&
+            strcmp(ts->arena + (ts->key_offs[slot] - 1), tok) == 0)
+            return 0;
+        slot = (slot + 1) & mask;
+    }
+    if (ts->arena_used + len + 1 > ts->arena_cap) {
+        size_t new_acap = ts->arena_cap * 2;
+        while (new_acap < ts->arena_used + len + 1) new_acap *= 2;
+        ts->arena = TREALLOC(char, ts->arena, new_acap);
+        ts->arena_cap = new_acap;
+    }
+    uint32_t off = (uint32_t)ts->arena_used;
+    memcpy(ts->arena + off, tok, len + 1);
+    ts->arena_used += len + 1;
+    ts->key_offs[slot] = off + 1;
+    ts->hashes[slot] = h;
+    ts->count++;
+    return 1;
+}
+
+typedef struct {
+    int k;
+    int si;
+} NgBfsItem;
+
+static void
+ng_scan_line_tokens_bfs(const char *line, NgTokSet *ts,
+                        int n_anchors, const NgDeckIndex * const *indices,
+                        uint8_t **used,
+                        NgBfsItem **q, int *q_tail, int *q_cap)
+{
+    const char *p = line;
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p == '\0' || *p == '*')
+        return;
+
+    char buf[128];
+    while (*p) {
+        while (*p && ng_is_tok_delim((unsigned char)*p)) p++;
+        if (!*p) break;
+        const char *start = p;
+        while (*p && !ng_is_tok_delim((unsigned char)*p)) p++;
+        size_t len = (size_t)(p - start);
+        if (len == 0 || len >= sizeof(buf))
+            continue;
+        /* Skip pure numeric literals quickly */
+        if (isdigit_c(start[0]))
+            continue;
+        for (size_t i = 0; i < len; i++)
+            buf[i] = tolower_c(start[i]);
+        buf[len] = '\0';
+        uint32_t h = ng_fnv1a_lower(buf, len);
+        if (ng_tokset_add(ts, buf, len, h)) {
+            for (int k = 0; k < n_anchors; k++) {
+                int si = ng_deck_index_find_subckt(indices[k], buf, h);
+                while (si >= 0) {
+                    if (!used[k][si]) {
+                        used[k][si] = 1;
+                        if (*q_tail >= *q_cap) {
+                            *q_cap = (*q_cap == 0) ? 64 : (*q_cap * 2);
+                            *q = TREALLOC(NgBfsItem, *q, *q_cap);
+                        }
+                        (*q)[(*q_tail)++] = (NgBfsItem){ k, si };
+                    }
+                    si = indices[k]->subckts[si].next_same;
+                }
+            }
+        }
+    }
+}
+
+static inline struct card *
+ng_materialize_one_card(const NgDeckIndex *idx, uint32_t i,
+                        char *src_tag, int *lnum)
+{
+    uint32_t sl = idx->lens[i];
+    struct card *c = TMALLOC(struct card, 1);
+    c->linenum = (*lnum)++;
+    c->linenum_orig = idx->linenum_orig ? idx->linenum_orig[i] : ((int)i + 1);
+    c->linesource = src_tag;
+    c->line = TMALLOC(char, (size_t)sl + 1);
+    memcpy(c->line, idx->payload + idx->offsets[i], (size_t)sl + 1);
+    c->error = NULL;
+    c->nextcard = NULL;
+    c->actualLine = NULL;
+    c->compmod = 0;
+    return c;
+}
+
+static void
+ng_deck_index_splice_multi(struct card *deck_root,
+                           int n_anchors,
+                           struct card **anchors,
+                           const NgDeckIndex * const *indices,
+                           char **src_tags,
+                           int *line_num_io,
+                           int allow_filter)
+{
+    if (n_anchors <= 0)
+        return;
+
+    int can_filter = (allow_filter && !nglib_precompiling && deck_root != NULL);
+    for (int k = 0; k < n_anchors && can_filter; k++) {
+        if (!indices[k] || !indices[k]->index_valid)
+            can_filter = 0;
+    }
+    if (can_filter) {
+        for (struct card *c = deck_root; c; c = c->nextcard) {
+            const char *s = c->line;
+            while (*s == ' ' || *s == '\t') s++;
+            if (ciprefix(".if", s) && (s[3] <= ' ' || s[3] == '(')) {
+                can_filter = 0;
+                break;
+            }
+        }
+    }
+
+    NgTokSet ts;
+    uint8_t **used = NULL;
+    NgBfsItem *q = NULL;
+    int q_head = 0, q_tail = 0, q_cap = 0;
+
+    if (can_filter) {
+        ng_tokset_init(&ts);
+        used = TMALLOC(uint8_t *, n_anchors);
+        for (int k = 0; k < n_anchors; k++) {
+            int ns = indices[k]->num_subckts;
+            used[k] = TMALLOC(uint8_t, ns > 0 ? ns : 1);
+            memset(used[k], 0, (size_t)(ns > 0 ? ns : 1));
+        }
+
+        /* Seed from all non-comment lines in the user deck */
+        for (struct card *c = deck_root; c; c = c->nextcard) {
+            ng_scan_line_tokens_bfs(c->line, &ts, n_anchors, indices, used,
+                                    &q, &q_tail, &q_cap);
+        }
+
+        /* Also seed from any top-level non-param/non-option lines inside libraries */
+        for (int k = 0; k < n_anchors; k++) {
+            const NgDeckIndex *idx = indices[k];
+            for (uint32_t i = 0; i < idx->num_cards; i++) {
+                if (idx->card_kind[i] == 0) {
+                    const char *s = idx->payload + idx->offsets[i];
+                    while (*s == ' ' || *s == '\t') s++;
+                    if (*s != '.') {
+                        ng_scan_line_tokens_bfs(s, &ts, n_anchors, indices, used,
+                                                &q, &q_tail, &q_cap);
+                    }
+                }
+            }
+        }
+
+        /* Transitive BFS over reachable subckts across all library anchors */
+        while (q_head < q_tail) {
+            NgBfsItem it = q[q_head++];
+            const NgDeckIndex *idx = indices[it.k];
+            const NgSubcktSpan *sub = &idx->subckts[it.si];
+            for (uint32_t j = sub->start + 1; j < sub->end; j++) {
+                ng_scan_line_tokens_bfs(idx->payload + idx->offsets[j], &ts,
+                                        n_anchors, indices, used,
+                                        &q, &q_tail, &q_cap);
+            }
+        }
+    }
+
+    int lnum = line_num_io ? *line_num_io : 1;
+    for (int k = 0; k < n_anchors; k++) {
+        const NgDeckIndex *idx = indices[k];
+        if (!idx || idx->num_cards == 0 || !anchors[k])
+            continue;
+        struct card *head = NULL, *tail = NULL;
+        for (uint32_t i = 0; i < idx->num_cards; i++) {
+            if (!can_filter) {
+                struct card *nc = ng_materialize_one_card(idx, i, src_tags[k], &lnum);
+                if (tail) tail->nextcard = nc; else head = nc;
+                tail = nc;
+            } else {
+                uint8_t kind = idx->card_kind[i];
+                if (kind == 3)
+                    continue;
+                if (kind == 0) {
+                    struct card *nc = ng_materialize_one_card(idx, i, src_tags[k], &lnum);
+                    if (tail) tail->nextcard = nc; else head = nc;
+                    tail = nc;
+                } else if (kind == 2) {
+                    int mid = idx->card_aux_id[i];
+                    const NgModelSpan *m = &idx->models[mid];
+                    if (idx->has_ako ||
+                        ng_tokset_has(&ts, m->name, m->name_hash) ||
+                        (m->base && ng_tokset_has(&ts, m->base, m->base_hash)))
+                    {
+                        struct card *nc = ng_materialize_one_card(idx, i, src_tags[k], &lnum);
+                        if (tail) tail->nextcard = nc; else head = nc;
+                        tail = nc;
+                    }
+                } else if (kind == 1) {
+                    int si = idx->card_aux_id[i];
+                    if (si >= 0) {
+                        const NgSubcktSpan *sub = &idx->subckts[si];
+                        if (used[k][si]) {
+                            for (uint32_t j = sub->start; j <= sub->end; j++) {
+                                struct card *nc = ng_materialize_one_card(idx, j, src_tags[k], &lnum);
+                                if (tail) tail->nextcard = nc; else head = nc;
+                                tail = nc;
+                            }
+                        }
+                        i = sub->end;
+                    }
+                }
+            }
+        }
+        if (head) {
+            tail->nextcard = anchors[k]->nextcard;
+            anchors[k]->nextcard = head;
+        }
+    }
+
+    if (line_num_io)
+        *line_num_io = lnum;
+
+    if (can_filter) {
+        ng_tokset_free(&ts);
+        for (int k = 0; k < n_anchors; k++)
+            FREE(used[k]);
+        FREE(used);
+        FREE(q);
+    }
+}
+
+static void
+ng_deck_index_build_from_cards(NgDeckIndex *idx, struct card *first, struct card *stop_excl)
+{
+    memset(idx, 0, sizeof(*idx));
+    uint32_t n = 0;
+    uint64_t total_bytes = 0;
+    for (struct card *c = first; c && c != stop_excl; c = c->nextcard) {
+        n++;
+        total_bytes += (uint64_t)strlen(c->line) + 1;
+    }
+    if (n == 0)
+        return;
+
+    idx->num_cards = n;
+    idx->total_str_bytes = total_bytes;
+    idx->payload = TMALLOC(char, (size_t)total_bytes + 1);
+    idx->lens = TMALLOC(uint32_t, n);
+    idx->offsets = TMALLOC(uint64_t, n);
+    idx->linenum_orig = TMALLOC(int, n);
+
+    uint32_t i = 0;
+    uint64_t off = 0;
+    for (struct card *c = first; c && c != stop_excl; c = c->nextcard) {
+        uint32_t sl = (uint32_t)strlen(c->line);
+        idx->lens[i] = sl;
+        idx->offsets[i] = off;
+        idx->linenum_orig[i] = c->linenum_orig;
+        memcpy(idx->payload + off, c->line, (size_t)sl + 1);
+        off += (uint64_t)sl + 1;
+        i++;
+    }
+    idx->payload[total_bytes] = '\0';
+    ng_deck_index_build(idx);
+}
+
+static struct NgDeckIndex *
+ng_deck_index_create_from_cards(struct card *first, struct card *stop_excl)
+{
+    NgDeckIndex *idx = TMALLOC(NgDeckIndex, 1);
+    ng_deck_index_build_from_cards(idx, first, stop_excl);
+    return idx;
+}
+
+static void
+ng_deck_index_destroy(struct NgDeckIndex *idx)
+{
+    if (!idx) return;
+    ng_deck_index_free(idx);
+    tfree(idx);
+}
+
+#define NGLIB_MEM_CACHE_MAX 16
+
+typedef struct {
+    char         *path;
+    dev_t         st_dev;
+    ino_t         st_ino;
+    off_t         st_size;
+    time_t        mtime_sec;
+    long          mtime_nsec;
+    uint32_t      compat_mask;
+    NgDeckIndex   idx;
+} NglibMemSlot;
+
+static NglibMemSlot nglib_mem_cache[NGLIB_MEM_CACHE_MAX];
+static int nglib_mem_count = 0;
+
+static void
+nglib_get_stat_mtime(const struct stat *st, time_t *sec, long *nsec)
+{
+#if defined(__linux__)
+    *sec = st->st_mtim.tv_sec;
+    *nsec = st->st_mtim.tv_nsec;
+#else
+    *sec = st->st_mtime;
+    *nsec = 0;
+#endif
+}
+
+static const NgDeckIndex *
+nglib_get_cached_index(const char *blob_path)
+{
+    struct stat st;
+    if (stat(blob_path, &st) != 0) {
+        fprintf(cp_err, "Error: .uselib cannot open precompiled library '%s'\n", blob_path);
+        return NULL;
+    }
+    time_t ms; long mn;
+    nglib_get_stat_mtime(&st, &ms, &mn);
+    uint32_t cur_mask = nglib_current_compat_mask();
+
+    for (int i = 0; i < nglib_mem_count; i++) {
+        NglibMemSlot *s = &nglib_mem_cache[i];
+        if (s->path && strcmp(s->path, blob_path) == 0) {
+            if (s->st_dev == st.st_dev && s->st_ino == st.st_ino &&
+                s->st_size == st.st_size && s->mtime_sec == ms &&
+                s->mtime_nsec == mn && s->compat_mask == cur_mask)
+            {
+                return &s->idx;
+            }
+            /* Stale entry: free and reload into this slot */
+            tfree(s->path);
+            ng_deck_index_free(&s->idx);
+            memmove(&nglib_mem_cache[i], &nglib_mem_cache[i + 1],
+                    (size_t)(nglib_mem_count - i - 1) * sizeof(NglibMemSlot));
+            nglib_mem_count--;
+            break;
+        }
+    }
+
+    FILE *fi = fopen(blob_path, "rb");
+    if (!fi) {
+        fprintf(cp_err, "Error: .uselib cannot open precompiled library '%s'\n", blob_path);
+        return NULL;
+    }
+
+    NglibHeader hdr;
+    if (fread(&hdr, sizeof(hdr), 1, fi) != 1 ||
+        memcmp(hdr.magic, NGLIB_MAGIC, NGLIB_MAGIC_LEN) != 0 ||
+        hdr.version != NGLIB_VERSION)
+    {
+        fprintf(cp_err, "Error: '%s' is not a valid NGLIB001 precompiled library\n", blob_path);
+        fclose(fi);
+        return NULL;
+    }
+
+    if (hdr.compat_mask != cur_mask) {
+        fprintf(cp_err,
+                "Warning: .uselib '%s' compat mask (0x%x) differs from current mode (0x%x)\n",
+                blob_path, hdr.compat_mask, cur_mask);
+    }
+
+    if (hdr.num_cards == 0) {
+        fclose(fi);
+        return NULL;
+    }
+
+    uint32_t *lens = TMALLOC(uint32_t, hdr.num_cards);
+    char *payload = TMALLOC(char, (size_t)hdr.total_str_bytes + 1);
+    if (fread(lens, sizeof(uint32_t), hdr.num_cards, fi) != hdr.num_cards ||
+        fread(payload, 1, (size_t)hdr.total_str_bytes, fi) != (size_t)hdr.total_str_bytes)
+    {
+        fprintf(cp_err, "Error: truncated precompiled library '%s'\n", blob_path);
+        FREE(lens);
+        FREE(payload);
+        fclose(fi);
+        return NULL;
+    }
+    fclose(fi);
+    payload[hdr.total_str_bytes] = '\0';
+
+    uint64_t *offsets = TMALLOC(uint64_t, hdr.num_cards);
+    uint64_t off = 0;
+    for (uint32_t i = 0; i < hdr.num_cards; i++) {
+        uint32_t sl = lens[i];
+        if (off + sl + 1 > hdr.total_str_bytes) {
+            fprintf(cp_err, "Error: corrupt precompiled library '%s'\n", blob_path);
+            FREE(offsets);
+            FREE(lens);
+            FREE(payload);
+            return NULL;
+        }
+        offsets[i] = off;
+        off += (uint64_t)sl + 1;
+    }
+
+    if (nglib_mem_count >= NGLIB_MEM_CACHE_MAX) {
+        tfree(nglib_mem_cache[0].path);
+        ng_deck_index_free(&nglib_mem_cache[0].idx);
+        memmove(&nglib_mem_cache[0], &nglib_mem_cache[1],
+                (size_t)(NGLIB_MEM_CACHE_MAX - 1) * sizeof(NglibMemSlot));
+        nglib_mem_count--;
+    }
+
+    NglibMemSlot *slot = &nglib_mem_cache[nglib_mem_count++];
+    memset(slot, 0, sizeof(*slot));
+    slot->path = copy(blob_path);
+    slot->st_dev = st.st_dev;
+    slot->st_ino = st.st_ino;
+    slot->st_size = st.st_size;
+    slot->mtime_sec = ms;
+    slot->mtime_nsec = mn;
+    slot->compat_mask = cur_mask;
+    slot->idx.num_cards = hdr.num_cards;
+    slot->idx.payload = payload;
+    slot->idx.total_str_bytes = hdr.total_str_bytes;
+    slot->idx.lens = lens;
+    slot->idx.offsets = offsets;
+    slot->idx.linenum_orig = NULL;
+    ng_deck_index_build(&slot->idx);
+
+    return &slot->idx;
+}
+#endif /* NGSPICE_OPT_GENERAL */
+
 struct card *
 nglib_load_blob(const char *blob_path, int *line_num_io)
 {
+#if NGSPICE_OPT_GENERAL
+    const NgDeckIndex *idx = nglib_get_cached_index(blob_path);
+    if (!idx)
+        return NULL;
+    struct card *head = NULL, *tail = NULL;
+    int lnum = line_num_io ? *line_num_io : 1;
+    for (uint32_t i = 0; i < idx->num_cards; i++) {
+        struct card *c = ng_materialize_one_card(idx, i, NULL, &lnum);
+        if (tail) tail->nextcard = c; else head = c;
+        tail = c;
+    }
+    if (line_num_io)
+        *line_num_io = lnum;
+    return head;
+#else
     FILE *fi = fopen(blob_path, "rb");
     if (!fi) {
         fprintf(cp_err, "Error: .uselib cannot open precompiled library '%s'\n", blob_path);
@@ -917,6 +1702,7 @@ nglib_load_blob(const char *blob_path, int *line_num_io)
     FREE(lens);
     FREE(payload);
     return head;
+#endif
 }
 
 void
