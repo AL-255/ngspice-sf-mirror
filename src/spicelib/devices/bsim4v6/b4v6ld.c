@@ -115,6 +115,8 @@ static inline int BSIM4v6polyDepletion(double phi, double ngate,double epsgate, 
 #include "ngspice/bsim4_avx512_glue.h"
 #undef B4P
 #undef B4_IS_V6
+#define exp(x) b4_s_exp(x)
+#define log(x) b4_s_log(x)
 #elif NGSPICE_OPT_APPLE
 #define B4P(x) BSIM4v6##x
 #define B4_IS_V6 1
@@ -205,7 +207,15 @@ BSIM4v6kluPrep(GENmodel *inModel, CKTcircuit *ckt)
         head->BSIM4v6KluAxBase = ax;
         head->BSIM4v6KluNz = nz;
     }
-#if NGSPICE_OPT_BSIM4_SIMD
+#if NGSPICE_OPT_ZEN4
+    if (head->BSIM4v6KluAll4Term &&
+        (BSIM4v6isAvxEligibleTran(ckt) || BSIM4v6isAvxEligibleDcOp(ckt))) {
+        BSIM4v6ensureAvxPack(head, ckt);
+        BSIM4v6syncAvxDynFromInst(head);
+    } else {
+        head->BSIM4v6AvxDynValid = 0;
+    }
+#elif NGSPICE_OPT_APPLE
     if (head->BSIM4v6KluAll4Term && BSIM4v6isAvxEligibleTran(ckt)) {
         BSIM4v6ensureAvxPack(head, ckt);
         BSIM4v6syncAvxDynFromInst(head);
@@ -226,16 +236,18 @@ BSIM4v6loadKluPar(GENmodel *inModel, CKTcircuit *ckt, double *my_ax, double *my_
     int error = 0;
 
 #if NGSPICE_OPT_ZEN4
-    if (head->BSIM4v6AvxBuilt && BSIM4v6isAvxEligibleTran(ckt)) {
+    int is_dc_avx = BSIM4v6isAvxEligibleDcOp(ckt);
+    if (head->BSIM4v6AvxBuilt && (BSIM4v6isAvxEligibleTran(ckt) || is_dc_avx)) {
         const BSIM4Avx512Block *blocks = (const BSIM4Avx512Block *)head->BSIM4v6AvxBlocks;
         BSIM4Avx512Dyn *dyn = (BSIM4Avx512Dyn *)head->BSIM4v6AvxDyn;
         int nBlocks = head->BSIM4v6AvxBlockCount;
         const int *fbIdx = head->BSIM4v6AvxFallbackIdx;
         int nFb = head->BSIM4v6AvxFallbackCount;
+        int force_aos = (nFb > 0) ? 1 : 0;
         if (omp_in_parallel()) {
             #pragma omp for schedule(static) nowait
             for (int bi = 0; bi < nBlocks; bi++) {
-                BSIM4v6evalAvxBlock(&blocks[bi], &dyn[bi], InstArray, ckt, my_ax, my_rhs, 0);
+                BSIM4v6evalAvxBlock(&blocks[bi], &dyn[bi], InstArray, ckt, my_ax, my_rhs, 0, is_dc_avx, force_aos);
             }
             if (nFb > 0) {
                 #pragma omp for schedule(static) nowait
@@ -248,9 +260,7 @@ BSIM4v6loadKluPar(GENmodel *inModel, CKTcircuit *ckt, double *my_ax, double *my_
             }
             return error;
         }
-        for (int bi = 0; bi < nBlocks; bi++) {
-            BSIM4v6evalAvxBlock(&blocks[bi], &dyn[bi], InstArray, ckt, my_ax, my_rhs, 0);
-        }
+        BSIM4v6evalAvxRange(blocks, dyn, nBlocks, InstArray, ckt, my_ax, my_rhs, 0, is_dc_avx, force_aos);
         for (int fi = 0; fi < nFb; fi++) {
             int idx = fbIdx[fi];
             int local_error = BSIM4v6LoadOMP_core(InstArray[idx], ckt, my_ax, my_rhs, &koffArr[idx]);
@@ -318,35 +328,37 @@ CKTcircuit *ckt)
     int count = model->BSIM4v6InstCount;
 
 #if NGSPICE_OPT_ZEN4
-    if (BSIM4v6isAvxEligibleTran(ckt)) {
-        BSIM4v6ensureAvxPack(model, ckt);
-        BSIM4v6syncAvxDynFromInst(model);
-        const BSIM4Avx512Block *blocks = (const BSIM4Avx512Block *)model->BSIM4v6AvxBlocks;
-        BSIM4Avx512Dyn *dyn = (BSIM4Avx512Dyn *)model->BSIM4v6AvxDyn;
-        int nBlocks = model->BSIM4v6AvxBlockCount;
-        const int *fbIdx = model->BSIM4v6AvxFallbackIdx;
-        int nFb = model->BSIM4v6AvxFallbackCount;
-        if (omp_get_max_threads() == 1 && nFb == 0) {
-            double *rhs = ckt->CKTrhs;
-            for (int bi = 0; bi < nBlocks; bi++) {
-                BSIM4v6evalAvxBlock(&blocks[bi], &dyn[bi], InstArray, ckt, NULL, rhs, 1);
+    {
+        int is_dc_avx = BSIM4v6isAvxEligibleDcOp(ckt);
+        if (BSIM4v6isAvxEligibleTran(ckt) || is_dc_avx) {
+            BSIM4v6ensureAvxPack(model, ckt);
+            BSIM4v6syncAvxDynFromInst(model);
+            const BSIM4Avx512Block *blocks = (const BSIM4Avx512Block *)model->BSIM4v6AvxBlocks;
+            BSIM4Avx512Dyn *dyn = (BSIM4Avx512Dyn *)model->BSIM4v6AvxDyn;
+            int nBlocks = model->BSIM4v6AvxBlockCount;
+            const int *fbIdx = model->BSIM4v6AvxFallbackIdx;
+            int nFb = model->BSIM4v6AvxFallbackCount;
+            int force_aos = (nFb > 0) ? 1 : 0;
+            if (omp_get_max_threads() == 1 && nFb == 0) {
+                double *rhs = ckt->CKTrhs;
+                BSIM4v6evalAvxRange(blocks, dyn, nBlocks, InstArray, ckt, NULL, rhs, 1, is_dc_avx, 0);
+                return OK;
             }
-            return OK;
-        }
-        #pragma omp parallel for schedule(static) if(omp_get_max_threads() > 1)
-        for (int bi = 0; bi < nBlocks; bi++) {
-            BSIM4v6evalAvxBlock(&blocks[bi], &dyn[bi], InstArray, ckt, NULL, NULL, 2);
-        }
-        if (nFb > 0) {
             #pragma omp parallel for schedule(static) if(omp_get_max_threads() > 1)
-            for (int fi = 0; fi < nFb; fi++) {
-                int local_error = BSIM4v6LoadOMP_core(InstArray[fbIdx[fi]], ckt, NULL, NULL, NULL);
-                if (local_error)
-                    error = local_error;
+            for (int bi = 0; bi < nBlocks; bi++) {
+                BSIM4v6evalAvxBlock(&blocks[bi], &dyn[bi], InstArray, ckt, NULL, NULL, 2, is_dc_avx, force_aos);
             }
+            if (nFb > 0) {
+                #pragma omp parallel for schedule(static) if(omp_get_max_threads() > 1)
+                for (int fi = 0; fi < nFb; fi++) {
+                    int local_error = BSIM4v6LoadOMP_core(InstArray[fbIdx[fi]], ckt, NULL, NULL, NULL);
+                    if (local_error)
+                        error = local_error;
+                }
+            }
+            BSIM4v6LoadRhsMat(inModel, ckt);
+            return error;
         }
-        BSIM4v6LoadRhsMat(inModel, ckt);
-        return error;
     }
     model->BSIM4v6AvxDynValid = 0;
 #elif NGSPICE_OPT_APPLE

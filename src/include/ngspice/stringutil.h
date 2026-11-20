@@ -10,6 +10,7 @@
 #include <string.h>
 
 #include "ngspice/config.h"
+#include "ngspice/opt_config.h"
 #include "ngspice/bool.h"
 
 
@@ -39,9 +40,11 @@ struct substring_match_info {
 };
 
 void appendc(char *s, char c);
+#if !NGSPICE_OPT_GENERAL
 int cieq(const char *p, const char *s);
-int cieqn(const char *p, const char *s, size_t n);
 int ciprefix(const char *p, const char *s);
+#endif
+int cieqn(const char *p, const char *s, size_t n);
 char *dup_string(const char *str, size_t n_char);
 char *find_first_of(const char *haystack,
         unsigned int n_needle, const char *p_needle);
@@ -115,6 +118,38 @@ inline int substring(const char *sub, const char *str)
 {
     return strstr(str, sub) != (char *) NULL;
 } /* end of function substring */
+
+#if NGSPICE_OPT_GENERAL
+inline int ciprefix(const char *p, const char *s)
+{
+    for (; *p; p++, s++) {
+        unsigned char a = (unsigned char)*p;
+        unsigned char b = (unsigned char)*s;
+        if (a != b) {
+            if ((unsigned)(a - 'A') < 26u) a |= 0x20u;
+            if ((unsigned)(b - 'A') < 26u) b |= 0x20u;
+            if (a != b)
+                return FALSE;
+        }
+    }
+    return TRUE;
+}
+
+inline int cieq(const char *p, const char *s)
+{
+    for (; *p; p++, s++) {
+        unsigned char a = (unsigned char)*p;
+        unsigned char b = (unsigned char)*s;
+        if (a != b) {
+            if ((unsigned)(a - 'A') < 26u) a |= 0x20u;
+            if ((unsigned)(b - 'A') < 26u) b |= 0x20u;
+            if (a != b)
+                return FALSE;
+        }
+    }
+    return *s == '\0';
+}
+#endif
 
 #ifdef CIDER
 /* cider integration */ 

@@ -57,6 +57,9 @@ typedef struct INPparseNode {
 
 /* A debugging function */
 void INPptPrint(char *str, IFparseTree * ptree);
+#if NGSPICE_OPT_GENERAL
+int INPtreeIsAffine(IFparseTree *tree, int *has_temp);
+#endif
 
 /* FIXME, less public
  *   and replace with static inline functions for better type check

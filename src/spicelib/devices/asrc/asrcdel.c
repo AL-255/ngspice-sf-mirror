@@ -17,6 +17,9 @@ ASRCdelete(GENinstance *gen_inst)
 
     INPfreeTree(inst->ASRCtree);
     FREE(inst->ASRCacValues);
+#if NGSPICE_OPT_GENERAL
+    FREE(inst->ASRCaffDerivs);
+#endif
     FREE(inst->ASRCposPtr);
     FREE(inst->ASRCvars);
 #ifdef KLU

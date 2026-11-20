@@ -346,6 +346,36 @@ ATTRIBUTE_NORETURN void controlled_exit(int status);
 
 inline static int char_to_int(char c) { return (unsigned char) c; }
 
+#if NGSPICE_OPT_GENERAL
+static inline int ng_isdigit_c(char c) { return (unsigned)((unsigned char)c - '0') < 10u; }
+static inline int ng_islower_c(char c) { return (unsigned)((unsigned char)c - 'a') < 26u; }
+static inline int ng_isupper_c(char c) { return (unsigned)((unsigned char)c - 'A') < 26u; }
+static inline int ng_isalpha_c(char c) { return (unsigned)(((unsigned char)c | 0x20u) - 'a') < 26u; }
+static inline int ng_isalnum_c(char c) { return ng_isalpha_c(c) || ng_isdigit_c(c); }
+static inline int ng_isblank_c(char c) { return c == ' ' || c == '\t'; }
+static inline int ng_isspace_c(char c) { return c == ' ' || (unsigned)((unsigned char)c - '\t') < 5u; }
+static inline int ng_isprint_c(char c) { return (unsigned)((unsigned char)c - 0x20u) < 0x5fu; }
+static inline char ng_tolower_c(char c) {
+    unsigned char u = (unsigned char)c;
+    return (char)((unsigned)(u - 'A') < 26u ? (u | 0x20u) : u);
+}
+static inline char ng_toupper_c(char c) {
+    unsigned char u = (unsigned char)c;
+    return (char)((unsigned)(u - 'a') < 26u ? (u & ~0x20u) : u);
+}
+
+#define isalpha_c(x) ng_isalpha_c(x)
+#define islower_c(x) ng_islower_c(x)
+#define isdigit_c(x) ng_isdigit_c(x)
+#define isalnum_c(x) ng_isalnum_c(x)
+#define isprint_c(x) ng_isprint_c(x)
+#define isblank_c(x) ng_isblank_c(x)
+#define isspace_c(x) ng_isspace_c(x)
+#define isupper_c(x) ng_isupper_c(x)
+
+#define tolower_c(x) ng_tolower_c(x)
+#define toupper_c(x) ng_toupper_c(x)
+#else
 #define isalpha_c(x) isalpha(char_to_int(x))
 #define islower_c(x) islower(char_to_int(x))
 #define isdigit_c(x) isdigit(char_to_int(x))
@@ -357,6 +387,7 @@ inline static int char_to_int(char c) { return (unsigned char) c; }
 
 #define tolower_c(x) ((char) tolower(char_to_int(x)))
 #define toupper_c(x) ((char) toupper(char_to_int(x)))
+#endif
 
 #endif
 

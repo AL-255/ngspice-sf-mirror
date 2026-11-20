@@ -24,19 +24,35 @@ ASRCconvTest(GENmodel *inModel, CKTcircuit *ckt)
     for (; model; model = ASRCnextModel(model)) {
         for (here = ASRCinstances(model); here; here = ASRCnextInstance(here)) {
 
-            i = here->ASRCtree->numVars;
-            if (asrc_nvals < i) {
-                asrc_nvals = i;
-                asrc_vals = TREALLOC(double, asrc_vals, i);
-                asrc_derivs = TREALLOC(double, asrc_derivs, i);
+#if NGSPICE_OPT_GENERAL
+            if (here->ASRCisAffine && here->ASRCaffValid &&
+                (!here->ASRCaffHasTemp || here->ASRCaffTemp == ckt->CKTtemp) &&
+                here->ASRCaffGmin == ckt->CKTgmin)
+            {
+                int nvars = here->ASRCtree->numVars;
+                const double * restrict g = here->ASRCaffDerivs;
+                const int * restrict vars = here->ASRCvars;
+                const double * restrict crhs = ckt->CKTrhs;
+                rhs = here->ASRCaffC0;
+                for (i = 0; i < nvars; i++)
+                    rhs += crhs[vars[i]] * g[i];
+            } else
+#endif
+            {
+                i = here->ASRCtree->numVars;
+                if (asrc_nvals < i) {
+                    asrc_nvals = i;
+                    asrc_vals = TREALLOC(double, asrc_vals, i);
+                    asrc_derivs = TREALLOC(double, asrc_derivs, i);
+                }
+
+                for (i = 0; i < here->ASRCtree->numVars; i++)
+                    asrc_vals[i] = ckt->CKTrhs[here->ASRCvars[i]];
+
+                if (here->ASRCtree->IFeval(here->ASRCtree, ckt->CKTgmin, &rhs,
+                                           asrc_vals, asrc_derivs) != OK)
+                    return(E_BADPARM);
             }
-
-            for (i = 0; i < here->ASRCtree->numVars; i++)
-                asrc_vals[i] = ckt->CKTrhs[here->ASRCvars[i]];
-
-            if (here->ASRCtree->IFeval(here->ASRCtree, ckt->CKTgmin, &rhs,
-                                       asrc_vals, asrc_derivs) != OK)
-                return(E_BADPARM);
 
             prev = here->ASRCprev_value;
             diff = fabs(prev - rhs);

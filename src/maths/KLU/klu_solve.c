@@ -159,6 +159,20 @@ Int KLU_solve
             {
 
                 case 1:
+#if !defined(COMPLEX) && NGSPICE_OPT_GENERAL && !NGSPICE_OPT_APPLE
+                    if (Numeric->ref_prev_valid && Numeric->ref_inv_rs_perm != NULL)
+                    {
+                        const Int * restrict Pnr = Pnum ;
+                        const double * restrict iRs = Numeric->ref_inv_rs_perm ;
+                        const double * restrict Br = Bz ;
+                        double * restrict Xr = X ;
+                        for (k = 0 ; k < n ; k++)
+                        {
+                            Xr [k] = Br [Pnr [k]] * iRs [k] ;
+                        }
+                    }
+                    else
+#endif
                     for (k = 0 ; k < n ; k++)
                     {
                         SCALE_DIV_ASSIGN (X [k], Bz  [Pnum [k]], Rs [k]) ;
@@ -227,6 +241,11 @@ Int KLU_solve
                 {
 
                     case 1:
+#if !defined(COMPLEX) && NGSPICE_OPT_GENERAL && !NGSPICE_OPT_APPLE
+                        if (Numeric->ref_inv_udiag_valid && Numeric->ref_inv_udiag != NULL)
+                            X [k1] *= Numeric->ref_inv_udiag [k1] ;
+                        else
+#endif
                         DIV (X [k1], X [k1], s) ;
                         break ;
 
@@ -312,6 +331,12 @@ Int KLU_solve
                 {
                     KLU_lsolve (nk, Lip + k1, Llen + k1, LUbx [block], nr,
                             X + nr*k1) ;
+#if !defined(COMPLEX) && NGSPICE_OPT_GENERAL && !NGSPICE_OPT_APPLE
+                    if (nr == 1 && Numeric->ref_inv_udiag_valid && Numeric->ref_inv_udiag != NULL)
+                        KLU_usolve_inv (nk, Uip + k1, Ulen + k1, LUbx [block],
+                                Numeric->ref_inv_udiag + k1, X + k1) ;
+                    else
+#endif
                     KLU_usolve (nk, Uip + k1, Ulen + k1, LUbx [block],
                             Udiag + k1, nr, X + nr*k1) ;
                 }

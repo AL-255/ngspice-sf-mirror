@@ -33,6 +33,9 @@ static INPparseNode *mkvnode(char *name);
 static INPparseNode *mkinode(char *name);
 
 static INPparseNode *PTdifferentiate(INPparseNode * p, int varnum);
+#if NGSPICE_OPT_GENERAL
+static INPparseNode *PTsimplify(INPparseNode * p);
+#endif
 
 static void free_tree(INPparseNode *);
 static void printTree(INPparseNode *);
@@ -223,6 +226,10 @@ INPgetTree(char **line, INPparseTree ** pt, CKTcircuit *ckt, INPtables * tab)
         release_tree(p);
 
     } else {
+
+#if NGSPICE_OPT_GENERAL
+        p = PTsimplify(p);
+#endif
 
         (*pt) = TMALLOC(INPparseTree, 1);
 
@@ -771,6 +778,301 @@ static INPparseNode *mkcon(double value)
 
     return (p);
 }
+
+#if NGSPICE_OPT_GENERAL
+static int
+PT_is_finite_safe(const INPparseNode *p)
+{
+    if (!p)
+        return 0;
+    switch (p->type) {
+    case PT_CONSTANT:
+        return isfinite(p->constant) ? 1 : 0;
+    case PT_VAR:
+    case PT_TIME:
+    case PT_TEMPERATURE:
+    case PT_FREQUENCY:
+        return 1;
+    case PT_PLUS:
+    case PT_MINUS:
+    case PT_TIMES:
+        return PT_is_finite_safe(p->left) && PT_is_finite_safe(p->right);
+    case PT_DIVIDE:
+        return PT_is_finite_safe(p->left) &&
+               p->right && p->right->type == PT_CONSTANT &&
+               p->right->constant != 0.0 && isfinite(p->right->constant);
+    case PT_FUNCTION:
+        switch (p->funcnum) {
+        case PTF_ABS:
+        case PTF_UMINUS:
+        case PTF_SIN:
+        case PTF_COS:
+        case PTF_TANH:
+        case PTF_ATAN:
+        case PTF_SGN:
+        case PTF_USTEP:
+        case PTF_URAMP:
+        case PTF_USTEP2:
+        case PTF_EQ0:
+        case PTF_NE0:
+        case PTF_GT0:
+        case PTF_LT0:
+        case PTF_GE0:
+        case PTF_LE0:
+        case PTF_CEIL:
+        case PTF_FLOOR:
+        case PTF_NINT:
+            return PT_is_finite_safe(p->left);
+        default:
+            return 0;
+        }
+    default:
+        return 0;
+    }
+}
+
+static INPparseNode *
+PTsimplify(INPparseNode *p)
+{
+    if (!p)
+        return NULL;
+
+    switch (p->type) {
+    case PT_CONSTANT:
+    case PT_VAR:
+    case PT_TIME:
+    case PT_TEMPERATURE:
+    case PT_FREQUENCY:
+    case PT_PLACEHOLDER:
+        return p;
+
+    case PT_PLUS:
+    case PT_MINUS:
+    case PT_TIMES:
+    case PT_DIVIDE:
+    case PT_POWER: {
+        INPparseNode *l = PTsimplify(p->left);
+        INPparseNode *r = PTsimplify(p->right);
+        int l_const = (l && l->type == PT_CONSTANT && isfinite(l->constant));
+        int r_const = (r && r->type == PT_CONSTANT && isfinite(r->constant));
+
+        if (l_const && r_const) {
+            double val;
+            int can_fold = 1;
+            switch (p->type) {
+            case PT_PLUS:   val = l->constant + r->constant; break;
+            case PT_MINUS:  val = l->constant - r->constant; break;
+            case PT_TIMES:  val = l->constant * r->constant; break;
+            case PT_DIVIDE:
+                if (r->constant == 0.0) { can_fold = 0; val = 0.0; }
+                else val = l->constant / r->constant;
+                break;
+            case PT_POWER:
+                val = pow(l->constant, r->constant);
+                break;
+            default:
+                can_fold = 0; val = 0.0; break;
+            }
+            if (can_fold && isfinite(val))
+                return mkfirst(mkcon(val), mkfirst(p, mkfirst(l, r)));
+        }
+
+        if (p->type == PT_TIMES) {
+            if (l_const && l->constant == 0.0 && PT_is_finite_safe(r))
+                return mkfirst(mkcon(0.0), mkfirst(p, mkfirst(l, r)));
+            if (r_const && r->constant == 0.0 && PT_is_finite_safe(l))
+                return mkfirst(mkcon(0.0), mkfirst(p, mkfirst(l, r)));
+            if (l_const && l->constant == 1.0)
+                return mkfirst(r, mkfirst(p, l));
+            if (r_const && r->constant == 1.0)
+                return mkfirst(l, mkfirst(p, r));
+        } else if (p->type == PT_DIVIDE) {
+            if (l_const && l->constant == 0.0 && r_const && r->constant != 0.0)
+                return mkfirst(mkcon(0.0), mkfirst(p, mkfirst(l, r)));
+            if (r_const && r->constant == 1.0)
+                return mkfirst(l, mkfirst(p, r));
+        } else if (p->type == PT_PLUS) {
+            if (l_const && l->constant == 0.0)
+                return mkfirst(r, mkfirst(p, l));
+            if (r_const && r->constant == 0.0)
+                return mkfirst(l, mkfirst(p, r));
+        } else if (p->type == PT_MINUS) {
+            if (r_const && r->constant == 0.0)
+                return mkfirst(l, mkfirst(p, r));
+        } else if (p->type == PT_POWER) {
+            if (r_const && r->constant == 1.0)
+                return mkfirst(l, mkfirst(p, r));
+        }
+
+        if (l == p->left && r == p->right)
+            return p;
+
+        {
+            INPparseNode *newp = TMALLOC(INPparseNode, 1);
+            newp->type = p->type;
+            newp->usecnt = 0;
+            newp->funcname = p->funcname;
+            newp->function = p->function;
+            newp->left = inc_usage(l);
+            newp->right = inc_usage(r);
+            return mkfirst(newp, p);
+        }
+    }
+
+    case PT_FUNCTION:
+        if (p->data != NULL ||
+            p->funcnum == PTF_PWL ||
+            p->funcnum == PTF_PWL_DERIVATIVE ||
+            p->funcnum == PTF_DDT)
+            return p;
+
+        if (p->funcnum == PTF_POW || p->funcnum == PTF_PWR ||
+            p->funcnum == PTF_MIN || p->funcnum == PTF_MAX) {
+            if (p->left && p->left->type == PT_COMMA) {
+                INPparseNode *a = PTsimplify(p->left->left);
+                INPparseNode *b = PTsimplify(p->left->right);
+                if (a->type == PT_CONSTANT && b->type == PT_CONSTANT &&
+                    isfinite(a->constant) && isfinite(b->constant)) {
+                    double val = PTbinary(p->function)(a->constant, b->constant);
+                    if (val != HUGE && isfinite(val))
+                        return mkfirst(mkcon(val), mkfirst(p, mkfirst(a, b)));
+                }
+                if (a == p->left->left && b == p->left->right)
+                    return p;
+                {
+                    INPparseNode *comma = mkb(PT_COMMA, a, b);
+                    INPparseNode *newp = mkf(p->funcnum, comma);
+                    return mkfirst(newp, p);
+                }
+            }
+            return p;
+        }
+
+        {
+            INPparseNode *a = PTsimplify(p->left);
+            if (a && a->type == PT_CONSTANT && isfinite(a->constant)) {
+                double val = PTunary(p->function)(a->constant);
+                if (val != HUGE && isfinite(val))
+                    return mkfirst(mkcon(val), mkfirst(p, a));
+            }
+            if (a == p->left)
+                return p;
+            {
+                INPparseNode *newp = mkf(p->funcnum, a);
+                return mkfirst(newp, p);
+            }
+        }
+
+    case PT_TERN:
+        if (p->right && p->right->type == PT_COMMA) {
+            INPparseNode *c = PTsimplify(p->left);
+            INPparseNode *t = PTsimplify(p->right->left);
+            INPparseNode *f = PTsimplify(p->right->right);
+            if (c && c->type == PT_CONSTANT && isfinite(c->constant)) {
+                INPparseNode *pick = (c->constant != 0.0) ? t : f;
+                INPparseNode *drop = (c->constant != 0.0) ? f : t;
+                return mkfirst(pick, mkfirst(p, mkfirst(c, drop)));
+            }
+            if (c == p->left && t == p->right->left && f == p->right->right)
+                return p;
+            {
+                INPparseNode *newp = mkb(PT_TERN, c, mkb(PT_COMMA, t, f));
+                return mkfirst(newp, p);
+            }
+        }
+        return p;
+
+    default:
+        return p;
+    }
+}
+
+static int
+PT_is_var_free(const INPparseNode *p, int *has_temp)
+{
+    if (!p)
+        return 0;
+    switch (p->type) {
+    case PT_CONSTANT:
+        return 1;
+    case PT_TEMPERATURE:
+        if (has_temp) *has_temp = 1;
+        return 1;
+    case PT_VAR:
+    case PT_TIME:
+    case PT_FREQUENCY:
+    case PT_PLACEHOLDER:
+        return 0;
+    case PT_PLUS:
+    case PT_MINUS:
+    case PT_TIMES:
+    case PT_DIVIDE:
+    case PT_POWER:
+    case PT_COMMA:
+        return PT_is_var_free(p->left, has_temp) && PT_is_var_free(p->right, has_temp);
+    case PT_TERN:
+        return PT_is_var_free(p->left, has_temp) &&
+               p->right && p->right->type == PT_COMMA &&
+               PT_is_var_free(p->right->left, has_temp) &&
+               PT_is_var_free(p->right->right, has_temp);
+    case PT_FUNCTION:
+        if (p->funcnum == PTF_DDT || p->funcnum == PTF_PWL || p->funcnum == PTF_PWL_DERIVATIVE)
+            return 0;
+        return PT_is_var_free(p->left, has_temp);
+    default:
+        return 0;
+    }
+}
+
+static int
+PT_is_affine_node(const INPparseNode *p, int *has_temp)
+{
+    if (!p)
+        return 0;
+    if (PT_is_var_free(p, has_temp))
+        return 1;
+    switch (p->type) {
+    case PT_VAR:
+        return 1;
+    case PT_PLUS:
+    case PT_MINUS:
+        return PT_is_affine_node(p->left, has_temp) &&
+               PT_is_affine_node(p->right, has_temp);
+    case PT_FUNCTION:
+        return (p->funcnum == PTF_UMINUS) && PT_is_affine_node(p->left, has_temp);
+    case PT_TIMES:
+        if (PT_is_var_free(p->left, has_temp))
+            return PT_is_affine_node(p->right, has_temp);
+        if (PT_is_var_free(p->right, has_temp))
+            return PT_is_affine_node(p->left, has_temp);
+        return 0;
+    case PT_DIVIDE:
+        return PT_is_var_free(p->right, has_temp) &&
+               PT_is_affine_node(p->left, has_temp);
+    default:
+        return 0;
+    }
+}
+
+int
+INPtreeIsAffine(IFparseTree *tree, int *has_temp)
+{
+    INPparseTree *myTree = (INPparseTree *)tree;
+    int ht = 0;
+    int i;
+    if (!myTree || !myTree->tree || myTree->p.IFeval != IFeval)
+        return 0;
+    if (!PT_is_affine_node(myTree->tree, &ht))
+        return 0;
+    for (i = 0; i < myTree->p.numVars; i++) {
+        if (!PT_is_var_free(myTree->derivs[i], &ht))
+            return 0;
+    }
+    if (has_temp)
+        *has_temp = ht;
+    return 1;
+}
+#endif
 
 static INPparseNode *mkb(int type, INPparseNode * left,
                          INPparseNode * right)

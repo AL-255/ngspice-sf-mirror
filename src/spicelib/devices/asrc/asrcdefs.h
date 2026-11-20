@@ -58,6 +58,16 @@ typedef struct sASRCinstance {
     BindElement **ASRCposBinding ;
 #endif
 
+#if NGSPICE_OPT_GENERAL
+    double *ASRCaffDerivs;     /* Cached affine derivatives d(f)/d(v_i) */
+    double ASRCaffC0;          /* Cached affine offset f(0) */
+    double ASRCaffTemp;        /* CKTtemp when affine cache was computed */
+    double ASRCaffGmin;        /* CKTgmin when affine cache was computed */
+    unsigned char ASRCisAffine;   /* 1 if parse tree is structurally affine in vars */
+    unsigned char ASRCaffHasTemp; /* 1 if affine coefficients depend on temper */
+    unsigned char ASRCaffValid;   /* 1 if ASRCaffC0/ASRCaffDerivs are populated */
+#endif
+
 } ASRCinstance;
 
 

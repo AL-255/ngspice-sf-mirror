@@ -19,6 +19,10 @@ extern inline char *copy(const char *str);
 extern inline char *copy_substring(const char *str, const char *end);
 extern inline int scannum(const char *str);
 extern inline int substring(const char *sub, const char *str);
+#if NGSPICE_OPT_GENERAL
+extern inline int ciprefix(const char *p, const char *s);
+extern inline int cieq(const char *p, const char *s);
+#endif
 
 
 
@@ -254,6 +258,7 @@ int get_int_n(const char *str, size_t n, int *p_value)
 
 
 
+#if !NGSPICE_OPT_GENERAL
 /* Case insensitive str eq. */
 /* Like strcasecmp( ) XXX */
 int cieq(const char *p, const char *s)
@@ -266,6 +271,7 @@ int cieq(const char *p, const char *s)
 
     return *s == '\0';
 } /* end of function cieq */
+#endif
 
 
 
@@ -287,6 +293,7 @@ int cieqn(const char *p, const char *s, size_t n)
 } /* end of function cineq */
 
 
+#if !NGSPICE_OPT_GENERAL
 /* Case insensitive prefix. */
 int ciprefix(const char *p, const char *s)
 {
@@ -297,6 +304,7 @@ int ciprefix(const char *p, const char *s)
 
     return TRUE;
 } /* end of function ciprefix */
+#endif
 
 
 

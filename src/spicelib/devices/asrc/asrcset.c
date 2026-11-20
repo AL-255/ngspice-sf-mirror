@@ -6,6 +6,7 @@ Author: 1987 Kanwar Jit Singh
 #include "ngspice/ngspice.h"
 #include "ngspice/cktdefs.h"
 #include "asrcdefs.h"
+#include "ngspice/inpptree.h"
 #include "ngspice/sperror.h"
 #include "ngspice/suffix.h"
 
@@ -68,6 +69,23 @@ int ASRCsetup(SMPmatrix *matrix, GENmodel *inModel, CKTcircuit *ckt,
             here->ASRCposPtr = TMALLOC(double *, j);
             here->ASRCvars = TMALLOC(int, here->ASRCtree->numVars);
             here->ASRCacValues = TMALLOC(double, here->ASRCtree->numVars + 1);
+
+#if NGSPICE_OPT_GENERAL
+            {
+                int has_temp = 0;
+                FREE(here->ASRCaffDerivs);
+                here->ASRCaffValid = 0;
+                if (INPtreeIsAffine(here->ASRCtree, &has_temp)) {
+                    here->ASRCisAffine = 1;
+                    here->ASRCaffHasTemp = (unsigned char)(has_temp ? 1 : 0);
+                    if (here->ASRCtree->numVars > 0)
+                        here->ASRCaffDerivs = TMALLOC(double, here->ASRCtree->numVars);
+                } else {
+                    here->ASRCisAffine = 0;
+                    here->ASRCaffHasTemp = 0;
+                }
+            }
+#endif
 
 #ifdef KLU
             here->ASRCposBinding = TMALLOC (BindElement *, j) ;
@@ -143,6 +161,11 @@ ASRCunsetup(GENmodel *inModel, CKTcircuit *ckt)
             FREE(here->ASRCposPtr);
             FREE(here->ASRCvars);
             FREE(here->ASRCacValues);
+#if NGSPICE_OPT_GENERAL
+            FREE(here->ASRCaffDerivs);
+            here->ASRCisAffine = 0;
+            here->ASRCaffValid = 0;
+#endif
 #ifdef KLU
             FREE(here->ASRCposBinding);
 #endif            

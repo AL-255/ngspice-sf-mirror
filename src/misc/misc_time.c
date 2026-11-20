@@ -53,6 +53,54 @@ int gettimeofday(struct timeval * tp, void * unused)
 #include <omp.h>
 #endif
 
+#if NGSPICE_OPT_ZEN4 && defined(__x86_64__) && defined(HAVE_CLOCK_GETTIME)
+#include <x86intrin.h>
+#include <cpuid.h>
+#include <time.h>
+
+static int tsc_state = 0; /* 0=uninit, 1=calibrating, 2=ready, -1=unsupported */
+static unsigned long long tsc_ref = 0;
+static double mono_ref = 0.0;
+static double tsc_scale = 0.0;
+
+static inline double
+mono_now_sec(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
+static inline double
+zen4_fast_wtime(void)
+{
+    if (__builtin_expect(tsc_state == 2, 1))
+        return mono_ref + (double)(__rdtsc() - tsc_ref) * tsc_scale;
+    if (tsc_state == 0) {
+        unsigned int eax = 0, ebx = 0, ecx = 0, edx = 0;
+        if (__get_cpuid(0x80000007u, &eax, &ebx, &ecx, &edx) && (edx & (1u << 8))) {
+            mono_ref = mono_now_sec();
+            tsc_ref = __rdtsc();
+            tsc_state = 1;
+            return mono_ref;
+        }
+        tsc_state = -1;
+    }
+    double now = mono_now_sec();
+    if (tsc_state == 1) {
+        double dt = now - mono_ref;
+        if (dt >= 0.010) {
+            unsigned long long dtsc = __rdtsc() - tsc_ref;
+            if (dtsc > 0) {
+                tsc_scale = dt / (double)dtsc;
+                tsc_state = 2;
+            }
+        }
+    }
+    return now;
+}
+#endif
+
 /* Return the date. Return value is static data. */
 
 char *
@@ -107,7 +155,9 @@ void timediff(PerfTime *now, PerfTime *begin, int *sec, int *msec)
 double
 seconds(void)
 {
-#ifdef USE_OMP
+#if NGSPICE_OPT_ZEN4 && defined(__x86_64__) && defined(HAVE_CLOCK_GETTIME)
+    return zen4_fast_wtime() - timebegin.secs;
+#elif defined(USE_OMP)
     // Usage of OpenMP time function
     return(omp_get_wtime() - timebegin.secs);
 #elif defined(HAVE_QUERYPERFORMANCECOUNTER)

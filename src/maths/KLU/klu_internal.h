@@ -203,6 +203,18 @@ void KLU_usolve
     Entry X [ ]
 ) ;
 
+#if !defined(COMPLEX) && NGSPICE_OPT_GENERAL
+void KLU_usolve_inv
+(
+    Int n,
+    Int Up [ ],
+    Int Ui [ ],
+    Unit LU [ ],
+    const double invUdiag [ ],
+    double X [ ]
+) ;
+#endif
+
 void KLU_utsolve
 (
     /* inputs, not modified: */

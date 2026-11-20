@@ -66,6 +66,9 @@ CKTsetup(CKTcircuit *ckt)
     }
 
     ckt->CKTnumStates=0;
+#if NGSPICE_OPT_GENERAL
+    ckt->CKTactiveDevsValid = 0;
+#endif
 
 #ifdef WANT_SENSE2
     if(ckt->CKTsenInfo){
@@ -245,6 +248,9 @@ CKTunsetup(CKTcircuit *ckt)
     ckt->prev_CKTlastNode = NULL;
 
     ckt->CKTisSetup = 0;
+#if NGSPICE_OPT_GENERAL
+    ckt->CKTactiveDevsValid = 0;
+#endif
     if(error) return(error);
 
     NIdestroy(ckt);

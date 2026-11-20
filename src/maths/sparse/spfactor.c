@@ -694,6 +694,19 @@ FactorComplexMatrix( MatrixPtr Matrix )
             pColumn = Matrix->FirstInCol[Step];
             while (pColumn->Row < Step) {
                 pElement = Matrix->Diag[pColumn->Row];
+#if NGSPICE_OPT_GENERAL
+                ComplexNumber dc = Dest[pColumn->Row];
+                if (dc.Real != 0.0 || dc.Imag != 0.0) {
+                    CMPLX_MULT(Mult, dc, *pElement);
+                    CMPLX_ASSIGN(*pColumn, Mult);
+                    while ((pElement = pElement->NextInCol) != NULL) {
+                        CMPLX_MULT_SUBT_ASSIGN(Dest[pElement->Row], Mult, *pElement);
+                    }
+                } else {
+                    pColumn->Real = 0.0;
+                    pColumn->Imag = 0.0;
+                }
+#else
                 /* Cmplx expr: Mult = Dest[pColumn->Row] * (1.0 / *pPivot). */
                 CMPLX_MULT(Mult, Dest[pColumn->Row], *pElement);
                 CMPLX_ASSIGN(*pColumn, Mult);
@@ -701,6 +714,7 @@ FactorComplexMatrix( MatrixPtr Matrix )
                     /* Cmplx expr: Dest[pElement->Row] -= Mult * pElement */
                     CMPLX_MULT_SUBT_ASSIGN(Dest[pElement->Row],Mult,*pElement);
                 }
+#endif
                 pColumn = pColumn->NextInCol;
             }
 
@@ -731,6 +745,17 @@ FactorComplexMatrix( MatrixPtr Matrix )
             pColumn = Matrix->FirstInCol[Step];
             while (pColumn->Row < Step) {
                 pElement = Matrix->Diag[pColumn->Row];
+#if NGSPICE_OPT_GENERAL
+                ComplexNumber *pd = pDest[pColumn->Row];
+                ComplexNumber dc = *pd;
+                if (dc.Real != 0.0 || dc.Imag != 0.0) {
+                    CMPLX_MULT(Mult, dc, *pElement);
+                    CMPLX_ASSIGN(*pd, Mult);
+                    while ((pElement = pElement->NextInCol) != NULL) {
+                        CMPLX_MULT_SUBT_ASSIGN(*pDest[pElement->Row], Mult, *pElement);
+                    }
+                }
+#else
                 /* Cmplx expr: Mult = *pDest[pColumn->Row] * (1.0 / *pPivot). */
                 CMPLX_MULT(Mult, *pDest[pColumn->Row], *pElement);
                 CMPLX_ASSIGN(*pDest[pColumn->Row], Mult);
@@ -738,6 +763,7 @@ FactorComplexMatrix( MatrixPtr Matrix )
                     /* Cmplx expr: *pDest[pElement->Row] -= Mult * pElement */
                     CMPLX_MULT_SUBT_ASSIGN(*pDest[pElement->Row],Mult,*pElement);
                 }
+#endif
                 pColumn = pColumn->NextInCol;
             }
 

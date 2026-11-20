@@ -121,6 +121,7 @@
 #define KLU_lsolve klu_l_lsolve
 #define KLU_ltsolve klu_l_ltsolve
 #define KLU_usolve klu_l_usolve
+#define KLU_usolve_inv klu_l_usolve_inv
 #define KLU_utsolve klu_l_utsolve
 #define KLU_kernel klu_l_kernel
 #define KLU_valid klu_l_valid
@@ -144,6 +145,7 @@
 #define KLU_lsolve klu_lsolve
 #define KLU_ltsolve klu_ltsolve
 #define KLU_usolve klu_usolve
+#define KLU_usolve_inv klu_usolve_inv
 #define KLU_utsolve klu_utsolve
 #define KLU_kernel klu_kernel
 #define KLU_valid klu_valid

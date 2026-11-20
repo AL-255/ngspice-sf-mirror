@@ -117,10 +117,10 @@ RESload(GENmodel *inModel, CKTcircuit *ckt)
 {
     RESmodel *model = (RESmodel *)inModel;
 #if NGSPICE_OPT_GENERAL
-    int need_current = (ckt->CKTmode & MODEDC) != 0;
+    int need_current = (ckt->CKTmode & MODEINITSMSIG) != 0;
 
     if (!need_current) {
-        /* Transient/AC fast path: REScurrent is only read by DC noise analysis. */
+        /* Fast path: REScurrent is only read by noise analysis after MODEINITSMSIG. */
         if (model->RESfastVer != res_global_ver)
             RESbuildFastCache(model);
         const RESfastEntry * restrict arr = model->RESfastArr;

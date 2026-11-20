@@ -47,5 +47,10 @@ NIreinit( CKTcircuit *ckt)
     }
 #endif /* PREDICTOR */
     ckt->CKTniState = NISHOULDREORDER | NIACSHOULDREORDER | NIPZSHOULDREORDER;
+#if NGSPICE_OPT_GENERAL
+    ckt->CKTkluLuValid = 0;
+    ckt->CKTkluChordCount = 0;
+    ckt->CKTkluLastStepSmooth = 0;
+#endif
     return(0);
 }

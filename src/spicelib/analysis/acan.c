@@ -423,12 +423,39 @@ CKTacLoad(CKTcircuit* ckt)
 
     startTime = SPfrontEnd->IFseconds();
     size = SMPmatSize(ckt->CKTmatrix);
+#if NGSPICE_OPT_GENERAL
+    memset(ckt->CKTrhs, 0, (size_t)(size + 1) * sizeof(double));
+    memset(ckt->CKTirhs, 0, (size_t)(size + 1) * sizeof(double));
+#else
     for (i = 0; i <= size; i++) {
         ckt->CKTrhs[i] = 0;
         ckt->CKTirhs[i] = 0;
     }
+#endif
     SMPcClear(ckt->CKTmatrix);
 
+#if NGSPICE_OPT_GENERAL
+    if (!ckt->CKTactiveDevsValid && DEVmaxnum <= 256) {
+        int na = 0;
+        for (i = 0; i < DEVmaxnum; i++) {
+            if (DEVices[i] && ckt->CKThead[i])
+                ckt->CKTactiveDevs[na++] = (short)i;
+        }
+        ckt->CKTnumActiveDevs = na;
+        ckt->CKTactiveDevsValid = 1;
+    }
+    if (ckt->CKTactiveDevsValid) {
+        int n_active = ckt->CKTnumActiveDevs;
+        const short * restrict active_devs = ckt->CKTactiveDevs;
+        for (int ai = 0; ai < n_active; ai++) {
+            i = active_devs[ai];
+            if (DEVices[i]->DEVacLoad) {
+                error = DEVices[i]->DEVacLoad(ckt->CKThead[i], ckt);
+                if (error) return(error);
+            }
+        }
+    } else
+#endif
     for (i = 0; i < DEVmaxnum; i++) {
         if (DEVices[i] && DEVices[i]->DEVacLoad && ckt->CKThead[i]) {
             error = DEVices[i]->DEVacLoad(ckt->CKThead[i], ckt);

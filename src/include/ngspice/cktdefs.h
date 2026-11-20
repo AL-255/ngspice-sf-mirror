@@ -339,6 +339,16 @@ struct CKTcircuit {
     unsigned int CKTkluMODE:1;
     double CKTkluMemGrowFactor ;
 #endif
+#if NGSPICE_OPT_GENERAL
+    short CKTactiveDevs[256];
+    int CKTnumActiveDevs;
+    int CKTactiveDevsValid;
+    int CKTkluLuValid;
+    int CKTkluChordCount;
+    int CKTkluLastStepSmooth;
+    double CKTkluLuAg0;
+    double CKTkluLuGmin;
+#endif
 };
 
 
