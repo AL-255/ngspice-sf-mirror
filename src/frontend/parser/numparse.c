@@ -162,8 +162,11 @@ int ft_numparse(char **p_str, bool whole, double *p_val)
                     val, p_cur);
         }
 
-        /* Test if the number can be represented as an intger */
-        return (double) (int) val == val;
+        /* Test if the number can be represented as an integer without UB
+         * (Clang 21 optimizes (double)(int)val == val to trunc(val) == val,
+         *  causing .option rshunt=1e12 to overflow to INT_MAX on ARM64). */
+        return (val >= (double) INT_MIN && val <= (double) INT_MAX &&
+                (double) (int) val == val);
     }
 } /* end of function ft_numparse */
 
