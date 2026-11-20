@@ -1486,6 +1486,9 @@ nglib_get_stat_mtime(const struct stat *st, time_t *sec, long *nsec)
 #if defined(__linux__)
     *sec = st->st_mtim.tv_sec;
     *nsec = st->st_mtim.tv_nsec;
+#elif defined(__APPLE__)
+    *sec = st->st_mtimespec.tv_sec;
+    *nsec = st->st_mtimespec.tv_nsec;
 #else
     *sec = st->st_mtime;
     *nsec = 0;

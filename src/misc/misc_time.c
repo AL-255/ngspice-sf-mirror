@@ -99,6 +99,23 @@ zen4_fast_wtime(void)
     }
     return now;
 }
+#elif NGSPICE_OPT_APPLE && defined(__aarch64__)
+#include <stdint.h>
+
+static double apple_cnt_inv_freq = 0.0;
+
+static inline double
+apple_fast_wtime(void)
+{
+    uint64_t cnt;
+    __asm__ volatile("mrs %0, cntvct_el0" : "=r"(cnt));
+    if (__builtin_expect(apple_cnt_inv_freq == 0.0, 0)) {
+        uint64_t frq;
+        __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(frq));
+        apple_cnt_inv_freq = (frq > 0) ? (1.0 / (double)frq) : 1.0e-9;
+    }
+    return (double)cnt * apple_cnt_inv_freq;
+}
 #endif
 
 /* Return the date. Return value is static data. */
@@ -157,6 +174,8 @@ seconds(void)
 {
 #if NGSPICE_OPT_ZEN4 && defined(__x86_64__) && defined(HAVE_CLOCK_GETTIME)
     return zen4_fast_wtime() - timebegin.secs;
+#elif NGSPICE_OPT_APPLE && defined(__aarch64__)
+    return apple_fast_wtime() - timebegin.secs;
 #elif defined(USE_OMP)
     // Usage of OpenMP time function
     return(omp_get_wtime() - timebegin.secs);

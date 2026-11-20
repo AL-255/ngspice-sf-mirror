@@ -207,16 +207,9 @@ BSIM4v6kluPrep(GENmodel *inModel, CKTcircuit *ckt)
         head->BSIM4v6KluAxBase = ax;
         head->BSIM4v6KluNz = nz;
     }
-#if NGSPICE_OPT_ZEN4
+#if NGSPICE_OPT_BSIM4_SIMD
     if (head->BSIM4v6KluAll4Term &&
         (BSIM4v6isAvxEligibleTran(ckt) || BSIM4v6isAvxEligibleDcOp(ckt))) {
-        BSIM4v6ensureAvxPack(head, ckt);
-        BSIM4v6syncAvxDynFromInst(head);
-    } else {
-        head->BSIM4v6AvxDynValid = 0;
-    }
-#elif NGSPICE_OPT_APPLE
-    if (head->BSIM4v6KluAll4Term && BSIM4v6isAvxEligibleTran(ckt)) {
         BSIM4v6ensureAvxPack(head, ckt);
         BSIM4v6syncAvxDynFromInst(head);
     } else {
@@ -270,10 +263,12 @@ BSIM4v6loadKluPar(GENmodel *inModel, CKTcircuit *ckt, double *my_ax, double *my_
         return error;
     }
 #elif NGSPICE_OPT_APPLE
-    if (head->BSIM4v6AvxBuilt && BSIM4v6isAvxEligibleTran(ckt)) {
+    int is_dc_apple = BSIM4v6isAvxEligibleDcOp(ckt);
+    if (head->BSIM4v6AvxBuilt && (BSIM4v6isAvxEligibleTran(ckt) || is_dc_apple)) {
         const int *fbIdx = head->BSIM4v6AvxFallbackIdx;
         int nFb = head->BSIM4v6AvxFallbackCount;
-        BSIM4v6runApplePack(head, ckt, my_ax, my_rhs, 1);
+        int force_aos = (nFb > 0) ? 1 : 0;
+        BSIM4v6runApplePack(head, ckt, my_ax, my_rhs, 1, is_dc_apple, force_aos);
         if (nFb > 0) {
             if (omp_in_parallel()) {
                 #pragma omp for schedule(static) nowait
@@ -362,29 +357,33 @@ CKTcircuit *ckt)
     }
     model->BSIM4v6AvxDynValid = 0;
 #elif NGSPICE_OPT_APPLE
-    if (BSIM4v6isAvxEligibleTran(ckt)) {
-        BSIM4v6ensureAvxPack(model, ckt);
-        BSIM4v6syncAvxDynFromInst(model);
-        const int *fbIdx = model->BSIM4v6AvxFallbackIdx;
-        int nFb = model->BSIM4v6AvxFallbackCount;
-        if (omp_get_max_threads() == 1 && nFb == 0) {
-            BSIM4v6runApplePack(model, ckt, NULL, ckt->CKTrhs, 2);
-            return OK;
-        }
-        #pragma omp parallel if(omp_get_max_threads() > 1)
-        {
-            BSIM4v6runApplePack(model, ckt, NULL, NULL, 0);
-        }
-        if (nFb > 0) {
-            #pragma omp parallel for schedule(static) if(omp_get_max_threads() > 1)
-            for (int fi = 0; fi < nFb; fi++) {
-                int local_error = BSIM4v6LoadOMP_core(InstArray[fbIdx[fi]], ckt, NULL, NULL, NULL);
-                if (local_error)
-                    error = local_error;
+    {
+        int is_dc_apple = BSIM4v6isAvxEligibleDcOp(ckt);
+        if (BSIM4v6isAvxEligibleTran(ckt) || is_dc_apple) {
+            BSIM4v6ensureAvxPack(model, ckt);
+            BSIM4v6syncAvxDynFromInst(model);
+            const int *fbIdx = model->BSIM4v6AvxFallbackIdx;
+            int nFb = model->BSIM4v6AvxFallbackCount;
+            int force_aos = (nFb > 0) ? 1 : 0;
+            if (omp_get_max_threads() == 1 && nFb == 0) {
+                BSIM4v6runApplePack(model, ckt, NULL, ckt->CKTrhs, 2, is_dc_apple, 0);
+                return OK;
             }
+            #pragma omp parallel if(omp_get_max_threads() > 1)
+            {
+                BSIM4v6runApplePack(model, ckt, NULL, NULL, 0, is_dc_apple, force_aos);
+            }
+            if (nFb > 0) {
+                #pragma omp parallel for schedule(static) if(omp_get_max_threads() > 1)
+                for (int fi = 0; fi < nFb; fi++) {
+                    int local_error = BSIM4v6LoadOMP_core(InstArray[fbIdx[fi]], ckt, NULL, NULL, NULL);
+                    if (local_error)
+                        error = local_error;
+                }
+            }
+            BSIM4v6LoadRhsMat(inModel, ckt);
+            return error;
         }
-        BSIM4v6LoadRhsMat(inModel, ckt);
-        return error;
     }
     model->BSIM4v6AvxDynValid = 0;
 #endif

@@ -1115,7 +1115,8 @@ extern void bsim4_apple_eval_batch(
     const double * restrict s1,
     const double * restrict s2,
     BSIM4AppleOut * restrict out,
-    int need_aos);
+    int need_aos,
+    int dc_only);
 
 #ifdef B4_APPLE_DEFINE_KERNEL
 
@@ -3027,7 +3028,8 @@ bsim4_apple_eval_batch(
     const double * restrict s1,
     const double * restrict s2,
     BSIM4AppleOut * restrict out,
-    int need_aos)
+    int need_aos,
+    int dc_only)
 {
     BSIM4ApplePipe pipe;
 
@@ -3046,9 +3048,51 @@ bsim4_apple_eval_batch(
     bsim4_apple_p2_ids_diode(pp, &pipe, jpts, cpts, spts, l2pts,
                              nact, ckt_gmin, out, need_aos);
 
-    bsim4_apple_p3_cv_jct(pp, &pipe, jpts, cpts, spts, l2pts,
-                          nact, ag0, ag1, ag2, is_gear2, is_trap2,
-                          s0, s1, s2, need_aos);
+    if (!dc_only) {
+        bsim4_apple_p3_cv_jct(pp, &pipe, jpts, cpts, spts, l2pts,
+                              nact, ag0, ag1, ag2, is_gear2, is_trap2,
+                              s0, s1, s2, need_aos);
+    } else {
+        for (int l = 0; l < nact; l++) {
+            int st = cpts[l]->stateBase;
+            double vd = vds_in[l], vg = vgs_in[l], vb = vbs_in[l];
+            double vbd = vb - vd;
+            s0[st + 0]  = vbd;
+            s0[st + 1]  = vb;
+            s0[st + 2]  = vg;
+            s0[st + 3]  = vd;
+            s0[st + 4]  = vb;
+            s0[st + 5]  = vbd;
+            s0[st + 6]  = vb;
+            s0[st + 7]  = vg;
+            s0[st + 8]  = vg;
+            s0[st + 9]  = 0.0;
+            s0[st + 10] = vd;
+            s0[st + 27] = 0.0;
+            const BSIM4AppleL2 * restrict l2 = l2pts[l];
+            double * restrict dst = spts[l]->st;
+            dst[0]  = l2->mdc_rhsd;
+            dst[1]  = 0.0;
+            dst[2]  = l2->mdc_rhsb;
+            dst[3]  = l2->mdc_rhss;
+            dst[4]  = 0.0;
+            dst[5]  = 0.0;
+            dst[6]  = 0.0;
+            dst[7]  = 0.0;
+            dst[8]  = l2->mdc44;
+            dst[9]  = l2->mdc46;
+            dst[10] = l2->mdc47;
+            dst[11] = l2->mdc48;
+            dst[12] = l2->mdc51;
+            dst[13] = l2->mdc52;
+            dst[14] = l2->mdc53;
+            dst[15] = l2->mdc55;
+            dst[16] = l2->mdc58;
+            dst[17] = l2->mdc59;
+            dst[18] = l2->mdc60;
+            dst[19] = l2->mdc61;
+        }
+    }
 }
 
 #undef B4A_SCATTER

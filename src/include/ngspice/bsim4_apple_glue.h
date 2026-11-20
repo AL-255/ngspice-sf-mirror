@@ -39,6 +39,30 @@ B4P(isAvxEligibleTran)(CKTcircuit *ckt)
     return 1;
 }
 
+static inline int
+B4P(isAvxEligibleDcOp)(CKTcircuit *ckt)
+{
+    static int disabled = -1;
+    if (disabled < 0) {
+        disabled = (getenv("NGSPICE_NO_NEON") != NULL ||
+                    getenv("NGSPICE_NO_SIMD") != NULL ||
+                    getenv("NGSPICE_NO_AVX512") != NULL) ? 1 : 0;
+    }
+    if (disabled)
+        return 0;
+
+    long mode = ckt->CKTmode;
+    if (!(mode & (MODEDCOP | MODETRANOP)))
+        return 0;
+    if (!(mode & (MODEINITFLOAT | MODEINITJCT | MODEINITFIX)))
+        return 0;
+    if (mode & (MODEINITSMSIG | MODEINITTRAN | MODEUIC | MODEDCTRANCURVE | MODEAC | MODETRAN))
+        return 0;
+    if (ckt->CKTbypass)
+        return 0;
+    return 1;
+}
+
 void
 B4P(freeApplePack)(B4P(model) *head)
 {
@@ -63,6 +87,8 @@ B4P(freeApplePack)(B4P(model) *head)
 }
 
 typedef struct {
+    const char *mod_name;
+    double    l, w;
     uintptr_t mod_ptr;
     uintptr_t pp_ptr;
     int       has_trap;
@@ -76,7 +102,13 @@ B4P(cmpGroupKey)(const void *pa, const void *pb)
 {
     const B4P(GroupSortKey) *a = (const B4P(GroupSortKey) *)pa;
     const B4P(GroupSortKey) *b = (const B4P(GroupSortKey) *)pb;
-    if (a->mod_ptr != b->mod_ptr) return (a->mod_ptr < b->mod_ptr) ? -1 : 1;
+    if (a->mod_ptr != b->mod_ptr) {
+        int mc = strcmp(a->mod_name, b->mod_name);
+        if (mc != 0) return mc;
+        return (a->mod_ptr < b->mod_ptr) ? -1 : 1;
+    }
+    if (a->l != b->l) return (a->l < b->l) ? -1 : 1;
+    if (a->w != b->w) return (a->w < b->w) ? -1 : 1;
     if (a->pp_ptr  != b->pp_ptr)  return (a->pp_ptr  < b->pp_ptr)  ? -1 : 1;
     if (a->has_trap != b->has_trap) return a->has_trap - b->has_trap;
     if (a->nf != b->nf) return (a->nf < b->nf) ? -1 : 1;
@@ -440,6 +472,9 @@ B4P(ensureAvxPack)(B4P(model) *head, CKTcircuit *ckt)
 #endif
         if (ok) {
             B4P(GroupSortKey) *k = &keys[nElig++];
+            k->mod_name = m->gen.GENmodName;
+            k->l        = h->B4P(l);
+            k->w        = h->B4P(w);
             k->mod_ptr  = (uintptr_t)m;
             k->pp_ptr   = (uintptr_t)h->pParam;
             k->has_trap = h->B4P(hasTrapTunnel) ? 1 : 0;
@@ -744,26 +779,58 @@ B4P(stampOneDirect)(
     const double * restrict st = sp->st;
     if (stamp_mode == 1) {
         const int * restrict off = sp->kluOff;
-        my_rhs[c->dNodePrime] += st[0];
-        my_rhs[c->gNodePrime] -= st[1];
-        my_rhs[c->bNodePrime] += st[2];
-        my_rhs[c->sNodePrime] += st[3];
-        my_ax[off[0]]  += st[4];
-        my_ax[off[1]]  += st[5];
-        my_ax[off[2]]  += st[6];
-        my_ax[off[3]]  += st[7];
-        my_ax[off[4]]  += st[8];
-        my_ax[off[5]]  += st[9];
-        my_ax[off[6]]  -= st[10];
-        my_ax[off[7]]  -= st[11];
-        my_ax[off[8]]  -= st[12];
-        my_ax[off[9]]  += st[13];
-        my_ax[off[10]] += st[14];
-        my_ax[off[11]] -= st[15];
-        my_ax[off[12]] += st[16];
-        my_ax[off[13]] += st[17];
-        my_ax[off[14]] += st[18];
-        my_ax[off[15]] += st[19];
+        int dn = c->dNodePrime;
+        int gn = c->gNodePrime;
+        int sn = c->sNodePrime;
+        int bn = c->bNodePrime;
+        if (dn) my_rhs[dn] += st[0];
+        if (gn) my_rhs[gn] -= st[1];
+        if (bn) my_rhs[bn] += st[2];
+        if (sn) my_rhs[sn] += st[3];
+        /* 4-way ground-skip stamping: eliminates serialized my_ax[inz] store-forwarding stalls */
+        if (sn != 0 && bn != 0) {
+            my_ax[off[0]]  += st[4];
+            my_ax[off[1]]  += st[5];
+            my_ax[off[2]]  += st[6];
+            my_ax[off[3]]  += st[7];
+            my_ax[off[4]]  += st[8];
+            my_ax[off[5]]  += st[9];
+            my_ax[off[6]]  -= st[10];
+            my_ax[off[7]]  -= st[11];
+            my_ax[off[8]]  -= st[12];
+            my_ax[off[9]]  += st[13];
+            my_ax[off[10]] += st[14];
+            my_ax[off[11]] -= st[15];
+            my_ax[off[12]] += st[16];
+            my_ax[off[13]] += st[17];
+            my_ax[off[14]] += st[18];
+            my_ax[off[15]] += st[19];
+        } else if (sn != 0) {
+            my_ax[off[0]]  += st[4];
+            my_ax[off[1]]  += st[5];
+            my_ax[off[2]]  += st[6];
+            my_ax[off[4]]  += st[8];
+            my_ax[off[5]]  += st[9];
+            my_ax[off[6]]  -= st[10];
+            my_ax[off[8]]  -= st[12];
+            my_ax[off[9]]  += st[13];
+            my_ax[off[10]] += st[14];
+        } else if (bn != 0) {
+            my_ax[off[0]]  += st[4];
+            my_ax[off[1]]  += st[5];
+            my_ax[off[3]]  += st[7];
+            my_ax[off[4]]  += st[8];
+            my_ax[off[5]]  += st[9];
+            my_ax[off[7]]  -= st[11];
+            my_ax[off[12]] += st[16];
+            my_ax[off[13]] += st[17];
+            my_ax[off[15]] += st[19];
+        } else {
+            my_ax[off[0]]  += st[4];
+            my_ax[off[1]]  += st[5];
+            my_ax[off[4]]  += st[8];
+            my_ax[off[5]]  += st[9];
+        }
         if (__builtin_expect(c->has_dint | c->has_sint, 0)) {
             B4P(instance) *here = InstArray[c->instIdx];
             if (c->has_dint) {
@@ -781,38 +848,69 @@ B4P(stampOneDirect)(
         }
     } else if (stamp_mode == 2) {
         B4P(instance) *here = InstArray[c->instIdx];
-        my_rhs[c->dNodePrime] += st[0];
-        my_rhs[c->gNodePrime] -= st[1];
-        my_rhs[c->bNodePrime] += st[2];
-        my_rhs[c->sNodePrime] += st[3];
-        *(here->B4P(GPgpPtr)) += st[4];
-        *(here->B4P(GPdpPtr)) += st[5];
-        *(here->B4P(GPspPtr)) += st[6];
-        *(here->B4P(GPbpPtr)) += st[7];
-        *(here->B4P(DPdpPtr)) += st[8];
-        *(here->B4P(DPgpPtr)) += st[9];
-        *(here->B4P(DPspPtr)) -= st[10];
-        *(here->B4P(DPbpPtr)) -= st[11];
+        int dn = c->dNodePrime;
+        int gn = c->gNodePrime;
+        int sn = c->sNodePrime;
+        int bn = c->bNodePrime;
+        if (dn) my_rhs[dn] += st[0];
+        if (gn) my_rhs[gn] -= st[1];
+        if (bn) my_rhs[bn] += st[2];
+        if (sn) my_rhs[sn] += st[3];
+        if (sn != 0 && bn != 0) {
+            *(here->B4P(GPgpPtr)) += st[4];
+            *(here->B4P(GPdpPtr)) += st[5];
+            *(here->B4P(GPspPtr)) += st[6];
+            *(here->B4P(GPbpPtr)) += st[7];
+            *(here->B4P(DPdpPtr)) += st[8];
+            *(here->B4P(DPgpPtr)) += st[9];
+            *(here->B4P(DPspPtr)) -= st[10];
+            *(here->B4P(DPbpPtr)) -= st[11];
+            *(here->B4P(SPdpPtr)) -= st[12];
+            *(here->B4P(SPgpPtr)) += st[13];
+            *(here->B4P(SPspPtr)) += st[14];
+            *(here->B4P(SPbpPtr)) -= st[15];
+            *(here->B4P(BPdpPtr)) += st[16];
+            *(here->B4P(BPgpPtr)) += st[17];
+            *(here->B4P(BPspPtr)) += st[18];
+            *(here->B4P(BPbpPtr)) += st[19];
+        } else if (sn != 0) {
+            *(here->B4P(GPgpPtr)) += st[4];
+            *(here->B4P(GPdpPtr)) += st[5];
+            *(here->B4P(GPspPtr)) += st[6];
+            *(here->B4P(DPdpPtr)) += st[8];
+            *(here->B4P(DPgpPtr)) += st[9];
+            *(here->B4P(DPspPtr)) -= st[10];
+            *(here->B4P(SPdpPtr)) -= st[12];
+            *(here->B4P(SPgpPtr)) += st[13];
+            *(here->B4P(SPspPtr)) += st[14];
+        } else if (bn != 0) {
+            *(here->B4P(GPgpPtr)) += st[4];
+            *(here->B4P(GPdpPtr)) += st[5];
+            *(here->B4P(GPbpPtr)) += st[7];
+            *(here->B4P(DPdpPtr)) += st[8];
+            *(here->B4P(DPgpPtr)) += st[9];
+            *(here->B4P(DPbpPtr)) -= st[11];
+            *(here->B4P(BPdpPtr)) += st[16];
+            *(here->B4P(BPgpPtr)) += st[17];
+            *(here->B4P(BPbpPtr)) += st[19];
+        } else {
+            *(here->B4P(GPgpPtr)) += st[4];
+            *(here->B4P(GPdpPtr)) += st[5];
+            *(here->B4P(DPdpPtr)) += st[8];
+            *(here->B4P(DPgpPtr)) += st[9];
+        }
         if (__builtin_expect(c->has_dint, 0)) {
             double mgd = sp->mgd;
             *(here->B4P(DPdPtr)) -= mgd;
             *(here->B4P(DdpPtr)) -= mgd;
             *(here->B4P(DdPtr))  += mgd;
         }
-        *(here->B4P(SPdpPtr)) -= st[12];
-        *(here->B4P(SPgpPtr)) += st[13];
-        *(here->B4P(SPspPtr)) += st[14];
-        *(here->B4P(SPbpPtr)) -= st[15];
         if (__builtin_expect(c->has_sint, 0)) {
             double mgs = sp->mgs;
             *(here->B4P(SPsPtr)) -= mgs;
             *(here->B4P(SspPtr)) -= mgs;
             *(here->B4P(SsPtr))  += mgs;
         }
-        *(here->B4P(BPdpPtr)) += st[16];
-        *(here->B4P(BPgpPtr)) += st[17];
-        *(here->B4P(BPspPtr)) += st[18];
-        *(here->B4P(BPbpPtr)) += st[19];
     } else {
         B4P(instance) *here = InstArray[c->instIdx];
         here->B4P(rhsdPrime) = st[0];
@@ -896,6 +994,8 @@ B4P(evalAppleGroup)(
     double * restrict my_ax,
     double * restrict my_rhs,
     int stamp_mode,
+    int dc_only,
+    int force_aos,
     int l1_step_ok,
     int l2_gmin_ok,
     int * restrict eval_q,
@@ -912,21 +1012,24 @@ B4P(evalAppleGroup)(
 
     const double * restrict rhsOld = ckt->CKTrhsOld;
     double * restrict s0 = ckt->CKTstate0;
-    const double * restrict s1 = ckt->CKTstate1;
-    const double * restrict s2 = ckt->CKTstate2;
+    const double * restrict s1 = dc_only ? NULL : ckt->CKTstate1;
+    const double * restrict s2 = dc_only ? NULL : ckt->CKTstate2;
     const double cur_gmin = ckt->CKTgmin;
     const double reltol   = ckt->CKTreltol;
     const double abstol   = ckt->CKTabstol;
-    const double ag0 = ckt->CKTag[0], ag1 = ckt->CKTag[1], ag2 = ckt->CKTag[2];
-    const int is_pred  = (ckt->CKTmode & MODEINITPRED) != 0;
-    const int is_gear2 = (ckt->CKTintegrateMethod == GEAR && ckt->CKTorder == 2);
-    const int is_trap2 = (ckt->CKTintegrateMethod == TRAPEZOIDAL && ckt->CKTorder == 2);
-    const int need_aos = B4P(AvxNeedAosSync);
-    const double vtol  = B4P(avxBypassTol)(ckt);
+    const double ag0 = dc_only ? 0.0 : ckt->CKTag[0];
+    const double ag1 = dc_only ? 0.0 : ckt->CKTag[1];
+    const double ag2 = dc_only ? 0.0 : ckt->CKTag[2];
+    const int is_pred  = (!dc_only && (ckt->CKTmode & MODEINITPRED) != 0);
+    const int is_initjct = (dc_only && (ckt->CKTmode & MODEINITJCT) != 0);
+    const int is_gear2 = (!dc_only && ckt->CKTintegrateMethod == GEAR && ckt->CKTorder == 2);
+    const int is_trap2 = (!dc_only && ckt->CKTintegrateMethod == TRAPEZOIDAL && ckt->CKTorder == 2);
+    const int need_aos = B4P(AvxNeedAosSync) || force_aos;
+    const double vtol  = dc_only ? -1.0 : B4P(avxBypassTol)(ckt);
     const double xfact = is_pred ? (ckt->CKTdelta / ckt->CKTdeltaOld[1]) : 0.0;
     const double one_p_xf = 1.0 + xfact;
-    const int do_l1 = (!is_pred && !need_aos && vtol >= 0.0 && l1_step_ok);
-    const int do_l2 = (!need_aos && vtol >= 0.0 && l2_gmin_ok);
+    const int do_l1 = (!dc_only && !is_pred && !need_aos && vtol >= 0.0 && l1_step_ok);
+    const int do_l2 = (!dc_only && !need_aos && vtol >= 0.0 && l2_gmin_ok);
 
     int start = grp->offset;
     int end   = start + grp->count;
@@ -937,6 +1040,25 @@ B4P(evalAppleGroup)(
         BSIM4AppleCheck * restrict c = &checks[i];
 
         double vds, vgs, vbs;
+        if (is_initjct) {
+            B4P(instance) *h = InstArray[c->instIdx];
+            double t = c->type;
+            vds = t * h->B4P(icVDS);
+            vgs = t * h->B4P(icVGS);
+            vbs = t * h->B4P(icVBS);
+            if (vds == 0.0 && vgs == 0.0 && vbs == 0.0) {
+                vds = 0.1;
+                vgs = pp->vth0_signed + 0.1;
+                vbs = 0.0;
+            }
+            eval_q[n_eval]   = i;
+            eval_vds[n_eval] = vds;
+            eval_vgs[n_eval] = vgs;
+            eval_vbs[n_eval] = vbs;
+            n_eval++;
+            continue;
+        }
+
         double s0_vds, s0_vgs, s0_vbs, s0_vbd;
 
         if (!is_pred) {
@@ -1062,13 +1184,22 @@ B4P(evalAppleGroup)(
             pp, jpts, cpts, spts, l2pts, nact,
             bvds, bvgs, bvbs,
             cur_gmin, ag0, ag1, ag2, is_gear2, is_trap2,
-            s0, s1, s2, need_aos ? &out : NULL, need_aos);
+            s0, s1, s2, need_aos ? &out : NULL, need_aos, dc_only);
 
         for (int l = 0; l < nact; l++) {
-            cpts[l]->phys_valid = 1;
-            cpts[l]->stamp_valid = !need_aos;
-            if (need_aos)
-                B4P(scatterAosOne)(InstArray[cpts[l]->instIdx], &out, l);
+            if (dc_only) {
+                cpts[l]->phys_valid = 0;
+                cpts[l]->stamp_valid = 0;
+                if (need_aos)
+                    B4P(scatterAosOne)(InstArray[cpts[l]->instIdx], &out, l);
+                else
+                    InstArray[cpts[l]->instIdx]->B4P(von) = spts[l]->von;
+            } else {
+                cpts[l]->phys_valid = 1;
+                cpts[l]->stamp_valid = !need_aos;
+                if (need_aos)
+                    B4P(scatterAosOne)(InstArray[cpts[l]->instIdx], &out, l);
+            }
             B4P(stampOneDirect)(cpts[l], spts[l], InstArray, my_ax, my_rhs, stamp_mode);
         }
     }
@@ -1084,7 +1215,9 @@ B4P(runApplePack)(
     CKTcircuit *ckt,
     double * restrict my_ax,
     double * restrict my_rhs,
-    int stamp_mode)
+    int stamp_mode,
+    int dc_only,
+    int force_aos)
 {
     BSIM4ApplePack *pack = (BSIM4ApplePack *)head->B4P(AvxBlocks);
     if (!pack || pack->nElig <= 0) return;
@@ -1093,13 +1226,15 @@ B4P(runApplePack)(
 
     const double cur_time = ckt->CKTtime;
     const double cur_gmin = ckt->CKTgmin;
-    const double ag0 = ckt->CKTag[0], ag1 = ckt->CKTag[1], ag2 = ckt->CKTag[2];
-    const int is_gear2 = (ckt->CKTintegrateMethod == GEAR && ckt->CKTorder == 2);
-    const int is_trap2 = (ckt->CKTintegrateMethod == TRAPEZOIDAL && ckt->CKTorder == 2);
+    const double ag0 = dc_only ? 0.0 : ckt->CKTag[0];
+    const double ag1 = dc_only ? 0.0 : ckt->CKTag[1];
+    const double ag2 = dc_only ? 0.0 : ckt->CKTag[2];
+    const int is_gear2 = (!dc_only && ckt->CKTintegrateMethod == GEAR && ckt->CKTorder == 2);
+    const int is_trap2 = (!dc_only && ckt->CKTintegrateMethod == TRAPEZOIDAL && ckt->CKTorder == 2);
     const int int_mode = is_gear2 ? 2 : (is_trap2 ? 1 : 0);
     const double *s0 = ckt->CKTstate0, *s1 = ckt->CKTstate1, *s2 = ckt->CKTstate2;
 
-    int l2_gmin_ok = (pack->step_valid && pack->last_gmin == cur_gmin);
+    int l2_gmin_ok = (!dc_only && pack->step_valid && pack->last_gmin == cur_gmin);
     int l1_step_ok = (l2_gmin_ok &&
                       pack->last_time == cur_time &&
                       pack->last_ag0 == ag0 && pack->last_ag1 == ag1 && pack->last_ag2 == ag2 &&
@@ -1119,17 +1254,22 @@ B4P(runApplePack)(
             #pragma omp for schedule(dynamic, 1) nowait
             for (int gi = 0; gi < nGroups; gi++) {
                 B4P(evalAppleGroup)(pack, gi, InstArray, ckt, my_ax, my_rhs,
-                                    stamp_mode, l1_step_ok, l2_gmin_ok, tq, tvd, tvg, tvb);
+                                    stamp_mode, dc_only, force_aos,
+                                    l1_step_ok, l2_gmin_ok, tq, tvd, tvg, tvb);
             }
         }
         free(tq); free(tvd); free(tvg); free(tvb);
         #pragma omp single nowait
         {
-            pack->last_time = cur_time; pack->last_gmin = cur_gmin;
-            pack->last_ag0 = ag0; pack->last_ag1 = ag1; pack->last_ag2 = ag2;
-            pack->last_int_mode = int_mode;
-            pack->last_s0 = s0; pack->last_s1 = s1; pack->last_s2 = s2;
-            pack->step_valid = !B4P(AvxNeedAosSync);
+            if (dc_only) {
+                pack->step_valid = 0;
+            } else {
+                pack->last_time = cur_time; pack->last_gmin = cur_gmin;
+                pack->last_ag0 = ag0; pack->last_ag1 = ag1; pack->last_ag2 = ag2;
+                pack->last_int_mode = int_mode;
+                pack->last_s0 = s0; pack->last_s1 = s1; pack->last_s2 = s2;
+                pack->step_valid = !(B4P(AvxNeedAosSync) || force_aos);
+            }
         }
         return;
     }
@@ -1137,15 +1277,20 @@ B4P(runApplePack)(
 
     for (int gi = 0; gi < nGroups; gi++) {
         B4P(evalAppleGroup)(pack, gi, InstArray, ckt, my_ax, my_rhs,
-                            stamp_mode, l1_step_ok, l2_gmin_ok,
+                            stamp_mode, dc_only, force_aos,
+                            l1_step_ok, l2_gmin_ok,
                             pack->eval_q, pack->eval_vds, pack->eval_vgs, pack->eval_vbs);
     }
 
-    pack->last_time = cur_time; pack->last_gmin = cur_gmin;
-    pack->last_ag0 = ag0; pack->last_ag1 = ag1; pack->last_ag2 = ag2;
-    pack->last_int_mode = int_mode;
-    pack->last_s0 = s0; pack->last_s1 = s1; pack->last_s2 = s2;
-    pack->step_valid = !B4P(AvxNeedAosSync);
+    if (dc_only) {
+        pack->step_valid = 0;
+    } else {
+        pack->last_time = cur_time; pack->last_gmin = cur_gmin;
+        pack->last_ag0 = ag0; pack->last_ag1 = ag1; pack->last_ag2 = ag2;
+        pack->last_int_mode = int_mode;
+        pack->last_s0 = s0; pack->last_s1 = s1; pack->last_s2 = s2;
+        pack->step_valid = !(B4P(AvxNeedAosSync) || force_aos);
+    }
 }
 
 /*
@@ -1155,7 +1300,8 @@ int
 B4P(convTestAvx)(GENmodel *inModel, CKTcircuit *ckt)
 {
     B4P(model) *head = (B4P(model) *)inModel;
-    if (!head->B4P(AvxBuilt) || !head->B4P(AvxDynValid) || !B4P(isAvxEligibleTran)(ckt))
+    if (!head->B4P(AvxBuilt) || !head->B4P(AvxDynValid) ||
+        (!B4P(isAvxEligibleTran)(ckt) && !B4P(isAvxEligibleDcOp)(ckt)))
         return -1;
     if (head->B4P(AvxFallbackCount) != 0)
         return -1;
