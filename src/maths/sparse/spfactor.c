@@ -56,6 +56,7 @@
  *    Matrix type and macro definitions for the sparse matrix routines.
  */
 #include <assert.h>
+#include <stdlib.h>
 #define spINSIDE_SPARSE
 #include "spconfig.h"
 #include "ngspice/spmatrix.h"
@@ -301,9 +302,141 @@ Done:
     Matrix->NeedsOrdering = NO;
     Matrix->Reordered = YES;
     Matrix->Factored = YES;
+#if NGSPICE_OPT_GENERAL
+    Matrix->FlatValid = 0;
+    Matrix->FlatFactored = 0;
+#endif
 
     return Matrix->Error;
 }
+
+#if NGSPICE_OPT_GENERAL
+void
+spcSyncFlatToElems(MatrixPtr Matrix)
+{
+    if (!Matrix || !Matrix->FlatValid || !Matrix->FlatFactored)
+        return;
+    int nnz = Matrix->FlatNnz;
+    const double * restrict val = Matrix->FlatVal;
+    double * const * restrict eptr = Matrix->FlatElemPtr;
+    for (int p = 0; p < nnz; p++)
+        *(eptr[p]) = val[p];
+    Matrix->FlatFactored = 0;
+}
+
+static int
+spcBuildFlatCsc(MatrixPtr Matrix)
+{
+    int Size = Matrix->Size;
+    if (Size <= 0 || Matrix->Complex || Matrix->Intermediate == NULL)
+        return 0;
+
+    int nnz = 0;
+    for (int c = 1; c <= Size; c++) {
+        ElementPtr p = Matrix->FirstInCol[c];
+        int prev_r = 0;
+        int has_diag = 0;
+        while (p != NULL) {
+            if (p->Row <= prev_r || p->Row > Size)
+                return 0;
+            if (p->Row == c) has_diag = 1;
+            prev_r = p->Row;
+            nnz++;
+            p = p->NextInCol;
+        }
+        if (!has_diag)
+            return 0;
+    }
+
+    free(Matrix->FlatColStart);  Matrix->FlatColStart  = NULL;
+    free(Matrix->FlatDiagIdx);   Matrix->FlatDiagIdx   = NULL;
+    free(Matrix->FlatRow);       Matrix->FlatRow       = NULL;
+    free(Matrix->FlatVal);       Matrix->FlatVal       = NULL;
+    free(Matrix->FlatElemPtr);   Matrix->FlatElemPtr   = NULL;
+    free(Matrix->FlatURowStart); Matrix->FlatURowStart = NULL;
+    free(Matrix->FlatUCol);      Matrix->FlatUCol      = NULL;
+    free(Matrix->FlatUValIdx);   Matrix->FlatUValIdx   = NULL;
+
+    int *colStart = (int *)malloc((size_t)(Size + 2) * sizeof(int));
+    int *diagIdx  = (int *)malloc((size_t)(Size + 1) * sizeof(int));
+    int *row      = (int *)malloc((size_t)(nnz + 1) * sizeof(int));
+    double *val   = NULL;
+    double **eptr = (double **)malloc((size_t)(nnz + 1) * sizeof(double *));
+    if (!colStart || !diagIdx || !row || !eptr ||
+        posix_memalign((void **)&val, 128, (size_t)(nnz + 1) * sizeof(double)) != 0)
+    {
+        free(colStart); free(diagIdx); free(row); free(val); free(eptr);
+        return 0;
+    }
+
+    int idx = 0;
+    colStart[0] = 0;
+    diagIdx[0]  = 0;
+    for (int c = 1; c <= Size; c++) {
+        colStart[c] = idx;
+        ElementPtr p = Matrix->FirstInCol[c];
+        while (p != NULL) {
+            row[idx]  = p->Row;
+            eptr[idx] = &p->Real;
+            if (p->Row == c)
+                diagIdx[c] = idx;
+            idx++;
+            p = p->NextInCol;
+        }
+    }
+    colStart[Size + 1] = idx;
+
+    /* Build row-oriented CSR index of strict upper triangle U (ascending Col order)
+     * so backward substitution in spSolve preserves exact stock summation order! */
+    int *uRowStart = (int *)calloc((size_t)(Size + 2), sizeof(int));
+    int unnz = 0;
+    if (uRowStart) {
+        for (int c = 1; c <= Size; c++) {
+            int cd = diagIdx[c];
+            for (int p = colStart[c]; p < cd; p++) {
+                uRowStart[row[p] + 1]++;
+                unnz++;
+            }
+        }
+        for (int r = 1; r <= Size; r++)
+            uRowStart[r + 1] += uRowStart[r];
+    }
+    int *uCol    = (int *)malloc((size_t)(unnz + 1) * sizeof(int));
+    int *uValIdx = (int *)malloc((size_t)(unnz + 1) * sizeof(int));
+    int *uCursor = (int *)malloc((size_t)(Size + 2) * sizeof(int));
+    if (!uRowStart || !uCol || !uValIdx || !uCursor) {
+        free(colStart); free(diagIdx); free(row); free(val); free(eptr);
+        free(uRowStart); free(uCol); free(uValIdx); free(uCursor);
+        return 0;
+    }
+    for (int r = 0; r <= Size + 1; r++)
+        uCursor[r] = uRowStart[r];
+    for (int c = 1; c <= Size; c++) {
+        int cd = diagIdx[c];
+        for (int p = colStart[c]; p < cd; p++) {
+            int pos = uCursor[row[p]]++;
+            uCol[pos]    = c;
+            uValIdx[pos] = p;
+        }
+    }
+    free(uCursor);
+
+    Matrix->FlatColStart  = colStart;
+    Matrix->FlatDiagIdx   = diagIdx;
+    Matrix->FlatRow       = row;
+    Matrix->FlatVal       = val;
+    Matrix->FlatElemPtr   = eptr;
+    Matrix->FlatURowStart = uRowStart;
+    Matrix->FlatUCol      = uCol;
+    Matrix->FlatUValIdx   = uValIdx;
+    Matrix->FlatSize      = Size;
+    Matrix->FlatElements  = Matrix->Elements;
+    Matrix->FlatNnz       = idx;
+    Matrix->FlatValid     = 1;
+    Matrix->FlatFactored  = 0;
+    return 1;
+}
+#endif
 
 
 
@@ -366,6 +499,93 @@ spFactor(MatrixPtr Matrix)
         Matrix->Factored = YES;
         return (Matrix->Error = spOKAY);
     }
+
+#if NGSPICE_OPT_GENERAL
+    {
+        static int flat_disabled = -1;
+        if (flat_disabled < 0)
+            flat_disabled = (getenv("NGSPICE_NO_SPARSE_FLAT") != NULL) ? 1 : 0;
+        if (!flat_disabled && Matrix->Intermediate != NULL) {
+            if (!Matrix->FlatValid || Matrix->FlatSize != Size ||
+                Matrix->FlatElements != Matrix->Elements)
+            {
+                spcBuildFlatCsc(Matrix);
+            }
+            if (Matrix->FlatValid) {
+                const int * restrict colStart = Matrix->FlatColStart;
+                const int * restrict diagIdx  = Matrix->FlatDiagIdx;
+                const int * restrict row      = Matrix->FlatRow;
+                double * restrict val         = Matrix->FlatVal;
+                double * const * restrict eptr = Matrix->FlatElemPtr;
+                double * restrict Dest        = (double *)Matrix->Intermediate;
+
+                /* Step 1 */
+                {
+                    int d1 = diagIdx[1];
+                    double p1 = *(eptr[d1]);
+                    if (p1 == 0.0) {
+                        Matrix->FlatFactored = 0;
+                        return ZeroPivot(Matrix, 1);
+                    }
+                    val[d1] = 1.0 / p1;
+                    int c2 = colStart[2];
+                    for (int p = d1 + 1; p < c2; p++)
+                        val[p] = *(eptr[p]);
+                }
+
+                /* Steps 2 .. Size: contiguous CSC left-looking LU (zero linked-list chases!) */
+                for (Step = 2; Step <= Size; Step++) {
+                    int c0 = colStart[Step];
+                    int c1 = colStart[Step + 1];
+                    int cd = diagIdx[Step];
+
+                    /* Fused gather from MatrixElement->Real + scatter into Dest[] */
+                    for (int p = c0; p < c1; p++)
+                        Dest[row[p]] = *(eptr[p]);
+
+                    /* Left-looking U-driven column update */
+                    for (int pu = c0; pu < cd; pu++) {
+                        int r = row[pu];
+                        int rd = diagIdx[r];
+                        double mult = Dest[r] * val[rd];
+                        val[pu] = mult;
+                        if (mult != 0.0) {
+                            int l1 = colStart[r + 1];
+                            int p = rd + 1;
+                            for (; p + 3 < l1; p += 4) {
+                                int i0 = row[p], i1 = row[p + 1], i2 = row[p + 2], i3 = row[p + 3];
+                                double d0 = Dest[i0], d1 = Dest[i1], d2 = Dest[i2], d3 = Dest[i3];
+                                d0 -= mult * val[p];
+                                d1 -= mult * val[p + 1];
+                                d2 -= mult * val[p + 2];
+                                d3 -= mult * val[p + 3];
+                                Dest[i0] = d0; Dest[i1] = d1; Dest[i2] = d2; Dest[i3] = d3;
+                            }
+                            for (; p < l1; p++)
+                                Dest[row[p]] -= mult * val[p];
+                        }
+                    }
+
+                    /* Gather L column entries */
+                    for (int p = cd + 1; p < c1; p++)
+                        val[p] = Dest[row[p]];
+
+                    /* Pivot check & reciprocal */
+                    double piv = Dest[Step];
+                    if (piv == 0.0) {
+                        Matrix->FlatFactored = 0;
+                        return ZeroPivot(Matrix, Step);
+                    }
+                    val[cd] = 1.0 / piv;
+                }
+
+                Matrix->Factored = YES;
+                Matrix->FlatFactored = 1;
+                return (Matrix->Error = spOKAY);
+            }
+        }
+    }
+#endif
 
     if (Matrix->Diag[1]->Real == 0.0) return ZeroPivot( Matrix, 1 );
     Matrix->Diag[1]->Real = 1.0 / Matrix->Diag[1]->Real;
@@ -2178,6 +2398,10 @@ spcRowExchange( MatrixPtr Matrix, int Row1, int Row2 )
     ElementPtr  Element1, Element2;
 
     /* Begin `spcRowExchange'. */
+#if NGSPICE_OPT_GENERAL
+    Matrix->FlatValid = 0;
+    Matrix->FlatFactored = 0;
+#endif
     if (Row1 > Row2)  SWAP(int, Row1, Row2);
 
     Row1Ptr = Matrix->FirstInRow[Row1];
@@ -2272,6 +2496,10 @@ spcColExchange( MatrixPtr Matrix, int Col1, int Col2 )
     ElementPtr  Element1, Element2;
 
     /* Begin `spcColExchange'. */
+#if NGSPICE_OPT_GENERAL
+    Matrix->FlatValid = 0;
+    Matrix->FlatFactored = 0;
+#endif
     if (Col1 > Col2)  SWAP(int, Col1, Col2);
 
     Col1Ptr = Matrix->FirstInCol[Col1];

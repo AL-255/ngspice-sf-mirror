@@ -1015,6 +1015,17 @@ typedef struct sKLUmatrix {
     double *KLUmatrixAxResConst ;
     int     KLUmatrixResConstValid ;
     unsigned long long KLUmatrixResVersion ;
+    double *KLUmatrixAxCapUnit ;
+    int     KLUmatrixCapUnitValid ;
+    unsigned long long KLUmatrixCapVersion ;
+    double *KLUmatrixAxResCapBase ;
+    double  KLUmatrixResCapAg0 ;
+    int     KLUmatrixResCapValid ;
+    int     KLUmatrixResCapHasRes ;
+    double *KLUmatrixRhsCapCache ;
+    int     KLUmatrixRhsCapLen ;
+    int     KLUmatrixRhsCapValid ;
+    int     KLUmatrixIdentityMap ; /* -1=unknown, 0=non-identity, 1=identity */
 
 #ifdef CIDER
     int *KLUmatrixColCOOforCIDER ;             /* KLU Col Index for COO storage (for CIDER) */

@@ -23,6 +23,20 @@
     Xi = (Int *) (LU + Xip [k]) ; \
 }
 
+#if NGSPICE_OPT_GENERAL
+#define GET_X_POINTER(LU, Xip, Xlen, Xx, k) \
+{ \
+    Xx = (Entry *) (LU + Xip [k] + (((size_t) (Xlen [k]) * sizeof (Int) + sizeof (Unit) - 1) / sizeof (Unit))) ; \
+}
+
+#define GET_POINTER(LU, Xip, Xlen, Xi, Xx, k, xlen) \
+{ \
+    Unit *xp = LU + Xip [k] ; \
+    xlen = Xlen [k] ; \
+    Xi = (Int *) xp ; \
+    Xx = (Entry *) (xp + (((size_t) (xlen) * sizeof (Int) + sizeof (Unit) - 1) / sizeof (Unit))) ; \
+}
+#else
 #define GET_X_POINTER(LU, Xip, Xlen, Xx, k) \
 { \
     Xx = (Entry *) (LU + Xip [k] + UNITS (Int, Xlen [k])) ; \
@@ -35,6 +49,7 @@
     Xi = (Int *) xp ; \
     Xx = (Entry *) (xp + UNITS (Int, xlen)) ; \
 }
+#endif
 
 /* function names */
 #ifdef COMPLEX

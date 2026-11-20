@@ -183,6 +183,10 @@ spMNA_Preorder(MatrixPtr Matrix)
 
     /* Begin `spMNA_Preorder'. */
     assert( IS_VALID(Matrix) && !Matrix->Factored );
+#if NGSPICE_OPT_GENERAL
+    Matrix->FlatValid = 0;
+    Matrix->FlatFactored = 0;
+#endif
 
     if (Matrix->RowsLinked) return;
     Size = Matrix->Size;

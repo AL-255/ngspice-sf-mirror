@@ -184,6 +184,9 @@ spClear(MatrixPtr Matrix)
 
     Matrix->Error = spOKAY;
     Matrix->Factored = NO;
+#if NGSPICE_OPT_GENERAL
+    Matrix->FlatFactored = 0;
+#endif
     Matrix->SingularCol = 0;
     Matrix->SingularRow = 0;
     Matrix->PreviousMatrixWasComplex = Matrix->Complex;
@@ -1228,6 +1231,9 @@ spInitialize(MatrixPtr Matrix, int (*pInit)(RealNumber*, void *InitInfo, int , i
 
     Matrix->Error = spOKAY;
     Matrix->Factored = NO;
+#if NGSPICE_OPT_GENERAL
+    Matrix->FlatFactored = 0;
+#endif
     Matrix->SingularCol = 0;
     Matrix->SingularRow = 0;
     Matrix->PreviousMatrixWasComplex = Matrix->Complex;

@@ -333,6 +333,61 @@ dicostack_pop(dico_t *dico)
     inst_name = dico->inst_name[dico->stack_depth];
     htable_p = dico->symbols[dico->stack_depth];
     if (htable_p) {
+#if NGSPICE_OPT_GENERAL
+        size_t inst_len = strlen(inst_name);
+        char stack_buf[256];
+        if (!(dico->inst_symbols))
+            dico->inst_symbols = nghash_init(256);
+
+        NGHASH_FIRST(&iter);
+        for (entry = (entry_t *) nghash_enumerateRE(htable_p, &iter);
+                 entry;
+                 entry = (entry_t *) nghash_enumerateRE(htable_p, &iter)) {
+            size_t sym_len = strlen(entry->symbol);
+            size_t qlen = inst_len + 1 + sym_len;
+            char *qname = (qlen + 1 <= sizeof(stack_buf))
+                              ? stack_buf
+                              : TMALLOC(char, qlen + 1);
+            entry_t *existing;
+
+            memcpy(qname, inst_name, inst_len);
+            qname[inst_len] = '.';
+            memcpy(qname + inst_len + 1, entry->symbol, sym_len + 1);
+
+            existing = (entry_t *) nghash_insert(dico->inst_symbols, qname, entry);
+            if (!existing) {
+                char *new_sym;
+                if (qname != stack_buf) {
+                    new_sym = qname;
+                    qname = stack_buf; /* ownership transferred */
+                } else {
+#if !defined(HAVE_LIBGC) && !defined(TCL_MODULE) && !defined(SHARED_MODULE)
+                    new_sym = (char *)malloc(qlen + 1);
+                    if (!new_sym)
+                        new_sym = TMALLOC(char, qlen + 1);
+#else
+                    new_sym = TMALLOC(char, qlen + 1);
+#endif
+                    memcpy(new_sym, qname, qlen + 1);
+                }
+                txfree(entry->symbol);
+                entry->symbol = new_sym;
+                entry->level = dico->stack_depth;
+            } else {
+                if (!(existing->level < dico->stack_depth &&
+                      existing->tp != NUPA_UNKNOWN)) {
+                    existing->vl = entry->vl;
+                    existing->tp = entry->tp;
+                    existing->ivl = entry->ivl;
+                    existing->sbbase = entry->sbbase;
+                }
+                dico_free_entry(entry);
+            }
+            if (qname != stack_buf)
+                txfree(qname);
+        }
+        nghash_free(htable_p, NULL, NULL);
+#else
         /* build a qualified name */
         DS_CREATE(param_name, 100);
 
@@ -351,6 +406,7 @@ dicostack_pop(dico_t *dico)
         }
         nghash_free(htable_p, NULL, NULL);
         ds_free(&param_name);
+#endif
     }
     tfree(inst_name);
 

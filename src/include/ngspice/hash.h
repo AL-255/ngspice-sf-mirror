@@ -10,6 +10,7 @@ REVISIONS:  Aug 21, 2009 - adapted for ngspice
 #define ngspice_HASH_H
 
 #include "ngspice/bool.h"
+#include "ngspice/opt_config.h"
 #include <stdint.h>
 
 #define _NGMALLOC(size_xz)            tmalloc((size_xz))
@@ -30,6 +31,9 @@ typedef struct ngtable_rec {
     struct ngtable_rec *next ;		/* collision list */
     struct ngtable_rec *thread_next ;    /* thread thru entire table */
     struct ngtable_rec *thread_prev ;    /* thread thru entire table */
+#if NGSPICE_OPT_GENERAL
+    unsigned int hash ;                  /* cached 32-bit raw hash */
+#endif
 } NGTABLEBOX, *NGTABLEPTR ;
 
 struct nghashbox;
@@ -304,6 +308,9 @@ Function:
 
 
 extern int nghash_table_get( NGHASHPTR  hashtable ) ;
+#if NGSPICE_OPT_GENERAL
+extern void nghash_reserve( NGHASHPTR hashtable, int min_entries ) ;
+#endif
 /*
 Function:
     Returns the current size of hash table set by nghash_table_create 

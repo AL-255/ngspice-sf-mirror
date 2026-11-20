@@ -201,3 +201,22 @@ Precompiling the full GF180 typical PDK (`design.ngspice` + `sm141064.ngspice` c
   5. **Dynamic Active-Lane SIMD Compaction** (`bsim4_avx512_core.h`, `bsim4_avx512_glue.h`, `b4v5ld.c`, `b4v6ld.c`, `NGSPICE_OPT_ZEN4`, toggle `NGSPICE_NO_LANE_COMPACT=1`):
      - In partially active 8-wide BSIM4 blocks (`1..5` moving lanes with `>=1` stationary lanes), stationary lanes take their exact L1/L2 bypass path while moving lanes are packed across blocks into dense 8-wide AVX-512 batches using an in-register 8×8 AVX-512 `double` transpose (`b4_transpose_8x8`) over contiguous per-instance `BSIM4Avx512Inst` records (allocated contiguously after `blocks[nBlocks]` when `nBlocks > 4`) and 1-cycle `_mm512_test_epi64_mask` (`vptestmq`) mask packing.
      - Preserves exact `0..nBlocks-1` stamping summation order on Sparse 1t (`stamp_mode != 0`) while eliminating 25–47% of redundant BSIM4 lane evaluations on large mixed-signal workloads (`ti12_full_300ns`, `pll_ring_150m_4us`, `sar12_hero_16cyc`).
+
+### Stage 11: Portable Solver & Frontend Convergence from `opt/apple-silicon-transient` (`NGSPICE_OPT_GENERAL`)
+- **Gain (single-core 1t on Ryzen 9 7940HX vs Stage 10 / vs Stock Sparse 1t):**
+  - `sar12_hero_16cyc`: KLU **`60.64 s -> 55.56 s`** (**11.28×** vs stock Sparse `626.75 s`); Sparse **`142.57 s -> 77.84 s`** (**-45.4%**, `spFactor` **3.4×** faster, `spSolve` **4.0×** faster!)
+  - `ti12_full_300ns`: KLU **`39.16 s -> 33.30 s`** (**-15.0%**, **13.95×** vs stock Sparse `464.51 s`); Sparse **`77.01 s -> 56.77 s`** (**-26.3%**, `rel_rms = 3.04e-11`)
+  - `pll_ring_150m_4us`: KLU **`22.70 s -> 21.37 s`** (**10.86×** vs stock Sparse `232.14 s`); Sparse **`30.54 s -> 24.04 s`** (**-21.3%**)
+  - `sdm16_120cyc`: KLU **`24.70 s -> 23.05 s`** (**-6.7%**); Sparse **`69.33 s -> 32.07 s`** (**-53.7%**, 115/115 exact PDM bits, `rel_rms = 5.25e-3`)
+  - `sar12_probe_2cyc`: KLU **`8.13 s -> 7.48 s`** (**10.89×** vs stock Sparse `81.46 s`); Sparse **`18.91 s -> 11.20 s`** (**-40.8%**)
+  - `opa1k_pvt16`: KLU **`134.76 s -> 130.88 s`** (`-2.9%`); Sparse **`134.72 s -> 123.34 s`** (**-8.4%**, `5.08×` vs stock `626.47 s`)
+  - **12/12** golden PASS across KLU & Sparse with **bit-identical** Sparse iteration counts and `rel_rms` vs linked-list Sparse.
+- **Major changes (all 100% portable C99 under `NGSPICE_OPT_GENERAL`):**
+  1. **Flat contiguous CSC numeric refactor & exact row-oriented CSR backward solve for Sparse** (`spdefs.h`, `spalloc.c`, `spbuild.c`, `spfactor.c`, `spsolve.c`, `sputils.c`):
+     - Compiles the Sparse linked-list LU structure into contiguous CSC arrays `(FlatColStart, FlatDiagIdx, FlatRow, FlatVal, FlatElemPtr)` plus a row-oriented strict-upper CSR index `(FlatURowStart, FlatUCol, FlatUValIdx)` that preserves exact stock `NextInRow` floating-point summation order in backward substitution while eliminating all pointer chasing.
+  2. **Pre-baked unit-capacitance KLU matrix + per-timestep CAP RHS cache + `KLUmatrixIdentityMap`** (`capdefs.h`, `capload.c`, `klu.h`, `klusmp.c`, `cktload.c`):
+     - Pre-bakes constant linear capacitance stamps into `KLUmatrixAxCapUnit` and combines `res_base + ag0 * cap_unit` once per `ag0` into `KLUmatrixAxResCapBase`, turning 100k PEX capacitor stamps on `ti12_full_300ns` into a single `memcpy`.
+     - Detects identity `KLUmatrixNodeCollapsingNewToOld` mapping once per matrix to eliminate `RHS -> Intermediate -> RHS` scatter/gather copies in `SMPsolve`.
+  3. **Fast power-of-2 `nghash` + zero-copy subcircuit parameter transfer** (`hash.h`, `hash.c`, `spicenum.c`, `xpressn.c`):
+     - Power-of-2 mask sizing, cached 32-bit FNV-1a hash pre-filter, in-place node relinking on resize, and swap-merge subcircuit symbol dictionaries.
+  4. **Unsigned `size_t` KLU `GET_POINTER`/`GET_X_POINTER`** (`klu_version.h`) & **`ft_numparse()` FP-to-int overflow UB fix** (`numparse.c`).
