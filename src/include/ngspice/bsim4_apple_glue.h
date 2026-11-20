@@ -52,11 +52,13 @@ B4P(isAvxEligibleDcOp)(CKTcircuit *ckt)
         return 0;
 
     long mode = ckt->CKTmode;
-    if (!(mode & MODEDCOP))
+    if (!(mode & (MODEDCOP | MODETRANOP)))
+        return 0;
+    if ((mode & MODETRANOP) && ckt->CKTdiagGmin != 0.0)
         return 0;
     if (!(mode & (MODEINITFLOAT | MODEINITJCT | MODEINITFIX)))
         return 0;
-    if (mode & (MODEINITSMSIG | MODEINITTRAN | MODEUIC | MODEDCTRANCURVE | MODEAC | MODETRAN | MODETRANOP))
+    if (mode & (MODEINITSMSIG | MODEINITTRAN | MODEUIC | MODEDCTRANCURVE | MODEAC | MODETRAN))
         return 0;
     if (ckt->CKTbypass)
         return 0;
