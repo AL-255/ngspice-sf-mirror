@@ -50,6 +50,7 @@ Author: 1985 Wayne A. Christopher
 #include "variable.h"
 
 #include "inpcompat.h"
+#include "inp_spectre.h"
 
 #ifdef XSPICE
 /* gtri - add - 12/12/90 - wbk - include new stuff */
@@ -117,6 +118,7 @@ static NgPendingSplice ng_pending_nglibs[NG_MAX_PENDING_SPLICE];
 static int ng_num_pending_nglibs = 0;
 static int ng_reading_a_lib = 0;
 static struct library *ng_dep_collector_lib = NULL;
+static unsigned int ng_lib_gen = 0;
 #endif
 
 static struct library {
@@ -127,6 +129,7 @@ static struct library {
     char          *orig_path;
     uint32_t       compat_mask;
     int            soacheck;
+    unsigned int   read_gen;
     NgLibDep      *deps;
     int            num_deps;
     int            cap_deps;
@@ -580,6 +583,10 @@ static void lib_add_dep(struct library *lib, const char *path)
 
 static int lib_is_valid(const struct library *lib, uint32_t cur_mask, int cur_soa)
 {
+    /* Never evict a library already validated/loaded in the current expand_section_references
+     * pass (e.g. when a .scs library auto-enables newcompat.spe mid-pass). */
+    if (ng_lib_gen != 0 && lib->read_gen == ng_lib_gen)
+        return 1;
     if (lib->compat_mask != cur_mask || lib->soacheck != cur_soa)
         return 0;
     if (lib->num_deps == 0)
@@ -649,8 +656,10 @@ static struct library *find_lib(char *name)
     int cur_soa = cp_getvar("soacheck", CP_BOOL, NULL, 0) ? 1 : 0;
     for (i = 0; i < num_libraries; i++) {
         if (cieq(libraries[i].realpath, name)) {
-            if (lib_is_valid(&libraries[i], cur_mask, cur_soa))
+            if (lib_is_valid(&libraries[i], cur_mask, cur_soa)) {
+                libraries[i].read_gen = ng_lib_gen;
                 return &libraries[i];
+            }
             free_one_lib(&libraries[i]);
             memmove(&libraries[i], &libraries[i + 1],
                     (size_t)(num_libraries - i - 1) * sizeof(struct library));
@@ -725,6 +734,7 @@ static struct library *read_a_lib(const char *y, const char *dir_name)
             {
                 if (lib_is_valid(&libraries[i], cur_mask, cur_soa)) {
                     lib = &libraries[i];
+                    lib->read_gen = ng_lib_gen;
                     if (ng_dep_collector_lib && lib != ng_dep_collector_lib) {
                         for (int di = 0; di < lib->num_deps; di++)
                             lib_add_dep(ng_dep_collector_lib, lib->deps[di].path);
@@ -789,6 +799,10 @@ static struct library *read_a_lib(const char *y, const char *dir_name)
             inp_read(newfp, 1 /*dummy*/, lib->habitat, lib->realpath, FALSE, FALSE).cc;
 #if NGSPICE_OPT_GENERAL
         ng_reading_a_lib--;
+        /* inp_read() may auto-enable compat flags (e.g. newcompat.spe on .scs files);
+         * refresh compat_mask and pin to current expand_section_references generation. */
+        lib->compat_mask = nglib_current_compat_mask();
+        lib->read_gen = ng_lib_gen;
 #endif
 
         struct card* tmpdeck;
@@ -1578,10 +1592,22 @@ static struct inp_read_t inp_read(FILE* fp, int call_depth, const char* dir_name
         ng_num_pending_nglibs = 0;
 #endif
 
+    /* Native Spectre (.scs) compatibility translation */
+    char **spe_lines = NULL;
+    size_t spe_idx = 0, spe_nlines = 0;
+    if (!intfile && !comfile && fp && inp_spectre_should_translate(fp, file_name)) {
+        spe_lines = inp_spectre_translate_fp(fp, dir_name, file_name, (call_depth == 0), &spe_nlines);
+    }
     /* First read in all lines & put them in the struct cc */
     for (;;) {
+        /* derive lines from Spectre translator */
+        if (spe_lines) {
+            if (spe_idx >= spe_nlines)
+                break;
+            buffer = spe_lines[spe_idx++];
+        }
         /* derive lines from circarray */
-        if (intfile) {
+        else if (intfile) {
             buffer = circarray[cirlinecount++];
             if (!buffer) {
                 tfree(circarray);
@@ -2192,6 +2218,12 @@ static struct inp_read_t inp_read(FILE* fp, int call_depth, const char* dir_name
 
         tfree(buffer);
     } /* end while ((buffer = readline(fp)) != NULL) */
+
+    if (spe_lines) {
+        while (spe_idx < spe_nlines)
+            tfree(spe_lines[spe_idx++]);
+        tfree(spe_lines);
+    }
 
     if (!cc) /* No stuff here */
     {
@@ -4436,6 +4468,8 @@ static struct card *expand_section_ref(struct card *c, const char *dir_name)
 static void expand_section_references(struct card *c, const char *dir_name)
 {
 #if NGSPICE_OPT_GENERAL
+    if (++ng_lib_gen == 0)
+        ng_lib_gen = 1;
     if (!nglib_precompiling && c) {
         int can_batch = 1;
         int n_libs = 0;
@@ -4747,13 +4781,15 @@ static int inp_fix_subckt_multiplier(struct names *subckt_w_params,
     for (card = subckt_card->nextcard; card && !ciprefix(".ends", card->line);
             card = card->nextcard) {
         char *curr_line = card->line;
-        /* no 'm' for comment line, V, E, H and some others that are not
+        /* no 'm' for comment line, dot cards, V, E, H and some others that are not
            using 'm' in their model description.
-           B source will get 'm' only when it is a current source. */
-        if (strchr("*vehaknopstuwy", curr_line[0]))
+           B source will get 'm' only when it is a current source.
+           In Spectre mode, OSDI 'n' devices DO support 'm' multiplicity. */
+        if (curr_line[0] == '.')
             continue;
-        /* no 'm' for model cards */
-        if (ciprefix(".model", curr_line))
+        if (strchr("*vehakopstuwy", curr_line[0]))
+            continue;
+        if (curr_line[0] == 'n' && !newcompat.spe)
             continue;
         /* Special treatment for B source:
            Skip voltage source */
@@ -4766,7 +4802,7 @@ static int inp_fix_subckt_multiplier(struct names *subckt_w_params,
             if (ciprefix("v=", tmpstr))
                 continue;
         }
-        if (newcompat.hs && card->compmod == 0) {
+        if ((newcompat.hs || newcompat.spe) && card->compmod == 0) {
             /* if there is already an m=xx in the instance line, multiply it with the new m */
             char* mult = strstr(curr_line, " m=");
             if (mult) {
@@ -4816,45 +4852,53 @@ static void inp_fix_inst_calls_for_numparam(
     int i;
 
     // first iterate through instances and find occurences where 'm'
-    // multiplier needs to be added to the subcircuit -- subsequent instances
-    // will then need this parameter as well
-    for (c = deck; c; c = c->nextcard) {
-        char *inst_line = c->line;
+    // multiplier needs to be added to the subcircuit -- repeat to fixed point
+    // so multi-level nested subckts (e.g. wrapper -> PDK inline subckt -> device)
+    // propagate 'm' down the entire hierarchy.
+    bool m_propagated;
+    do {
+        m_propagated = FALSE;
+        for (c = deck; c; c = c->nextcard) {
+            char *inst_line = c->line;
 
-        if (*inst_line == '*')
-            continue;
+            if (*inst_line == '*')
+                continue;
 
-        if (ciprefix("x", inst_line)) {
-            int num_inst_params = inp_get_params(
-                    inst_line, inst_param_names, inst_param_values);
-            char *subckt_name = inp_get_subckt_name(inst_line);
+            if (ciprefix("x", inst_line)) {
+                int num_inst_params = inp_get_params(
+                        inst_line, inst_param_names, inst_param_values);
+                char *subckt_name = inp_get_subckt_name(inst_line);
 
-            if (found_mult_param(num_inst_params, inst_param_names)) {
-                struct card_assoc *a = find_subckt(c->level, subckt_name);
-                if (a) {
-                    int num_subckt_params = inp_get_params(a->line->line,
-                            subckt_param_names, subckt_param_values);
+                if (found_mult_param(num_inst_params, inst_param_names)) {
+                    struct card_assoc *a = find_subckt(c->level, subckt_name);
+                    if (a) {
+                        int num_subckt_params = inp_get_params(a->line->line,
+                                subckt_param_names, subckt_param_values);
 
-                    if (!found_mult_param(
-                                num_subckt_params, subckt_param_names))
-                        inp_fix_subckt_multiplier(subckt_w_params, a->line,
-                                num_subckt_params, subckt_param_names,
-                                subckt_param_values);
+                        if (!found_mult_param(
+                                    num_subckt_params, subckt_param_names)) {
+                            num_subckt_params = inp_fix_subckt_multiplier(
+                                    subckt_w_params, a->line,
+                                    num_subckt_params, subckt_param_names,
+                                    subckt_param_values);
+                            m_propagated = TRUE;
+                        }
 
-                    for (i = 0; i < num_subckt_params; i++) {
-                        tfree(subckt_param_names[i]);
-                        tfree(subckt_param_values[i]);
+                        for (i = 0; i < num_subckt_params; i++) {
+                            tfree(subckt_param_names[i]);
+                            tfree(subckt_param_values[i]);
+                        }
                     }
                 }
-            }
 
-            tfree(subckt_name);
-            for (i = 0; i < num_inst_params; i++) {
-                tfree(inst_param_names[i]);
-                tfree(inst_param_values[i]);
+                tfree(subckt_name);
+                for (i = 0; i < num_inst_params; i++) {
+                    tfree(inst_param_names[i]);
+                    tfree(inst_param_values[i]);
+                }
             }
         }
-    }
+    } while (m_propagated);
 
     for (c = deck; c; c = c->nextcard) {
         char *inst_line = c->line;
@@ -5209,8 +5253,9 @@ static char *inp_expand_macro_in_str(struct function_env *env, char *str)
         fcn_name = open_paren_ptr;
         while (--fcn_name >= search_ptr)
             /* function name consists of numbers, letters and special
-             * characters (VALIDCHARS) */
-            if (!isalnum_c(*fcn_name) && !strchr(VALIDCHARS, *fcn_name))
+             * characters (VALIDCHARS); in Spectre mode, ?, !, & are operators */
+            if (!isalnum_c(*fcn_name) &&
+                !strchr(newcompat.spe ? "$%_#@.[]" : VALIDCHARS, *fcn_name))
                 break;
         fcn_name++;
 
@@ -5339,9 +5384,21 @@ static char *inp_expand_macro_in_str(struct function_env *env, char *str)
 static void inp_expand_macros_in_func(struct function_env *env)
 {
     struct function *f;
-
-    for (f = env->functions; f; f = f->next)
-        f->body = inp_expand_macro_in_str(env, f->body);
+    /* Iterate to fixed point (capped) so multi-level nested .func calls
+     * (e.g. A -> B -> C -> D in PDK BEOL/LLE equations) expand regardless of
+     * linked-list order in env->functions. */
+    for (int pass = 0; pass < 16; pass++) {
+        bool changed = FALSE;
+        for (f = env->functions; f; f = f->next) {
+            char *old_body = copy(f->body);
+            f->body = inp_expand_macro_in_str(env, f->body);
+            if (strcmp(old_body, f->body) != 0)
+                changed = TRUE;
+            tfree(old_body);
+        }
+        if (!changed)
+            break;
+    }
 }
 
 
@@ -5707,7 +5764,9 @@ struct dependency {
     int skip;
     char *param_name;
     char *param_str;
-    char *depends_on[DEPENDSON];
+    char **depends_on;
+    int num_deps;
+    int cap_deps;
     struct card *card;
 };
 
@@ -5998,6 +6057,9 @@ static void inp_sort_params(struct card *param_cards,
     for (c = param_cards; c; c = c->nextcard)
         // ignore .param lines without '='
         if (strchr(c->line, '=')) {
+            deps[num_params].cap_deps = 16;
+            deps[num_params].num_deps = 0;
+            deps[num_params].depends_on = TMALLOC(char *, deps[num_params].cap_deps);
             deps[num_params].depends_on[0] = NULL;
             deps[num_params].level = -1;
             deps[num_params].skip = 0;
@@ -6028,15 +6090,12 @@ static void inp_sort_params(struct card *param_cards,
             for (j = 0; j < num_params; j++)
                 if (j != i &&
                         search_plain_identifier(deps[j].param_str, param)) {
-                    for (ind = 0; deps[j].depends_on[ind]; ind++)
-                        ;
-                    deps[j].depends_on[ind++] = param;
-                    if (ind == DEPENDSON) {
-                        fprintf(stderr, "Error in netlist: Too many parameter dependencies (> %d)\n", ind);
-                        fprintf(stderr, "    Please check your netlist.\n");
-                        controlled_exit(EXIT_BAD);
+                    if (deps[j].num_deps + 2 >= deps[j].cap_deps) {
+                        deps[j].cap_deps *= 2;
+                        deps[j].depends_on = TREALLOC(char *, deps[j].depends_on, deps[j].cap_deps);
                     }
-                    deps[j].depends_on[ind] = NULL;
+                    deps[j].depends_on[deps[j].num_deps++] = param;
+                    deps[j].depends_on[deps[j].num_deps] = NULL;
                 }
         }
 
@@ -6076,6 +6135,7 @@ static void inp_sort_params(struct card *param_cards,
     for (i = 0; i < arr_size; i++) {
         tfree(deps[i].param_name);
         tfree(deps[i].param_str);
+        tfree(deps[i].depends_on);
     }
 
     tfree(deps);
@@ -7993,8 +8053,9 @@ static bool inp_temper_compat(struct card *card)
         else if (skip_control > 0) {
             continue;
         }
-        /* exclude some elements */
-        if (strchr("*vbiegfhVBIEGFH", curr_line[0]))
+        /* exclude some elements (and subcircuit calls X, whose param=val
+         * tokenization would be corrupted by inp_modify_exp) */
+        if (strchr("*vbiegfhxVBIEGFHX", curr_line[0]))
             continue;
         /* exclude all dot commands except .model */
         if (curr_line[0] == '.' && !prefix(".model", curr_line))

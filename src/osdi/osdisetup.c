@@ -214,8 +214,9 @@ int OSDIsetup(SMPmatrix *matrix, GENmodel *inModel, CKTcircuit *ckt,
     /* setup model parameter (setup_model)*/
     handle = (OsdiNgspiceHandle){.kind = 1, .name = gen_model->GENmodName};
     descr->setup_model((void *)&handle, model, sim_params, &init_info);
-    res = handle_init_info(init_info, descr);
-    if (res) {
+    err = handle_init_info(init_info, descr);
+    if (err) {
+      res = err;
       errRtn = "OSDI setup_model";
       continue;
     }
@@ -252,8 +253,9 @@ int OSDIsetup(SMPmatrix *matrix, GENmodel *inModel, CKTcircuit *ckt,
       handle = (OsdiNgspiceHandle){.kind = 2, .name = gen_inst->GENname};
       descr->setup_instance((void *)&handle, inst, model, temp,
                             connected_terminals, sim_params, &init_info);
-      res = handle_init_info(init_info, descr);
-      if (res) {
+      err = handle_init_info(init_info, descr);
+      if (err) {
+        res = err;
         errRtn = "OSDI setup_instance";
         continue;
       }
@@ -319,8 +321,9 @@ extern int OSDItemp(GENmodel *inModel, CKTcircuit *ckt) {
 
     handle = (OsdiNgspiceHandle){.kind = 4, .name = gen_model->GENmodName};
     descr->setup_model((void *)&handle, model, sim_params, &init_info);
-    res = handle_init_info(init_info, descr);
-    if (res) {
+    int err = handle_init_info(init_info, descr);
+    if (err) {
+      res = err;
       errRtn = "OSDI setup_model (OSDItemp)";
       continue;
     }
@@ -355,8 +358,9 @@ extern int OSDItemp(GENmodel *inModel, CKTcircuit *ckt) {
 
       descr->setup_instance((void *)&handle, inst, model, temp,
                             connected_terminals, sim_params, &init_info);
-      res = handle_init_info(init_info, descr);
-      if (res) {
+      err = handle_init_info(init_info, descr);
+      if (err) {
+        res = err;
         errRtn = "OSDI setup_instance (OSDItemp)";
         continue;
       }

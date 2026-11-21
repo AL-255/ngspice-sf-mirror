@@ -233,6 +233,27 @@ inp_subcktexpand(struct card *deck) {
 #endif
 
     nupa_signal(NUPADECKCOPY);
+    if (newcompat.spe) {
+        /* Make Spectre circuit temperature (`temp` -> `temper`) available inside
+         * numparam subcircuit call parameter expressions (leaf devices/models
+         * still evaluate `temper` dynamically via inp_parse_temper). */
+        double sim_temp = 27.0;
+        if (!cp_getvar("temp", CP_REAL, &sim_temp, 0))
+            sim_temp = 27.0;
+        for (c = deck; c; c = c->nextcard) {
+            if (ciprefix(".temp", c->line)) {
+                char *ts = skip_ws(c->line + 5);
+                if (*ts == '=')
+                    ts = skip_ws(ts + 1);
+                char *endp = NULL;
+                double v = strtod(ts, &endp);
+                if (endp && endp != ts)
+                    sim_temp = v;
+            }
+        }
+        char temper_name[] = "temper";
+        nupa_add_param(temper_name, sim_temp);
+    }
     /* get the subckt names from the deck */
     for (c = deck; c; c = c->nextcard) {    /* first Numparam pass */
         if (ciprefix(".subckt", c->line)) {
