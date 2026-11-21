@@ -1,0 +1,75 @@
+Native Spectre (.scs) compatibility regression test
+
+.lib 'spectre-compat.scs' mos_tt
+.lib 'spectre-compat.scs' passives_tt
+
+* 2-level nested subckt with m=1 vs m=8 (bin 0)
+Vd1 d1 0 1.2
+Vg1 g1 0 1.2
+Xm1 d1 g1 0 0 spe_nmos w=2u l=0.2u m=1
+
+Vd8 d8 0 1.2
+Vg8 g8 0 1.2
+Xm8 d8 g8 0 0 spe_nmos w=2u l=0.2u m=8
+
+* Bin 1 selection (l=1.0u)
+Vd2 d2 0 1.2
+Vg2 g2 0 1.2
+Xm2 d2 g2 0 0 spe_nmos w=2u l=1.0u m=1
+
+* Vertical BJT with local model sharing subckt name
+Vbc c1 0 3.0
+Vbe b1 0 0.7
+Xq1 c1 b1 0 0 spe_npn
+
+* Diode with compatible=hspice
+Vdi di 0 0.65
+Dd1 di 0 spe_dio
+
+* Temperature-dependent Spectre resistor (temp -> temper) with m=4
+Vr1 r1 0 2.0
+Xr1 r1 0 spe_res_t rbase=1000 m=4
+
+.control
+op
+
+let fail_count = 0
+
+* 1. Nested 2-level subckt m=8 exact scaling
+let ratio_m = i(vd8) / i(vd1)
+if abs(ratio_m - 8.0) > 1e-6
+    echo "ERROR: nested m=8 ratio = $&ratio_m"
+    let fail_count = fail_count + 1
+end
+
+* 2. Bin 0 & Bin 1 MOS currents non-zero and distinct
+if (i(vd1) > -1e-5) | (i(vd2) > -1e-6) | (abs(i(vd1) - i(vd2)) < 1e-5)
+    echo "ERROR: binned BSIM4 currents unexpected"
+    let fail_count = fail_count + 1
+end
+
+* 3. Vertical BJT collector current
+if i(vbc) > -1e-5
+    echo "ERROR: BJT collector current unexpected"
+    let fail_count = fail_count + 1
+end
+
+* 4. Diode forward current
+if i(vdi) > -1e-5
+    echo "ERROR: Diode current unexpected"
+    let fail_count = fail_count + 1
+end
+
+* 5. Spectre resistor temp expression + m=4: I = 2.0V / (1000/4) = 8mA
+if abs(-i(vr1) - 8e-3) > 1e-9
+    echo "ERROR: Spectre resistor current unexpected"
+    let fail_count = fail_count + 1
+end
+
+echo "INFO: $&fail_count of 5 tests failed"
+if fail_count > 0
+    quit 1
+end
+quit 0
+.endc
+.end

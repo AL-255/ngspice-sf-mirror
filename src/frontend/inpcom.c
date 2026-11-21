@@ -50,6 +50,7 @@ Author: 1985 Wayne A. Christopher
 #include "variable.h"
 
 #include "inpcompat.h"
+#include "inp_spectre.h"
 
 #ifdef XSPICE
 /* gtri - add - 12/12/90 - wbk - include new stuff */
@@ -1358,10 +1359,22 @@ static struct inp_read_t inp_read(FILE* fp, int call_depth, const char* dir_name
 
     wl_append_word(&sourceinfo, &sourceinfo, sourcelineinfo);
 
+    /* Native Spectre (.scs) compatibility translation */
+    char **spe_lines = NULL;
+    size_t spe_idx = 0, spe_nlines = 0;
+    if (!intfile && !comfile && fp && inp_spectre_should_translate(fp, file_name)) {
+        spe_lines = inp_spectre_translate_fp(fp, dir_name, file_name, (call_depth == 0), &spe_nlines);
+    }
     /* First read in all lines & put them in the struct cc */
     for (;;) {
+        /* derive lines from Spectre translator */
+        if (spe_lines) {
+            if (spe_idx >= spe_nlines)
+                break;
+            buffer = spe_lines[spe_idx++];
+        }
         /* derive lines from circarray */
-        if (intfile) {
+        else if (intfile) {
             buffer = circarray[cirlinecount++];
             if (!buffer) {
                 tfree(circarray);
@@ -1902,6 +1915,12 @@ static struct inp_read_t inp_read(FILE* fp, int call_depth, const char* dir_name
 
         tfree(buffer);
     } /* end while ((buffer = readline(fp)) != NULL) */
+
+    if (spe_lines) {
+        while (spe_idx < spe_nlines)
+            tfree(spe_lines[spe_idx++]);
+        tfree(spe_lines);
+    }
 
     if (!cc) /* No stuff here */
     {
@@ -4239,13 +4258,15 @@ static int inp_fix_subckt_multiplier(struct names *subckt_w_params,
     for (card = subckt_card->nextcard; card && !ciprefix(".ends", card->line);
             card = card->nextcard) {
         char *curr_line = card->line;
-        /* no 'm' for comment line, V, E, H and some others that are not
+        /* no 'm' for comment line, dot cards, V, E, H and some others that are not
            using 'm' in their model description.
-           B source will get 'm' only when it is a current source. */
-        if (strchr("*vehaknopstuwy", curr_line[0]))
+           B source will get 'm' only when it is a current source.
+           In Spectre mode, OSDI 'n' devices DO support 'm' multiplicity. */
+        if (curr_line[0] == '.')
             continue;
-        /* no 'm' for model cards */
-        if (ciprefix(".model", curr_line))
+        if (strchr("*vehakopstuwy", curr_line[0]))
+            continue;
+        if (curr_line[0] == 'n' && !newcompat.spe)
             continue;
         /* Special treatment for B source:
            Skip voltage source */
@@ -4258,7 +4279,7 @@ static int inp_fix_subckt_multiplier(struct names *subckt_w_params,
             if (ciprefix("v=", tmpstr))
                 continue;
         }
-        if (newcompat.hs && card->compmod == 0) {
+        if ((newcompat.hs || newcompat.spe) && card->compmod == 0) {
             /* if there is already an m=xx in the instance line, multiply it with the new m */
             char* mult = strstr(curr_line, " m=");
             if (mult) {
@@ -4308,45 +4329,53 @@ static void inp_fix_inst_calls_for_numparam(
     int i;
 
     // first iterate through instances and find occurences where 'm'
-    // multiplier needs to be added to the subcircuit -- subsequent instances
-    // will then need this parameter as well
-    for (c = deck; c; c = c->nextcard) {
-        char *inst_line = c->line;
+    // multiplier needs to be added to the subcircuit -- repeat to fixed point
+    // so multi-level nested subckts (e.g. wrapper -> PDK inline subckt -> device)
+    // propagate 'm' down the entire hierarchy.
+    bool m_propagated;
+    do {
+        m_propagated = FALSE;
+        for (c = deck; c; c = c->nextcard) {
+            char *inst_line = c->line;
 
-        if (*inst_line == '*')
-            continue;
+            if (*inst_line == '*')
+                continue;
 
-        if (ciprefix("x", inst_line)) {
-            int num_inst_params = inp_get_params(
-                    inst_line, inst_param_names, inst_param_values);
-            char *subckt_name = inp_get_subckt_name(inst_line);
+            if (ciprefix("x", inst_line)) {
+                int num_inst_params = inp_get_params(
+                        inst_line, inst_param_names, inst_param_values);
+                char *subckt_name = inp_get_subckt_name(inst_line);
 
-            if (found_mult_param(num_inst_params, inst_param_names)) {
-                struct card_assoc *a = find_subckt(c->level, subckt_name);
-                if (a) {
-                    int num_subckt_params = inp_get_params(a->line->line,
-                            subckt_param_names, subckt_param_values);
+                if (found_mult_param(num_inst_params, inst_param_names)) {
+                    struct card_assoc *a = find_subckt(c->level, subckt_name);
+                    if (a) {
+                        int num_subckt_params = inp_get_params(a->line->line,
+                                subckt_param_names, subckt_param_values);
 
-                    if (!found_mult_param(
-                                num_subckt_params, subckt_param_names))
-                        inp_fix_subckt_multiplier(subckt_w_params, a->line,
-                                num_subckt_params, subckt_param_names,
-                                subckt_param_values);
+                        if (!found_mult_param(
+                                    num_subckt_params, subckt_param_names)) {
+                            num_subckt_params = inp_fix_subckt_multiplier(
+                                    subckt_w_params, a->line,
+                                    num_subckt_params, subckt_param_names,
+                                    subckt_param_values);
+                            m_propagated = TRUE;
+                        }
 
-                    for (i = 0; i < num_subckt_params; i++) {
-                        tfree(subckt_param_names[i]);
-                        tfree(subckt_param_values[i]);
+                        for (i = 0; i < num_subckt_params; i++) {
+                            tfree(subckt_param_names[i]);
+                            tfree(subckt_param_values[i]);
+                        }
                     }
                 }
-            }
 
-            tfree(subckt_name);
-            for (i = 0; i < num_inst_params; i++) {
-                tfree(inst_param_names[i]);
-                tfree(inst_param_values[i]);
+                tfree(subckt_name);
+                for (i = 0; i < num_inst_params; i++) {
+                    tfree(inst_param_names[i]);
+                    tfree(inst_param_values[i]);
+                }
             }
         }
-    }
+    } while (m_propagated);
 
     for (c = deck; c; c = c->nextcard) {
         char *inst_line = c->line;
