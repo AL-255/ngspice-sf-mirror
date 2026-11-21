@@ -55,13 +55,8 @@ B4P(isAvxEligibleDcOp)(CKTcircuit *ckt)
     long mode = ckt->CKTmode;
     if (!(mode & (MODEDCOP | MODETRANOP)))
         return 0;
-#ifdef KLU
-    if ((mode & MODETRANOP) && (!ckt->CKTkluMODE || ckt->CKTdiagGmin != 0.0))
+    if ((mode & MODETRANOP) && ckt->CKTdiagGmin != 0.0)
         return 0;
-#else
-    if (mode & MODETRANOP)
-        return 0;
-#endif
     if (!(mode & (MODEINITFLOAT | MODEINITJCT | MODEINITFIX)))
         return 0;
     if (mode & (MODEINITSMSIG | MODEINITTRAN | MODEUIC | MODEDCTRANCURVE | MODEAC | MODETRAN))
@@ -638,11 +633,11 @@ B4P(ensureAvxPack)(B4P(model) *head, CKTcircuit *ckt)
         if (alloc_ok && posix_memalign((void **)&pack->jcts, 64, (size_t)nElig * sizeof(BSIM4AppleJct)) != 0) alloc_ok = 0;
         if (alloc_ok) {
             pack->eval_q     = (int *)malloc((size_t)(nElig + 2) * sizeof(int));
-            pack->orig_order = (nFb == 0) ? (int *)malloc((size_t)(nElig + 2) * sizeof(int)) : NULL;
+            pack->orig_order = (nFb == 0 && nElig <= 64) ? (int *)malloc((size_t)(nElig + 2) * sizeof(int)) : NULL;
             pack->eval_vds   = (double *)malloc((size_t)(nElig + 2) * sizeof(double));
             pack->eval_vgs   = (double *)malloc((size_t)(nElig + 2) * sizeof(double));
             pack->eval_vbs   = (double *)malloc((size_t)(nElig + 2) * sizeof(double));
-            if (!pack->eval_q || (nFb == 0 && !pack->orig_order) ||
+            if (!pack->eval_q || (nFb == 0 && nElig <= 64 && !pack->orig_order) ||
                 !pack->eval_vds || !pack->eval_vgs || !pack->eval_vbs)
                 alloc_ok = 0;
         }
@@ -2141,7 +2136,7 @@ B4P(runApplePack)(
                                     pack->eval_q, pack->eval_vds, pack->eval_vgs, pack->eval_vbs);
         }
     } else if (stamp_mode == 2 && dc_only && pack->orig_order) {
-        /* Preserve exact stock InstArray[0..nElig-1] Sparse stamping order during DCOP */
+        /* For L1-resident blocks (nElig <= 64), stamp Sparse DCOP/TRANOP in exact InstArray order */
         for (int gi = 0; gi < nGroups; gi++) {
             B4P(evalAppleGroupList)(pack, gi, NULL, pack->groups[gi].count,
                                     InstArray, ckt, my_ax, my_rhs,
