@@ -23,7 +23,7 @@
     Xi = (Int *) (LU + Xip [k]) ; \
 }
 
-#if NGSPICE_OPT_APPLE
+#if NGSPICE_OPT_GENERAL
 #define GET_X_POINTER(LU, Xip, Xlen, Xx, k) \
 { \
     Xx = (Entry *) (LU + Xip [k] + (((size_t) (Xlen [k]) * sizeof (Int) + sizeof (Unit) - 1) / sizeof (Unit))) ; \

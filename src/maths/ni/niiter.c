@@ -36,9 +36,12 @@ NIiter(CKTcircuit *ckt, int maxIter)
 #if defined(KLU) && NGSPICE_OPT_GENERAL
     double prev_dx_norm = 1.0e30;
     double step_max_dx = 0.0;
-    static int chord_init = 0, chord_disabled = 0;
+    static int chord_init = 0, chord_disabled = 0, chord_max_cnt = 10;
     if (!chord_init) {
         chord_disabled = (getenv("NGSPICE_NO_CHORD") != NULL);
+        const char *sc = getenv("NGSPICE_TA_CHORD");
+        if (sc && atoi(sc) > 0)
+            chord_max_cnt = (atoi(sc) >= 2) ? atoi(sc) : 32;
         chord_init = 1;
     }
 #endif
@@ -121,6 +124,29 @@ NIiter(CKTcircuit *ckt, int maxIter)
 
 #if defined(KLU) && NGSPICE_OPT_GENERAL
             int used_chord = 0;
+            if (ckt->CKTmrSubActive && ckt->CKTkluMODE && (ckt->CKTmode & MODETRAN)) {
+                double dx_norm = 1.0e30, sub_decomp_t = 0.0, sub_solve_t = 0.0;
+                int rhs_len = (int)ckt->CKTmatrix->SMPkluMatrix->KLUmatrixNrhs;
+                if (rhs_len < ckt->CKTmaxEqNum) rhs_len = ckt->CKTmaxEqNum;
+                error = SMPkluSubSolve(ckt->CKTmatrix, ckt->CKTrhs, ckt->CKTrhsOld,
+                                       rhs_len, ckt->CKTdiagGmin, ckt->CKTag[0],
+                                       iterno, prev_dx_norm, chord_disabled,
+                                       SPfrontEnd->IFseconds,
+                                       &used_chord, &dx_norm,
+                                       &sub_decomp_t, &sub_solve_t,
+                                       &ckt->CKTmrSubLuValid, &ckt->CKTmrSubLuAg0,
+                                       &ckt->CKTmrSubLuGmin, &ckt->CKTmrSubChordCount);
+                ckt->CKTstat->STATdecompTime += sub_decomp_t;
+                ckt->CKTstat->STATsolveTime += sub_solve_t;
+                if (error) {
+                    ckt->CKTstat->STATnumIter += iterno;
+                    FREE(OldCKTstate0);
+                    return(error);
+                }
+                prev_dx_norm = dx_norm;
+                if (dx_norm > step_max_dx) step_max_dx = dx_norm;
+                goto after_lin_solve;
+            }
 #endif
             if (ckt->CKTniState & NISHOULDREORDER) {
                 startTime = SPfrontEnd->IFseconds();
@@ -173,25 +199,47 @@ NIiter(CKTcircuit *ckt, int maxIter)
                     !(ckt->CKTmode & (MODEINITTRAN | MODEINITJCT | MODEINITFIX)) &&
                     ckt->CKTnoncon == 0 &&
                     ckt->CKTkluLuValid &&
-                    ckt->CKTdiagGmin == ckt->CKTkluLuGmin &&
-                    ckt->CKTkluChordCount < 10)
+                    ckt->CKTdiagGmin == ckt->CKTkluLuGmin)
                 {
+                    int vlsi_lu = (ckt->CKTmatrix && ckt->CKTmatrix->SMPkluMatrix &&
+                                   ckt->CKTmatrix->SMPkluMatrix->KLUmatrixN >= 10000);
+                    int eff_max_cnt = (vlsi_lu && chord_max_cnt < 16) ? 16 : chord_max_cnt;
                     double ag0 = ckt->CKTag[0];
                     double lu_ag0 = ckt->CKTkluLuAg0;
-                    /* Same-timestep polishing (iterno >= 2) or smooth constant-step reuse */
-                    int ok_iter = (iterno >= 2)
-                        ? (prev_dx_norm <= 0.05 && ag0 == lu_ag0)
-                        : (ckt->CKTkluLastStepSmooth && ag0 >= 0.90 * lu_ag0 && ag0 <= 1.11 * lu_ag0);
-                    if (ok_iter && lu_ag0 > 0.0)
+                    int ok_iter = 0;
+                    if (ckt->CKTkluChordCount < eff_max_cnt && lu_ag0 > 0.0) {
+                        if (vlsi_lu) {
+                            /* At VLSI scale (N >= 10k), KLU factor is ~20x slower than backsolve:
+                             * aggressively reuse LU whenever exact residual contracts! */
+                            int ag0_near = (ag0 >= 0.75 * lu_ag0 && ag0 <= 1.33 * lu_ag0);
+                            ok_iter = (iterno >= 2) ? (prev_dx_norm <= 0.50 && ag0_near) : ag0_near;
+                        } else {
+                            /* Same-timestep polishing (iterno >= 2) or smooth constant-step reuse */
+                            ok_iter = (iterno >= 2)
+                                ? (prev_dx_norm <= 0.05 && ag0 == lu_ag0)
+                                : ((ckt->CKTkluLastStepSmooth && ag0 >= 0.90 * lu_ag0 && ag0 <= 1.11 * lu_ag0) ||
+                                   (ckt->CKTtaPredActive && ag0 == lu_ag0));
+                        }
+                    }
+                    if (ok_iter)
                     {
                         double dx_norm = 1.0e30;
                         startTime = SPfrontEnd->IFseconds();
                         if (SMPkluChordSolve(ckt->CKTmatrix, ckt->CKTrhs, ckt->CKTrhsOld,
                                              ckt->CKTdiagGmin, &dx_norm))
                         {
-                            int accept = (iterno == 1)
-                                ? (dx_norm < 0.015)
-                                : (dx_norm < 0.04 && (dx_norm <= 0.35 * prev_dx_norm || dx_norm <= 5.0e-5));
+                            int accept;
+                            if (vlsi_lu) {
+                                double i1_lim = ckt->CKTtaPredActive ? 0.02 : 0.05;
+                                accept = (iterno == 1)
+                                    ? (dx_norm < i1_lim)
+                                    : (dx_norm < 0.30 && (dx_norm <= 0.65 * prev_dx_norm || dx_norm <= 1.0e-4));
+                            } else {
+                                double i1_lim = ckt->CKTtaPredActive ? 0.004 : 0.015;
+                                accept = (iterno == 1)
+                                    ? (dx_norm < i1_lim)
+                                    : (dx_norm < 0.04 && (dx_norm <= 0.35 * prev_dx_norm || dx_norm <= 5.0e-5));
+                            }
                             if (accept) {
                                 SMPkluChordCommit(ckt->CKTmatrix, ckt->CKTrhs, ckt->CKTrhsOld);
                                 ckt->CKTstat->STATsolveTime += SPfrontEnd->IFseconds() - startTime;
@@ -355,6 +403,7 @@ NIiter(CKTcircuit *ckt, int maxIter)
                     if (mx > step_max_dx) step_max_dx = mx;
                 }
             }
+        after_lin_solve:
 #else
             startTime = SPfrontEnd->IFseconds();
             SMPsolve(ckt->CKTmatrix, ckt->CKTrhs, ckt->CKTrhsSpare);
@@ -387,6 +436,9 @@ NIiter(CKTcircuit *ckt, int maxIter)
 #endif
                     FREE(errMsg);
                 }
+#if NGSPICE_OPT_GENERAL
+                ckt->CKTtaLastIter = iterno;
+#endif
                 FREE(OldCKTstate0);
                 return(E_ITERLIM);
             }
@@ -439,6 +491,9 @@ NIiter(CKTcircuit *ckt, int maxIter)
             if (ckt->CKTnoncon == 0) {
 #if defined(KLU) && NGSPICE_OPT_GENERAL
                 ckt->CKTkluLastStepSmooth = (iterno <= 4 && step_max_dx < 0.05);
+#endif
+#if NGSPICE_OPT_GENERAL
+                ckt->CKTtaLastIter = iterno;
 #endif
                 ckt->CKTstat->STATnumIter += iterno;
                 FREE(OldCKTstate0);

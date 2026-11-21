@@ -302,7 +302,7 @@ Done:
     Matrix->NeedsOrdering = NO;
     Matrix->Reordered = YES;
     Matrix->Factored = YES;
-#if NGSPICE_OPT_APPLE
+#if NGSPICE_OPT_GENERAL
     Matrix->FlatValid = 0;
     Matrix->FlatFactored = 0;
 #endif
@@ -310,7 +310,7 @@ Done:
     return Matrix->Error;
 }
 
-#if NGSPICE_OPT_APPLE
+#if NGSPICE_OPT_GENERAL
 void
 spcSyncFlatToElems(MatrixPtr Matrix)
 {
@@ -348,11 +348,14 @@ spcBuildFlatCsc(MatrixPtr Matrix)
             return 0;
     }
 
-    free(Matrix->FlatColStart); Matrix->FlatColStart = NULL;
-    free(Matrix->FlatDiagIdx);  Matrix->FlatDiagIdx  = NULL;
-    free(Matrix->FlatRow);      Matrix->FlatRow      = NULL;
-    free(Matrix->FlatVal);      Matrix->FlatVal      = NULL;
-    free(Matrix->FlatElemPtr);  Matrix->FlatElemPtr  = NULL;
+    free(Matrix->FlatColStart);  Matrix->FlatColStart  = NULL;
+    free(Matrix->FlatDiagIdx);   Matrix->FlatDiagIdx   = NULL;
+    free(Matrix->FlatRow);       Matrix->FlatRow       = NULL;
+    free(Matrix->FlatVal);       Matrix->FlatVal       = NULL;
+    free(Matrix->FlatElemPtr);   Matrix->FlatElemPtr   = NULL;
+    free(Matrix->FlatURowStart); Matrix->FlatURowStart = NULL;
+    free(Matrix->FlatUCol);      Matrix->FlatUCol      = NULL;
+    free(Matrix->FlatUValIdx);   Matrix->FlatUValIdx   = NULL;
 
     int *colStart = (int *)malloc((size_t)(Size + 2) * sizeof(int));
     int *diagIdx  = (int *)malloc((size_t)(Size + 1) * sizeof(int));
@@ -383,16 +386,54 @@ spcBuildFlatCsc(MatrixPtr Matrix)
     }
     colStart[Size + 1] = idx;
 
-    Matrix->FlatColStart = colStart;
-    Matrix->FlatDiagIdx  = diagIdx;
-    Matrix->FlatRow      = row;
-    Matrix->FlatVal      = val;
-    Matrix->FlatElemPtr  = eptr;
-    Matrix->FlatSize     = Size;
-    Matrix->FlatElements = Matrix->Elements;
-    Matrix->FlatNnz      = idx;
-    Matrix->FlatValid    = 1;
-    Matrix->FlatFactored = 0;
+    /* Build row-oriented CSR index of strict upper triangle U (ascending Col order)
+     * so backward substitution in spSolve preserves exact stock summation order! */
+    int *uRowStart = (int *)calloc((size_t)(Size + 2), sizeof(int));
+    int unnz = 0;
+    if (uRowStart) {
+        for (int c = 1; c <= Size; c++) {
+            int cd = diagIdx[c];
+            for (int p = colStart[c]; p < cd; p++) {
+                uRowStart[row[p] + 1]++;
+                unnz++;
+            }
+        }
+        for (int r = 1; r <= Size; r++)
+            uRowStart[r + 1] += uRowStart[r];
+    }
+    int *uCol    = (int *)malloc((size_t)(unnz + 1) * sizeof(int));
+    int *uValIdx = (int *)malloc((size_t)(unnz + 1) * sizeof(int));
+    int *uCursor = (int *)malloc((size_t)(Size + 2) * sizeof(int));
+    if (!uRowStart || !uCol || !uValIdx || !uCursor) {
+        free(colStart); free(diagIdx); free(row); free(val); free(eptr);
+        free(uRowStart); free(uCol); free(uValIdx); free(uCursor);
+        return 0;
+    }
+    for (int r = 0; r <= Size + 1; r++)
+        uCursor[r] = uRowStart[r];
+    for (int c = 1; c <= Size; c++) {
+        int cd = diagIdx[c];
+        for (int p = colStart[c]; p < cd; p++) {
+            int pos = uCursor[row[p]]++;
+            uCol[pos]    = c;
+            uValIdx[pos] = p;
+        }
+    }
+    free(uCursor);
+
+    Matrix->FlatColStart  = colStart;
+    Matrix->FlatDiagIdx   = diagIdx;
+    Matrix->FlatRow       = row;
+    Matrix->FlatVal       = val;
+    Matrix->FlatElemPtr   = eptr;
+    Matrix->FlatURowStart = uRowStart;
+    Matrix->FlatUCol      = uCol;
+    Matrix->FlatUValIdx   = uValIdx;
+    Matrix->FlatSize      = Size;
+    Matrix->FlatElements  = Matrix->Elements;
+    Matrix->FlatNnz       = idx;
+    Matrix->FlatValid     = 1;
+    Matrix->FlatFactored  = 0;
     return 1;
 }
 #endif
@@ -459,7 +500,7 @@ spFactor(MatrixPtr Matrix)
         return (Matrix->Error = spOKAY);
     }
 
-#if NGSPICE_OPT_APPLE
+#if NGSPICE_OPT_GENERAL
     {
         static int flat_disabled = -1;
         if (flat_disabled < 0)
@@ -2357,7 +2398,7 @@ spcRowExchange( MatrixPtr Matrix, int Row1, int Row2 )
     ElementPtr  Element1, Element2;
 
     /* Begin `spcRowExchange'. */
-#if NGSPICE_OPT_APPLE
+#if NGSPICE_OPT_GENERAL
     Matrix->FlatValid = 0;
     Matrix->FlatFactored = 0;
 #endif
@@ -2455,7 +2496,7 @@ spcColExchange( MatrixPtr Matrix, int Col1, int Col2 )
     ElementPtr  Element1, Element2;
 
     /* Begin `spcColExchange'. */
-#if NGSPICE_OPT_APPLE
+#if NGSPICE_OPT_GENERAL
     Matrix->FlatValid = 0;
     Matrix->FlatFactored = 0;
 #endif

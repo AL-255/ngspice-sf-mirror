@@ -74,6 +74,33 @@ void SMPsolve( SMPmatrix *, double [], double []);
 int SMPkluChordSolve(SMPmatrix *Matrix, const double RHS[], const double Xold[],
                      double Gmin, double *dx_norm_out);
 void SMPkluChordCommit(SMPmatrix *Matrix, double RHS[], const double Xold[]);
+void SMPkluSubExpand1Hop(SMPmatrix *Matrix, unsigned char *is_fast, int n_rhs,
+                         const unsigned char *is_rail);
+int  SMPkluSubPrepare(SMPmatrix *Matrix, const unsigned char *is_fast, int n_rhs,
+                      const unsigned char *is_rail, const int *rail_nodes, int n_rails,
+                      int max_nF, int *n_fast_out, const int **fast_rhs_out,
+                      int *same_as_prev_out,
+                      unsigned long long *cache_hits_out,
+                      unsigned long long *cache_misses_out);
+void SMPkluSubInitLoad(SMPmatrix *Matrix, double *ax_main, double *rhs_main,
+                       const double *res_base, const double *cap_unit,
+                       const double *cap_rhs, const double *lat_dc,
+                       const double *lat_cap, const double *lat_rhs_dc,
+                       const double *lat_rhs_cap, double ag0);
+int  SMPkluSubSolve(SMPmatrix *Matrix, double RHS[], const double Xold[],
+                    int rhs_len, double Gmin, double ag0, int iterno,
+                    double prev_dx_norm, int chord_disabled,
+                    double (*sec_fn)(void),
+                    int *used_chord_out, double *dx_norm_out,
+                    double *decomp_time_out, double *solve_time_out,
+                    int *lu_valid_io, double *lu_ag0_io, double *lu_gmin_io,
+                    int *chord_cnt_io);
+int  SMPkluSubCheckWake(SMPmatrix *Matrix, const double *rhs_now,
+                        const double *v_macro, double v_wake);
+void SMPkluSubRailUpdate(SMPmatrix *Matrix, const double *ax_main,
+                         const double *rhs_main, double *x_sol,
+                         const int *rail_nodes, const int *rail_br,
+                         const double *rail_sgn, int n_rails);
 #endif
 int SMPmatSize( SMPmatrix *);
 int SMPnewMatrix( SMPmatrix *, int );

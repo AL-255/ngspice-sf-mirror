@@ -31,7 +31,7 @@ typedef struct ngtable_rec {
     struct ngtable_rec *next ;		/* collision list */
     struct ngtable_rec *thread_next ;    /* thread thru entire table */
     struct ngtable_rec *thread_prev ;    /* thread thru entire table */
-#if NGSPICE_OPT_APPLE
+#if NGSPICE_OPT_GENERAL
     unsigned int hash ;                  /* cached 32-bit raw hash */
 #endif
 } NGTABLEBOX, *NGTABLEPTR ;
@@ -308,7 +308,7 @@ Function:
 
 
 extern int nghash_table_get( NGHASHPTR  hashtable ) ;
-#if NGSPICE_OPT_APPLE
+#if NGSPICE_OPT_GENERAL
 extern void nghash_reserve( NGHASHPTR hashtable, int min_entries ) ;
 #endif
 /*

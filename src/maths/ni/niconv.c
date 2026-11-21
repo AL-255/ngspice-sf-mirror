@@ -63,21 +63,23 @@ NIconvTest(CKTcircuit *ckt)
         double voltTol = ckt->CKTvoltTol;
         double abstol = ckt->CKTabstol;
 
-        i = 1;
+        int sub_only = (ckt->CKTmrSubActive && ckt->CKTmrFastNodes && ckt->CKTmrSubNFast > 0);
+        int li_start = 0;
+        int n_loop = sub_only ? ckt->CKTmrSubNFast : size;
 #if NGSPICE_OPT_APPLE
-        {
+        if (!sub_only) {
             const float64x2_t vrel = vdupq_n_f64(reltol);
             const float64x2_t vvt  = vdupq_n_f64(voltTol);
-            const float64x2_t vat  = vdupq_n_f64(abstol);
-            for (; i + 1 <= size; i += 2) {
-                float64x2_t vn = vld1q_f64(rhs + i);
-                float64x2_t vo = vld1q_f64(rhsOld + i);
+            int ni = 1;
+            for (; ni + 1 <= size; ni += 2) {
+                float64x2_t vn = vld1q_f64(rhs + ni);
+                float64x2_t vo = vld1q_f64(rhsOld + ni);
                 float64x2_t abs_t;
-                if ((isVolt[i] & isVolt[i + 1]) != 0) {
+                if ((isVolt[ni] & isVolt[ni + 1]) != 0) {
                     abs_t = vvt;
                 } else {
-                    abs_t = (float64x2_t){ isVolt[i] ? voltTol : abstol,
-                                           isVolt[i + 1] ? voltTol : abstol };
+                    abs_t = (float64x2_t){ isVolt[ni] ? voltTol : abstol,
+                                           isVolt[ni + 1] ? voltTol : abstol };
                 }
                 float64x2_t mx = vmaxq_f64(vabsq_f64(vo), vabsq_f64(vn));
                 float64x2_t vtol = vfmaq_f64(abs_t, vrel, mx);
@@ -87,9 +89,12 @@ NIconvTest(CKTcircuit *ckt)
                     break; /* Handle exact failing/NaN index in scalar loop below */
                 }
             }
+            li_start = ni - 1;
         }
 #endif
-        for (; i <= size; i++) {
+        for (int li = li_start; li < n_loop; li++) {
+            i = sub_only ? ckt->CKTmrFastNodes[li] : (li + 1);
+            if (i <= 0 || i > size) continue;
             new = rhs[i];
             old = rhsOld[i];
             double abs_tol = isVolt[i] ? voltTol : abstol;

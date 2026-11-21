@@ -60,7 +60,6 @@
  */
 #include <assert.h>
 #include <stdlib.h>
-#include <stdlib.h>
 
 #define spINSIDE_SPARSE
 
@@ -197,7 +196,7 @@ spCreate(int Size, int Complex, int *pError)
     Matrix->RecordsRemaining = 0;
     Matrix->ElementsRemaining = 0;
     Matrix->FillinsRemaining = 0;
-#if NGSPICE_OPT_APPLE
+#if NGSPICE_OPT_GENERAL
     Matrix->FlatValid = 0;
     Matrix->FlatFactored = 0;
     Matrix->FlatSize = 0;
@@ -208,6 +207,9 @@ spCreate(int Size, int Complex, int *pError)
     Matrix->FlatRow = NULL;
     Matrix->FlatVal = NULL;
     Matrix->FlatElemPtr = NULL;
+    Matrix->FlatURowStart = NULL;
+    Matrix->FlatUCol = NULL;
+    Matrix->FlatUValIdx = NULL;
 #endif
 
     RecordAllocation( Matrix, Matrix );
@@ -697,12 +699,15 @@ spDestroy(MatrixPtr Matrix)
     SP_FREE( Matrix->DoCmplxDirect );
     SP_FREE( Matrix->DoRealDirect );
     SP_FREE( Matrix->Intermediate );
-#if NGSPICE_OPT_APPLE
+#if NGSPICE_OPT_GENERAL
     free( Matrix->FlatColStart );
     free( Matrix->FlatDiagIdx );
     free( Matrix->FlatRow );
     free( Matrix->FlatVal );
     free( Matrix->FlatElemPtr );
+    free( Matrix->FlatURowStart );
+    free( Matrix->FlatUCol );
+    free( Matrix->FlatUValIdx );
 #endif
 
     /* Sequentially step through the list of allocated pointers

@@ -65,6 +65,31 @@ B4P(isAvxEligibleDcOp)(CKTcircuit *ckt)
     return 1;
 }
 
+/* Temporary no-op stubs for Stage 12 merge compilation; replaced by Apple BSIM4 port */
+void
+B4P(freeAvxLatent)(void *p)
+{
+    (void)p;
+}
+
+#ifdef KLU
+static inline void
+B4P(latentUnfreezeAll)(B4P(model) *head, CKTcircuit *ckt, KLUmatrix *km)
+{
+    (void)head;
+    (void)ckt;
+    (void)km;
+}
+
+static inline void
+B4P(latentSync)(B4P(model) *head, CKTcircuit *ckt, KLUmatrix *km)
+{
+    (void)head;
+    (void)ckt;
+    (void)km;
+}
+#endif /* KLU */
+
 void
 B4P(freeApplePack)(B4P(model) *head)
 {
@@ -82,8 +107,9 @@ B4P(freeApplePack)(B4P(model) *head)
         free(pack);
         head->B4P(AvxBlocks) = NULL;
     }
+    B4P(freeAvxLatent)(head->B4P(AvxLatent));
+    head->B4P(AvxLatent) = NULL;
     head->B4P(AvxDyn) = NULL;
-    head->B4P(AvxL2) = NULL;
     head->B4P(AvxDynValid) = 0;
     head->B4P(AvxBlockCount) = 0;
 }
@@ -673,7 +699,7 @@ B4P(ensureAvxPack)(B4P(model) *head, CKTcircuit *ckt)
     FREE(keys);
     head->B4P(AvxBlocks) = (void *)pack;
     head->B4P(AvxDyn) = NULL;
-    head->B4P(AvxL2) = NULL;
+    head->B4P(AvxLatent) = NULL;
     head->B4P(AvxDynValid) = 0;
     head->B4P(AvxBlockCount) = nGroups;
     if (nFb > 0) {

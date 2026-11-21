@@ -333,7 +333,7 @@ dicostack_pop(dico_t *dico)
     inst_name = dico->inst_name[dico->stack_depth];
     htable_p = dico->symbols[dico->stack_depth];
     if (htable_p) {
-#if NGSPICE_OPT_APPLE
+#if NGSPICE_OPT_GENERAL
         size_t inst_len = strlen(inst_name);
         char stack_buf[256];
         if (!(dico->inst_symbols))

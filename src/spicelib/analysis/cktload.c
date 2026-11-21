@@ -101,7 +101,7 @@ CKTload(CKTcircuit *ckt)
         int par_count = 0;
         int skip_mask_res = -1;
         int has_res_base = 0;
-#if NGSPICE_OPT_APPLE
+#if NGSPICE_OPT_GENERAL
         int has_cap_base = 0;
 #endif
         unsigned char handled[256];
@@ -128,7 +128,11 @@ CKTload(CKTcircuit *ckt)
                         skip_mask_res = i;
                         if (use_handled) handled[i] = 1;
                     }
-#if NGSPICE_OPT_APPLE
+#if NGSPICE_OPT_GENERAL
+                    else if (prep == 4) {
+                        has_cap_base = 1;
+                        if (use_handled) handled[i] = 1;
+                    }
                     else if (prep == 3 && DEVices[i]->DEVkluLoadPar && par_count < 16) {
                         has_cap_base = 1;
                         par_devs[par_count++] = i;
@@ -150,7 +154,11 @@ CKTload(CKTcircuit *ckt)
                         skip_mask_res = i;
                         if (use_handled) handled[i] = 1;
                     }
-#if NGSPICE_OPT_APPLE
+#if NGSPICE_OPT_GENERAL
+                    else if (prep == 4) {
+                        has_cap_base = 1;
+                        if (use_handled) handled[i] = 1;
+                    }
                     else if (prep == 3 && DEVices[i]->DEVkluLoadPar && par_count < 16) {
                         has_cap_base = 1;
                         par_devs[par_count++] = i;
@@ -166,7 +174,7 @@ CKTload(CKTcircuit *ckt)
         }
 
         const double * restrict res_base = has_res_base ? km->KLUmatrixAxResConst : NULL;
-#if NGSPICE_OPT_APPLE
+#if NGSPICE_OPT_GENERAL
         const double * restrict cap_unit = has_cap_base ? km->KLUmatrixAxCapUnit : NULL;
         const double * restrict cap_rhs  = has_cap_base ? km->KLUmatrixRhsCapCache : NULL;
         const double cap_ag0 = ckt->CKTag[0];
@@ -203,7 +211,7 @@ CKTload(CKTcircuit *ckt)
                 for (int jb = 0; jb < nz; jb += 256) {
                     int jend = jb + 256;
                     if (jend > nz) jend = nz;
-#if NGSPICE_OPT_APPLE
+#if NGSPICE_OPT_GENERAL
                     if (res_base != NULL && cap_unit != NULL) {
                         for (int j = jb; j < jend; j++)
                             ax_main[j] = (res_base[j] + cap_ag0 * cap_unit[j]) + ax_tls_base[j];
@@ -229,7 +237,7 @@ CKTload(CKTcircuit *ckt)
                 for (int jb = 0; jb < rhs_len; jb += 256) {
                     int jend = jb + 256;
                     if (jend > rhs_len) jend = rhs_len;
-#if NGSPICE_OPT_APPLE
+#if NGSPICE_OPT_GENERAL
                     if (cap_rhs != NULL) {
                         for (int j = jb; j < jend; j++)
                             rhs_main[j] = cap_rhs[j] + rhs_tls_base[j];
@@ -251,9 +259,24 @@ CKTload(CKTcircuit *ckt)
             if (par_error) return(par_error);
         } else {
             /* Single-thread (or no parallel devices): stamp directly into main KLU Ax & CKTrhs */
-#if NGSPICE_OPT_APPLE
-            if (cap_unit != NULL) {
+#if NGSPICE_OPT_GENERAL
+            int want_latent = (km->KLUmatrixLatentCount > 0 &&
+                               km->KLUmatrixAxLatentDC != NULL &&
+                               km->KLUmatrixAxLatentCap != NULL) ? 1 : 0;
+            const double * restrict lat_dc  = want_latent ? km->KLUmatrixAxLatentDC : NULL;
+            const double * restrict lat_cap = want_latent ? km->KLUmatrixAxLatentCap : NULL;
+            const double * restrict lat_rhs_dc  = (want_latent && km->KLUmatrixRhsLatentLen >= rhs_len) ? km->KLUmatrixRhsLatentDC : NULL;
+            const double * restrict lat_rhs_cap = (want_latent && km->KLUmatrixRhsLatentLen >= rhs_len) ? km->KLUmatrixRhsLatentCap : NULL;
+
+            if (ckt->CKTmrSubActive) {
+                SMPkluSubInitLoad(ckt->CKTmatrix, ax_main, rhs_main,
+                                  res_base, cap_unit, cap_rhs,
+                                  lat_dc, lat_cap, lat_rhs_dc, lat_rhs_cap,
+                                  cap_ag0);
+            } else {
+            if (cap_unit != NULL || want_latent) {
                 int want_res = (res_base != NULL) ? 1 : 0;
+                int want_cap = (cap_unit != NULL) ? 1 : 0;
                 if (!km->KLUmatrixAxResCapBase) {
                     if (posix_memalign((void **)&km->KLUmatrixAxResCapBase, 128,
                                        ((size_t)nz + 1) * sizeof(double)) != 0)
@@ -262,10 +285,25 @@ CKTload(CKTcircuit *ckt)
                 if (km->KLUmatrixAxResCapBase) {
                     if (!km->KLUmatrixResCapValid ||
                         km->KLUmatrixResCapAg0 != cap_ag0 ||
-                        km->KLUmatrixResCapHasRes != want_res)
+                        km->KLUmatrixResCapHasRes != (want_res | (want_cap << 1)) ||
+                        km->KLUmatrixResCapHasLatent != want_latent)
                     {
                         double * restrict rcb = km->KLUmatrixAxResCapBase;
-                        if (res_base != NULL) {
+                        if (want_latent) {
+                            if (res_base != NULL && cap_unit != NULL) {
+                                for (int j = 0; j < nz; j++)
+                                    rcb[j] = (res_base[j] + lat_dc[j]) + cap_ag0 * (cap_unit[j] + lat_cap[j]);
+                            } else if (res_base != NULL) {
+                                for (int j = 0; j < nz; j++)
+                                    rcb[j] = (res_base[j] + lat_dc[j]) + cap_ag0 * lat_cap[j];
+                            } else if (cap_unit != NULL) {
+                                for (int j = 0; j < nz; j++)
+                                    rcb[j] = lat_dc[j] + cap_ag0 * (cap_unit[j] + lat_cap[j]);
+                            } else {
+                                for (int j = 0; j < nz; j++)
+                                    rcb[j] = lat_dc[j] + cap_ag0 * lat_cap[j];
+                            }
+                        } else if (res_base != NULL) {
                             for (int j = 0; j < nz; j++)
                                 rcb[j] = res_base[j] + cap_ag0 * cap_unit[j];
                         } else {
@@ -274,16 +312,19 @@ CKTload(CKTcircuit *ckt)
                         }
                         rcb[nz] = 0.0;
                         km->KLUmatrixResCapAg0 = cap_ag0;
-                        km->KLUmatrixResCapHasRes = want_res;
+                        km->KLUmatrixResCapHasRes = want_res | (want_cap << 1);
+                        km->KLUmatrixResCapHasLatent = want_latent;
                         km->KLUmatrixResCapValid = 1;
                     }
                     memcpy(ax_main, km->KLUmatrixAxResCapBase, (size_t)nz * sizeof(double));
                 } else if (res_base != NULL) {
                     for (int j = 0; j < nz; j++)
-                        ax_main[j] = res_base[j] + cap_ag0 * cap_unit[j];
+                        ax_main[j] = res_base[j] + (cap_unit ? cap_ag0 * cap_unit[j] : 0.0)
+                                   + (want_latent ? (lat_dc[j] + cap_ag0 * lat_cap[j]) : 0.0);
                 } else {
                     for (int j = 0; j < nz; j++)
-                        ax_main[j] = cap_ag0 * cap_unit[j];
+                        ax_main[j] = (cap_unit ? cap_ag0 * cap_unit[j] : 0.0)
+                                   + (want_latent ? (lat_dc[j] + cap_ag0 * lat_cap[j]) : 0.0);
                 }
             } else
 #endif
@@ -292,12 +333,23 @@ CKTload(CKTcircuit *ckt)
             else
                 memset(ax_main, 0, (size_t)nz * sizeof(double));
             ax_main[nz] = 0.0;
-#if NGSPICE_OPT_APPLE
-            if (cap_rhs != NULL)
+#if NGSPICE_OPT_GENERAL
+            if (lat_rhs_dc != NULL) {
+                if (cap_rhs != NULL) {
+                    for (int j = 0; j < rhs_len; j++)
+                        rhs_main[j] = cap_rhs[j] + lat_rhs_dc[j] + cap_ag0 * lat_rhs_cap[j];
+                } else {
+                    for (int j = 0; j < rhs_len; j++)
+                        rhs_main[j] = lat_rhs_dc[j] + cap_ag0 * lat_rhs_cap[j];
+                }
+            } else if (cap_rhs != NULL)
                 memcpy(rhs_main, cap_rhs, (size_t)rhs_len * sizeof(double));
             else
-#endif
+                memset(rhs_main, 0, (size_t)rhs_len * sizeof(double));
+            } /* !ckt->CKTmrSubActive */
+#else
             memset(rhs_main, 0, (size_t)rhs_len * sizeof(double));
+#endif
 
             for (int k = 0; k < par_count; k++) {
                 int di = par_devs[k];

@@ -578,7 +578,7 @@ nupa_copy_inst_dico(void)
         if (dico->stack_depth > 0)
             fprintf(stderr, "stack depth should be zero.\n");
 
-#if NGSPICE_OPT_APPLE
+#if NGSPICE_OPT_GENERAL
         if (dico->stack_depth == 0) {
             NGHASHPTR dst = dico->symbols[0];
             NGHASHPTR src = dico->inst_symbols;

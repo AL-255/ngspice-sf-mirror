@@ -241,3 +241,48 @@ Precompiling the full GF180 typical PDK (`design.ngspice` + `sm141064.ngspice` c
   5. **Dynamic Active-Lane SIMD Compaction** (`bsim4_avx512_core.h`, `bsim4_avx512_glue.h`, `b4v5ld.c`, `b4v6ld.c`, `NGSPICE_OPT_ZEN4`, toggle `NGSPICE_NO_LANE_COMPACT=1`):
      - In partially active 8-wide BSIM4 blocks (`1..5` moving lanes with `>=1` stationary lanes), stationary lanes take their exact L1/L2 bypass path while moving lanes are packed across blocks into dense 8-wide AVX-512 batches using an in-register 8×8 AVX-512 `double` transpose (`b4_transpose_8x8`) over contiguous per-instance `BSIM4Avx512Inst` records (allocated contiguously after `blocks[nBlocks]` when `nBlocks > 4`) and 1-cycle `_mm512_test_epi64_mask` (`vptestmq`) mask packing.
      - Preserves exact `0..nBlocks-1` stamping summation order on Sparse 1t (`stamp_mode != 0`) while eliminating 25–47% of redundant BSIM4 lane evaluations on large mixed-signal workloads (`ti12_full_300ns`, `pll_ring_150m_4us`, `sar12_hero_16cyc`).
+
+### Stage 11: Portable Solver & Frontend Convergence from `opt/apple-silicon-transient` (`NGSPICE_OPT_GENERAL`)
+- **Gain (single-core 1t on Ryzen 9 7940HX vs Stage 10 / vs Stock Sparse 1t):**
+  - `sar12_hero_16cyc`: KLU **`60.64 s -> 55.56 s`** (**11.28×** vs stock Sparse `626.75 s`); Sparse **`142.57 s -> 77.84 s`** (**-45.4%**, `spFactor` **3.4×** faster, `spSolve` **4.0×** faster!)
+  - `ti12_full_300ns`: KLU **`39.16 s -> 33.30 s`** (**-15.0%**, **13.95×** vs stock Sparse `464.51 s`); Sparse **`77.01 s -> 56.77 s`** (**-26.3%**, `rel_rms = 3.04e-11`)
+  - `pll_ring_150m_4us`: KLU **`22.70 s -> 21.37 s`** (**10.86×** vs stock Sparse `232.14 s`); Sparse **`30.54 s -> 24.04 s`** (**-21.3%**)
+  - `sdm16_120cyc`: KLU **`24.70 s -> 23.05 s`** (**-6.7%**); Sparse **`69.33 s -> 32.07 s`** (**-53.7%**, 115/115 exact PDM bits, `rel_rms = 5.25e-3`)
+  - `sar12_probe_2cyc`: KLU **`8.13 s -> 7.48 s`** (**10.89×** vs stock Sparse `81.46 s`); Sparse **`18.91 s -> 11.20 s`** (**-40.8%**)
+  - `opa1k_pvt16`: KLU **`134.76 s -> 130.88 s`** (`-2.9%`); Sparse **`134.72 s -> 123.34 s`** (**-8.4%**, `5.08×` vs stock `626.47 s`)
+  - **12/12** golden PASS across KLU & Sparse with **bit-identical** Sparse iteration counts and `rel_rms` vs linked-list Sparse.
+- **Major changes (all 100% portable C99 under `NGSPICE_OPT_GENERAL`):**
+  1. **Flat contiguous CSC numeric refactor & exact row-oriented CSR backward solve for Sparse** (`spdefs.h`, `spalloc.c`, `spbuild.c`, `spfactor.c`, `spsolve.c`, `sputils.c`):
+     - Compiles the Sparse linked-list LU structure into contiguous CSC arrays `(FlatColStart, FlatDiagIdx, FlatRow, FlatVal, FlatElemPtr)` plus a row-oriented strict-upper CSR index `(FlatURowStart, FlatUCol, FlatUValIdx)` that preserves exact stock `NextInRow` floating-point summation order in backward substitution while eliminating all pointer chasing.
+  2. **Pre-baked unit-capacitance KLU matrix + per-timestep CAP RHS cache + `KLUmatrixIdentityMap`** (`capdefs.h`, `capload.c`, `klu.h`, `klusmp.c`, `cktload.c`):
+     - Pre-bakes constant linear capacitance stamps into `KLUmatrixAxCapUnit` and combines `res_base + ag0 * cap_unit` once per `ag0` into `KLUmatrixAxResCapBase`, turning 100k PEX capacitor stamps on `ti12_full_300ns` into a single `memcpy`.
+     - Detects identity `KLUmatrixNodeCollapsingNewToOld` mapping once per matrix to eliminate `RHS -> Intermediate -> RHS` scatter/gather copies in `SMPsolve`.
+  3. **Fast power-of-2 `nghash` + zero-copy subcircuit parameter transfer** (`hash.h`, `hash.c`, `spicenum.c`, `xpressn.c`):
+     - Power-of-2 mask sizing, cached 32-bit FNV-1a hash pre-filter, in-place node relinking on resize, and swap-merge subcircuit symbol dictionaries.
+  4. **Unsigned `size_t` KLU `GET_POINTER`/`GET_X_POINTER`** (`klu_version.h`) & **`ft_numparse()` FP-to-int overflow UB fix** (`numparse.c`).
+
+### Stage 12: Multirate & Latency-Partitioned Transient Integration + Opt-In Time-Axis Control (`NGSPICE_OPT_GENERAL` + `NGSPICE_OPT_ZEN4`)
+- **Literature basis:**
+  - **Compound-Fast Multirate Integration** (Gear & Wells, *BIT* 1984; Verhoeven et al., *IEEE TCAD* 2008; Gunther & Rentrop)
+  - **Dynamic Latency Exploitation & Nodal Linear-Capacitor Compression** (Rabbat, Sangiovanni-Vincentelli & Hsieh, *IEEE TCAS* 1979)
+  - **Time-Axis Predictor / PI+Deadband Step Controller / Adaptive Gear-3** (Gustafsson 1991; Soderlind H211PI *ACM TOMS* 2003; SUNDIALS IDA Hindmarsh et al. 2005)
+- **Gain — Mixed-Signal Benchmarks (single-core KLU-1t, `cpu0`, `0` env vars default ON vs Stage 11 `9795d5b03`):**
+  - `ti12_full_300ns` (`N=7,220`, 100k PEX caps): **`29.56 s -> 13.17 s` tran** (**2.24×** `std`, `rel_rms = 4.52e-6` PASS); with `nostepsizelimit`: **`8.96 s` tran** (**1.73×** vs `nostep` S11 / **3.30×** vs `std` S11, `2.69e-4` PASS).
+  - `sar12_probe_2cyc`: **`7.01 s -> 6.37 s`** (**1.10×**, PASS `141.1 ps`); `sar12_hero_16cyc`: **`55.00 s -> 50.47 s`** (**1.090×**, **16/16** exact SAR codes, `143.7 ps`).
+  - `pll_ring_150m_4us`: **`21.22 s -> 19.34 s`** (**1.10×**, PASS `c31`, `vc_err = 0.26 mV`).
+  - `sdm16_120cyc`: **`22.49 s -> 22.47 s`** (**1.00×**, **0/115** bit-exact PDM, `r = 0.99932` PASS).
+  - **4-Deck `std` Geomean:** **`1.284×`** over Stage 11 (**5/5 strict golden PASS** incl. Hero SAR).
+  - **Opt-In Time-Axis Synergy (`NGSPICE_TA_*`, default `0`):** `TA_P123` (`PRED=2 CTRL=1 BKPT=1`) compounds to **`1.338×` `std` / `1.314×` `nostep` geomean** (`ti12` **`12.34 s` [2.39×]** `std`, **`8.01 s` [3.69×]** `nostep`; `sdm16` **`19.93 s` [1.13×]**); `TA_P234` (`CTRL=1 BKPT=1 ORD3=1`, native Gear-3) reaches **`7.63 s` (`3.88×` vs `std` S11, PASS `2.44e-4`)** on `ti12 nostep`.
+- **Gain — VLSI Scaling on GF180 Post-APR 32-bit RISC-V SoC (`picorv32_gf180_soc`, `N=51,670` eqs, `58,320` BSIM4 MOSFETs, `21,955` R + `73,964` C [49.6k coupling], `2.68M` total KLU NNZ, single-core KLU-1t):**
+  - Exact `120 ns` (3 cycles, `cpu8`, `0` env vars): **`942.88 s` Stock KLU-1t / `397.69 s` Stage 11 -> `243.30 s` tran** (**3.88×** vs Stock KLU-1t, **1.63×** vs Stage 11; KLU `factor` **`569.87 s / 329.15 s -> 176.12 s`** [**3.24× / 1.87×**], `62.3%` micro-steps, `avg_nF = 8,796 [17.0%]`, `fb = 0`, **3/3 cycles bit-exact PASS**, `9.50 mV` RMS vs Stock golden).
+  - Full `260 ns` (6.5 cycles, PC `0x00 -> 0x04`, `cpu2`): Stage 11 **`802.68 s` -> `499.72 s` tran** default (**1.61×** vs Stage 11, **~4.00×** vs Stock KLU-1t; `factor` `660.97 s -> 360.14 s` [**1.84×**], `65.2%` micro-steps, **7/7 cycles bit-exact PASS**, `4.75 mV` RMS, `I_vdd = 3.629 mA` vs `3.63 mA`); with opt-in `TA_P123`: **`449.32 s` tran** (**1.79×** vs Stage 11, **~4.45×** vs Stock KLU-1t; `factor` `319.76 s` [**2.07×**], **7/7 cycles PASS**).
+- **Major changes (all 3 build profiles verified clean with 0 warnings, 0 `%zmm` on `ZEN4=0`, `tests/bsim4` 2/2 PASS, LSan 0 new leaks):**
+  1. **Deferred Nodal Linear-CAP Integration & Active-Node `CKTtrunc` (Default ON)** (`capdefs.h`, `capload.c`, `captrunc.c`, `capask.c`, `capinit.c`, `ckttrunc.c`, `NGSPICE_OPT_GENERAL`; opt-out `NGSPICE_NO_MR_DEFCAP=1`, `NGSPICE_NO_MR_TRUNC=1`):
+     - Compresses `O(N_cap)` linear capacitor integration into `O(N_node)` nodal capacitance history (`CAPmrVhist[4]` / `CAPmrQnode[3]`, supporting BDF-1, Trap-2, Gear-2, and Gear-3) computed once per converged step in `CAPaccept` and materialized in `CAPkluPrep`, plus active-node `CAPtrunc` and `BSIM4truncAvx` stationary-block skipping.
+  2. **Dynamic Latent-Partition BSIM4 Companion Freezing (Default ON)** (`bsim4_avx512_core.h`, `bsim4_avx512_glue.h`, `b4v5ld.c`, `b4v6ld.c`, `klu.h`, `klusmp.c`, `cktload.c`, `NGSPICE_OPT_ZEN4` + `NGSPICE_OPT_GENERAL`; opt-out `NGSPICE_NO_MR_LATENT=1`):
+     - Freezes stationary 8-wide BSIM4 blocks into pre-accumulated `(KLUmatrixAxLatentDC, KLUmatrixAxLatentCap, KLUmatrixRhsLatentDC/Cap)` arrays with exact node-indexed wake-up (`0.5 * vtol`), state resynchronization (`s0..s4`), and `KLUmatrixResCapValid` coherency.
+  3. **2-Level Compound-Fast Active-Submatrix KLU Multirate Integration (Auto-gated at `N >= 2,500`, Default ON)** (`dctran.c`, `klusmp.c`, `niiter.c`, `cktload.c`, `niconv.c`, `NGSPICE_OPT_GENERAL`; opt-out `NGSPICE_NO_MR_COMPFAST=1`, override `NGSPICE_MR_COMPFAST=0|1`, threshold `NGSPICE_MR_CF_MIN_N`):
+     - Dynamically partitions active vs. slow nodes into a cached `nF × nF` KLU submatrix (`16`-entry LRU superset cache with union hysteresis, pre-baked `SubBaseAx`/`BndBaseAx`/`RailBaseAx`, full-row grounded DC rail KCL for exact `i(Vvdd)`, Diode terminal pinning, and zero-lag pre-accept boundary wake-and-redo).
+     - At VLSI scale (`N >= 10,000`, strictly zero change for `N < 10,000`): uses directional strong-coupling 1-hop expansion (`|A_{row,j}| >= 0.02 * |A_{row,row}|`), exact first-order sensitivity-weighted wake (`WakeScale[i] = max_{j in S} |A_{j,i}|/|A_{j,j}|`), `vntol`-scaled thresholds, and VLSI-adaptive exact Chord Newton (`niiter.c` + `SMPkluSubSolve`).
+  4. **Opt-In Time-Axis Predictor, PI+Deadband+NL Controller, Breakpoint Smoothing, Gear-3 & `CKTnodeIsVolt` Leak Fix (Default OFF)** (`cktdefs.h`, `cktdest.c`, `dctran.c`, `niiter.c`, `dioload.c`, `b4v5ld.c`, `b4v6ld.c`, `bsim4_avx512_core.h`, `bsim4_avx512_glue.h`, `capload.c`, `captrunc.c`, `NGSPICE_OPT_GENERAL`):
+     - Opt-in toggles `NGSPICE_TA_PRED=0..3` (slope-limited 2nd-order Lagrange predictor, fast-only during `COMPFAST` bursts), `NGSPICE_TA_CTRL=1` (`TA_PI` Soderlind H211PI + `TA_DB=1.35` `ag0`-hold deadband + `TA_NL` Newton-aware damping + `TA_CHORD`), `NGSPICE_TA_BKPT=1`, and `NGSPICE_TA_ORD3=1` (native Gear-3 across AVX-512 BSIM4 and deferred KLU CAP); fixes unconditional `CKTnodeIsVolt` free in `cktdest.c`.

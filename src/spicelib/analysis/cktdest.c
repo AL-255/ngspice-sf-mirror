@@ -63,7 +63,7 @@ CKTdestroy(CKTcircuit *ckt)
                 DEVices[i]->DEVdestroy();
         }
 
-    for(i=0;i<=ckt->CKTmaxOrder+1;i++){
+    for(i=0;i<8;i++){
         FREE(ckt->CKTstates[i]);
     }
     if(ckt->CKTmatrix) {
@@ -89,6 +89,18 @@ CKTdestroy(CKTcircuit *ckt)
     FREE(ckt->CKTirhs);
     FREE(ckt->CKTirhsOld);
     FREE(ckt->CKTirhsSpare);
+#if NGSPICE_OPT_GENERAL
+    FREE(ckt->CKTnodeIsVolt);
+    FREE(ckt->CKTmrIsFast);
+    FREE(ckt->CKTmrVprev1);
+    FREE(ckt->CKTmrVprev2);
+    FREE(ckt->CKTmrVmacro);
+    FREE(ckt->CKTtaPredVec);
+    for (i = 0; i < 4; i++)
+        FREE(ckt->CKTtaSol[i]);
+    ckt->CKTtaSolSize = 0;
+    ckt->CKTtaSolCount = 0;
+#endif
 
 #ifdef PREDICTOR
     if(ckt->CKTpred) FREE(ckt->CKTpred);

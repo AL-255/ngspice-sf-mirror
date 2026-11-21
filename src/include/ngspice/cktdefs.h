@@ -348,6 +348,32 @@ struct CKTcircuit {
     int CKTkluLastStepSmooth;
     double CKTkluLuAg0;
     double CKTkluLuGmin;
+
+    /* Compound-fast active-submatrix multirate state (NGSPICE_MR_COMPFAST) */
+    int CKTmrSubActive;
+    int CKTmrSubBurstLen;
+    int CKTmrSubNeedSync;
+    int CKTmrSubNFast;
+    int CKTmrSubVlen;
+    unsigned int CKTmrSubEpoch;
+    const int *CKTmrFastNodes;       /* borrowed from KLUsubEntry->SubToRhs */
+    unsigned char *CKTmrIsFast;
+    double *CKTmrVprev1;
+    double *CKTmrVprev2;
+    double *CKTmrVmacro;
+    int CKTmrSubLuValid;
+    int CKTmrSubChordCount;
+    double CKTmrSubLuAg0;
+    double CKTmrSubLuGmin;
+
+    /* Time-axis predictor & step/order control state (NGSPICE_TA_*) */
+    double *CKTtaSol[4];
+    double *CKTtaPredVec;
+    double CKTtaSolDt[3];
+    int CKTtaSolSize;
+    int CKTtaSolCount;
+    int CKTtaPredActive;
+    int CKTtaLastIter;
 #endif
 };
 

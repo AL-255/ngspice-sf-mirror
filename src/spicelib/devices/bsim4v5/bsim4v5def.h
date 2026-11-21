@@ -1723,7 +1723,7 @@ typedef struct sBSIM4v5model
 #if NGSPICE_OPT_BSIM4_SIMD
     void *BSIM4v5AvxBlocks;
     void *BSIM4v5AvxDyn;
-    void *BSIM4v5AvxL2;
+    void *BSIM4v5AvxLatent;
     int   BSIM4v5AvxDynValid;
     int   BSIM4v5AvxBlockCount;
     int  *BSIM4v5AvxFallbackIdx;

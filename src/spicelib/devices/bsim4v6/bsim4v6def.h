@@ -1827,7 +1827,7 @@ typedef struct sBSIM4v6model
 #if NGSPICE_OPT_BSIM4_SIMD
     void *BSIM4v6AvxBlocks;
     void *BSIM4v6AvxDyn;
-    void *BSIM4v6AvxL2;
+    void *BSIM4v6AvxLatent;
     int   BSIM4v6AvxDynValid;
     int   BSIM4v6AvxBlockCount;
     int  *BSIM4v6AvxFallbackIdx;

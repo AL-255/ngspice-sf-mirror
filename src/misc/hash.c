@@ -34,11 +34,11 @@ REVISIONS:
 #define  MINPRIMESIZE 7
 
 /* ********************** STATIC DEFINITIONS ************************* */
-#if !NGSPICE_OPT_APPLE
+#if !NGSPICE_OPT_GENERAL
 static NGTABLEPTR _nghash_find_item(NGHASHPTR hhtable,void *user_key,void *data) ;
 #endif
 
-#if NGSPICE_OPT_APPLE
+#if NGSPICE_OPT_GENERAL
 static inline unsigned int
 nghash_raw_str(const char *s, size_t *out_len)
 {
@@ -131,7 +131,7 @@ NGHASHPTR nghash_init_with_parms(nghash_compare_func_t *comp_func, nghash_func_t
 
 void nghash_resize(NGHASHPTR hashtable, int num)
 {
-#if NGSPICE_OPT_APPLE
+#if NGSPICE_OPT_GENERAL
     NGTABLEPTR *oldtable, *newtable, hptr;
     int newsize;
 
@@ -221,7 +221,7 @@ void nghash_resize(NGHASHPTR hashtable, int num)
 #endif
 } /* end nghash_resize() */
 
-#if NGSPICE_OPT_APPLE
+#if NGSPICE_OPT_GENERAL
 void nghash_reserve(NGHASHPTR hashtable, int min_entries)
 {
     if (!hashtable || min_entries < hashtable->need_resize)
@@ -241,7 +241,7 @@ void nghash_reset_stat(NGHASHPTR hashtable)
 
 NGHASHPTR nghash_init(int num_entries)
 {
-#if NGSPICE_OPT_APPLE
+#if NGSPICE_OPT_GENERAL
     return( nghash_init_with_parms( NGHASH_DEF_CMP(NGHASH_FUNC_STR), NGHASH_DEF_HASH(NGHASH_FUNC_STR),
                                     num_entries, 2,
                                     NGHASH_DEF_GROW_FACTOR, NGHASH_UNIQUE_TWO) ) ;
@@ -346,7 +346,7 @@ void nghash_free_string_hashtable(NGHASHPTR hashtable)
 ----------------------------------------------------------------- */
 void * _nghash_find(NGHASHPTR hashtable, void * user_key,bool *status)
 {
-#if NGSPICE_OPT_APPLE
+#if NGSPICE_OPT_GENERAL
     NGTABLEPTR curPtr;
     NGTABLEPTR *table = hashtable->hash_table;
     DS(hashtable->access++;) ;
@@ -524,7 +524,7 @@ void * nghash_delete(NGHASHPTR hashtable, void * user_key)
     /* -----------------------------------------------------------------
      * Process the hash function.
     ----------------------------------------------------------------- */
-#if NGSPICE_OPT_APPLE
+#if NGSPICE_OPT_GENERAL
     hsum = nghash_bucket_idx(hashtable, nghash_raw_key(hashtable, user_key, NULL));
 #else
     switch( (intptr_t) hashtable->hash_func ) {
@@ -602,7 +602,7 @@ void * nghash_delete_special(NGHASHPTR hashtable, void* user_key)
     /* -----------------------------------------------------------------
      * Process the hash function.
       ----------------------------------------------------------------- */
-#if NGSPICE_OPT_APPLE
+#if NGSPICE_OPT_GENERAL
     hsum = nghash_bucket_idx(hashtable, nghash_raw_key(hashtable, user_key, NULL));
 #else
     switch ((intptr_t)hashtable->hash_func) {
@@ -668,7 +668,7 @@ void * nghash_delete_special(NGHASHPTR hashtable, void* user_key)
 
 void * nghash_insert(NGHASHPTR hashtable, void * user_key, void * data)
 {
-#if NGSPICE_OPT_APPLE
+#if NGSPICE_OPT_GENERAL
     NGTABLEPTR curPtr, temptr, curTable;
     NGTABLEPTR *table = hashtable->hash_table;
     DS(hashtable->access++;)
@@ -868,7 +868,7 @@ void * nghash_insert(NGHASHPTR hashtable, void * user_key, void * data)
 
 } /* end nghash_insert() */
 
-#if !NGSPICE_OPT_APPLE
+#if !NGSPICE_OPT_GENERAL
 /* returns the pointer with the item */
 static NGTABLEPTR _nghash_find_item(NGHASHPTR htable,void * user_key,void * data)
 {
@@ -1117,7 +1117,7 @@ bool nghash_deleteItem(NGHASHPTR hashtable, void * user_key, void * data)
     /* -----------------------------------------------------------------
      * Process the hash function.
     ----------------------------------------------------------------- */
-#if NGSPICE_OPT_APPLE
+#if NGSPICE_OPT_GENERAL
     hsum = nghash_bucket_idx(hashtable, nghash_raw_key(hashtable, user_key, NULL));
 #else
     switch( (intptr_t) hashtable->hash_func ) {

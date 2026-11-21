@@ -72,6 +72,56 @@ CKTtrunc(CKTcircuit *ckt, double *timeStep)
         ckt->CKTterrCacheValid = 0;
 #endif
 
+#if NGSPICE_OPT_GENERAL
+        {
+            static int mr_trunc_init = 0, mr_trunc_en = 1, cap_dev_idx = -2;
+            if (!mr_trunc_init) {
+                mr_trunc_en = 1;
+                if (getenv("NGSPICE_NO_MR_TRUNC") != NULL) {
+                    mr_trunc_en = 0;
+                } else {
+                    const char *v = getenv("NGSPICE_MR_TRUNC");
+                    if (v != NULL && v[0] != '\0')
+                        mr_trunc_en = (v[0] != '0');
+                }
+                mr_trunc_init = 1;
+            }
+            if (mr_trunc_en) {
+                if (cap_dev_idx == -2)
+                    cap_dev_idx = CKTtypelook("Capacitor");
+                /* CKTtrunc returns MIN(2 * *timeStep, timetemp), so seeding timetemp
+                 * with 2 * *timeStep is bit-exact and gives CAPtrunc a tight upper bound.
+                 * Run CAPtrunc last so nonlinear devices tighten timetemp first. */
+                timetemp = 2.0 * (*timeStep);
+                for (i = 0; i < DEVmaxnum; i++) {
+                    if (i == cap_dev_idx) continue;
+                    if (DEVices[i] && DEVices[i]->DEVtrunc && ckt->CKThead[i]) {
+                        error = DEVices[i]->DEVtrunc(ckt->CKThead[i], ckt, &timetemp);
+                        if (error) {
+                            ckt->CKTterrCacheValid = 0;
+                            ckt->CKTstat->STATtranTruncTime += SPfrontEnd->IFseconds() - startTime;
+                            return(error);
+                        }
+                    }
+                }
+                if (cap_dev_idx >= 0 && DEVices[cap_dev_idx] &&
+                    DEVices[cap_dev_idx]->DEVtrunc && ckt->CKThead[cap_dev_idx])
+                {
+                    error = DEVices[cap_dev_idx]->DEVtrunc(ckt->CKThead[cap_dev_idx], ckt, &timetemp);
+                    if (error) {
+                        ckt->CKTterrCacheValid = 0;
+                        ckt->CKTstat->STATtranTruncTime += SPfrontEnd->IFseconds() - startTime;
+                        return(error);
+                    }
+                }
+                ckt->CKTterrCacheValid = 0;
+                *timeStep = MIN(2 * *timeStep, timetemp);
+                ckt->CKTstat->STATtranTruncTime += SPfrontEnd->IFseconds() - startTime;
+                return(OK);
+            }
+        }
+#endif
+
         timetemp = HUGE;
         for (i = 0; i < DEVmaxnum; i++) {
             if (DEVices[i] && DEVices[i]->DEVtrunc && ckt->CKThead[i]) {

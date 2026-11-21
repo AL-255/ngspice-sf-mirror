@@ -145,7 +145,7 @@ spSolve(MatrixPtr Matrix, RealVector RHS, RealVector Solution,
     Intermediate = Matrix->Intermediate;
     Size = Matrix->Size;
 
-#if NGSPICE_OPT_APPLE
+#if NGSPICE_OPT_GENERAL
     if (Matrix->FlatValid && Matrix->FlatFactored)
     {
         const int * restrict colStart = Matrix->FlatColStart;
@@ -183,25 +183,16 @@ spSolve(MatrixPtr Matrix, RealVector RHS, RealVector Solution,
             }
         }
 
-        /* Backward substitution: Ux = c (column-oriented over same contiguous CSC!) */
+        /* Backward substitution: Ux = c (row-oriented flat CSR preserving exact stock summation order!) */
+        const int * restrict uRowStart = Matrix->FlatURowStart;
+        const int * restrict uCol      = Matrix->FlatUCol;
+        const int * restrict uValIdx   = Matrix->FlatUValIdx;
         for (I = Size; I > 0; I--) {
             double t = X[I];
-            if (t != 0.0) {
-                int c0 = colStart[I];
-                int cd = diagIdx[I];
-                int p = c0;
-                for (; p + 3 < cd; p += 4) {
-                    int i0 = row[p], i1 = row[p + 1], i2 = row[p + 2], i3 = row[p + 3];
-                    double x0 = X[i0], x1 = X[i1], x2 = X[i2], x3 = X[i3];
-                    x0 -= t * val[p];
-                    x1 -= t * val[p + 1];
-                    x2 -= t * val[p + 2];
-                    x3 -= t * val[p + 3];
-                    X[i0] = x0; X[i1] = x1; X[i2] = x2; X[i3] = x3;
-                }
-                for (; p < cd; p++)
-                    X[row[p]] -= t * val[p];
-            }
+            int q1 = uRowStart[I + 1];
+            for (int q = uRowStart[I]; q < q1; q++)
+                t -= val[uValIdx[q]] * X[uCol[q]];
+            X[I] = t;
         }
 
         /* Unscramble Solution */
@@ -476,7 +467,7 @@ spSolveTransposed(MatrixPtr Matrix, RealVector RHS, RealVector Solution,
 
     /* Begin `spSolveTransposed'. */
     assert( IS_VALID(Matrix) && IS_FACTORED(Matrix) );
-#if NGSPICE_OPT_APPLE
+#if NGSPICE_OPT_GENERAL
     if (Matrix->FlatFactored)
         spcSyncFlatToElems(Matrix);
 #endif

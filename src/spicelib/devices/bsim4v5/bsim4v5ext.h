@@ -38,6 +38,7 @@ extern int BSIM4v5loadKluPar (GENmodel*, CKTcircuit*, double*, double*) ;
 #if NGSPICE_OPT_BSIM4_SIMD
 extern int BSIM4v5convTestAvx(GENmodel*, CKTcircuit*);
 extern int BSIM4v5truncAvx(GENmodel*, CKTcircuit*, double*);
+extern void BSIM4v5freeAvxLatent(void*);
 extern int BSIM4v5AvxNeedAosSync;
 #if NGSPICE_OPT_APPLE
 struct sBSIM4v5model;

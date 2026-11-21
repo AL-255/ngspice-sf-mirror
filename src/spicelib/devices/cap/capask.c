@@ -72,6 +72,13 @@ CAPask(CKTcircuit *ckt, GENinstance *inst, int which, IFvalue *value,
                 if (ckt->CKTmode & MODETRANOP) {
                     value->rValue = 0;
                 } else {
+#if NGSPICE_OPT_GENERAL
+                    CAPmodel *head = (CAPmodel *)ckt->CKThead[here->gen.GENmodPtr->GENmodType];
+                    if (head && head->CAPmrStateLazy && head->CAPmrHistValid && head->CAPmrDvdtPrev) {
+                        value->rValue = here->CAPcapac *
+                            (head->CAPmrDvdtPrev[here->CAPposNode] - head->CAPmrDvdtPrev[here->CAPnegNode]);
+                    } else
+#endif
                     value->rValue = *(ckt->CKTstate0 + here->CAPccap);
                 }
             } else value->rValue = *(ckt->CKTstate0 + here->CAPccap);
@@ -91,7 +98,16 @@ CAPask(CKTcircuit *ckt, GENinstance *inst, int which, IFvalue *value,
                 if (ckt->CKTmode & MODETRANOP) {
                     value->rValue = 0;
                 } else {
-                    value->rValue = *(ckt->CKTstate0 + here->CAPccap) *
+                    double icap;
+#if NGSPICE_OPT_GENERAL
+                    CAPmodel *head = (CAPmodel *)ckt->CKThead[here->gen.GENmodPtr->GENmodType];
+                    if (head && head->CAPmrStateLazy && head->CAPmrHistValid && head->CAPmrDvdtPrev) {
+                        icap = here->CAPcapac *
+                            (head->CAPmrDvdtPrev[here->CAPposNode] - head->CAPmrDvdtPrev[here->CAPnegNode]);
+                    } else
+#endif
+                    icap = *(ckt->CKTstate0 + here->CAPccap);
+                    value->rValue = icap *
                             (*(ckt->CKTrhsOld + here->CAPposNode) -
                             *(ckt->CKTrhsOld + here->CAPnegNode));
                 }

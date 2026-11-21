@@ -23,6 +23,12 @@ extern int CAPsoaCheck(CKTcircuit *, GENmodel *);
 extern void CAPbumpVersion(void);
 extern int CAPmDelete(GENmodel*);
 extern void CAPensureFastCache(GENmodel*, CKTcircuit*);
+#if NGSPICE_OPT_GENERAL
+extern int CAPaccept(CKTcircuit*, GENmodel*);
+extern int CAPmrDeferredEnabled(void);
+extern int CAPmrActiveTruncEnabled(void);
+extern void CAPmrEnsureBuilt(GENmodel*, CKTcircuit*);
+#endif
 
 #ifdef KLU
 extern int CAPbindCSC (GENmodel*, CKTcircuit*) ;
