@@ -55,8 +55,13 @@ B4P(isAvxEligibleDcOp)(CKTcircuit *ckt)
     long mode = ckt->CKTmode;
     if (!(mode & (MODEDCOP | MODETRANOP)))
         return 0;
-    if ((mode & MODETRANOP) && ckt->CKTdiagGmin != 0.0)
+#ifdef KLU
+    if ((mode & MODETRANOP) && (!ckt->CKTkluMODE || ckt->CKTdiagGmin != 0.0))
         return 0;
+#else
+    if (mode & MODETRANOP)
+        return 0;
+#endif
     if (!(mode & (MODEINITFLOAT | MODEINITJCT | MODEINITFIX)))
         return 0;
     if (mode & (MODEINITSMSIG | MODEINITTRAN | MODEUIC | MODEDCTRANCURVE | MODEAC | MODETRAN))
@@ -1890,7 +1895,8 @@ B4P(evalAppleGroupList)(
                         bsim4_apple_l1_sync_one(c, &l2s[i], vds, vgs, vbs, ag0, s0);
                         c->last_active_step = acc;
                     }
-                    B4P(stampOneDirect)(c, &stamps[i], InstArray, my_ax, my_rhs, stamp_mode);
+                    if (stamp_mode != 3)
+                        B4P(stampOneDirect)(c, &stamps[i], InstArray, my_ax, my_rhs, stamp_mode);
                     continue;
                 }
             }
@@ -1960,7 +1966,8 @@ B4P(evalAppleGroupList)(
                 if (!exact_zero)
                     c->last_active_step = acc;
                 c->stamp_valid = 1;
-                B4P(stampOneDirect)(c, sp, InstArray, my_ax, my_rhs, stamp_mode);
+                if (stamp_mode != 3)
+                    B4P(stampOneDirect)(c, sp, InstArray, my_ax, my_rhs, stamp_mode);
                 continue;
             }
         }
@@ -2134,7 +2141,7 @@ B4P(runApplePack)(
                                     pack->eval_q, pack->eval_vds, pack->eval_vgs, pack->eval_vbs);
         }
     } else if (stamp_mode == 2 && dc_only && pack->orig_order) {
-        /* Preserve exact stock InstArray[0..nElig-1] Sparse stamping order during DCOP/TRANOP */
+        /* Preserve exact stock InstArray[0..nElig-1] Sparse stamping order during DCOP */
         for (int gi = 0; gi < nGroups; gi++) {
             B4P(evalAppleGroupList)(pack, gi, NULL, pack->groups[gi].count,
                                     InstArray, ckt, my_ax, my_rhs,
