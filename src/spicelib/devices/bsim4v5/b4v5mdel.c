@@ -30,6 +30,8 @@ BSIM4v5mDelete(GENmodel *gen_model)
     model->BSIM4v5AvxBlocks = NULL;
     free(model->BSIM4v5AvxDyn);
     model->BSIM4v5AvxDyn = NULL;
+    BSIM4v5freeAvxLatent(model->BSIM4v5AvxLatent);
+    model->BSIM4v5AvxLatent = NULL;
     model->BSIM4v5AvxDynValid = 0;
     FREE(model->BSIM4v5AvxFallbackIdx);
     model->BSIM4v5AvxBuilt = 0;

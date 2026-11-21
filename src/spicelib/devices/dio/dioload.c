@@ -173,24 +173,20 @@ DIOload(GENmodel *inModel, CKTcircuit *ckt)
                 if (ckt->CKTmode & MODEINITPRED) {
                     *(ckt->CKTstate0 + here->DIOvoltage) =
                             *(ckt->CKTstate1 + here->DIOvoltage);
-                    vd = DEVpred(ckt,here->DIOvoltage);
                     *(ckt->CKTstate0 + here->DIOcurrent) =
                             *(ckt->CKTstate1 + here->DIOcurrent);
                     *(ckt->CKTstate0 + here->DIOconduct) =
                             *(ckt->CKTstate1 + here->DIOconduct);
                     *(ckt->CKTstate0 + here->DIOdeltemp) =
                             *(ckt->CKTstate1 + here->DIOdeltemp);
-                    delTemp = DEVpred(ckt,here->DIOdeltemp);
                     *(ckt->CKTstate0 + here->DIOdIdio_dT) =
                             *(ckt->CKTstate1 + here->DIOdIdio_dT);
                     *(ckt->CKTstate0+here->DIOqth) =
                             *(ckt->CKTstate1+here->DIOqth);
                     if (model->DIOresistSWGiven) {
-                        vdsw = DEVpred(ckt,here->DIOvoltageSW);
                         *(ckt->CKTstate0 + here->DIOdIdioSW_dT) =
                                 *(ckt->CKTstate1 + here->DIOdIdioSW_dT);
                     }
-                    vqp = DEVpred(ckt,here->DIOqp);
                     *(ckt->CKTstate0 + here->DIOresCurrent) =
                             *(ckt->CKTstate1 + here->DIOresCurrent);
                     *(ckt->CKTstate0 + here->DIOresConduct) =
@@ -199,6 +195,24 @@ DIOload(GENmodel *inModel, CKTcircuit *ckt)
                             *(ckt->CKTstate1 + here->DIOcqcsr);
                     *(ckt->CKTstate0 + here->DIOgqcsr) =
                             *(ckt->CKTstate1 + here->DIOgqcsr);
+#if NGSPICE_OPT_GENERAL
+                    if (ckt->CKTtaPredActive) {
+                        vd = *(ckt->CKTrhsOld + here->DIOposPrimeNode) -
+                             *(ckt->CKTrhsOld + here->DIOnegNode);
+                        if (model->DIOresistSWGiven)
+                            vdsw = *(ckt->CKTrhsOld + here->DIOposSwPrimeNode) -
+                                   *(ckt->CKTrhsOld + here->DIOnegNode);
+                        delTemp = selfheat ? *(ckt->CKTrhsOld + here->DIOtempNode) : 0.0;
+                        vqp = DEVpred(ckt, here->DIOqp);
+                    } else
+#endif
+                    {
+                        vd = DEVpred(ckt,here->DIOvoltage);
+                        delTemp = DEVpred(ckt,here->DIOdeltemp);
+                        if (model->DIOresistSWGiven)
+                            vdsw = DEVpred(ckt,here->DIOvoltageSW);
+                        vqp = DEVpred(ckt,here->DIOqp);
+                    }
                 } else {
 #endif /* PREDICTOR */
                     vd = *(ckt->CKTrhsOld+here->DIOposPrimeNode)-

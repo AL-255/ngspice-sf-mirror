@@ -1027,6 +1027,19 @@ typedef struct sKLUmatrix {
     int     KLUmatrixRhsCapValid ;
     int     KLUmatrixIdentityMap ; /* -1=unknown, 0=non-identity, 1=identity */
 
+    /* Dynamic latent-partition BSIM4 companion accumulators (NGSPICE_MR_LATENT) */
+    double *KLUmatrixAxLatentDC ;
+    double *KLUmatrixAxLatentCap ;
+    double *KLUmatrixRhsLatentDC ;
+    double *KLUmatrixRhsLatentCap ;
+    int     KLUmatrixRhsLatentLen ;
+    int     KLUmatrixLatentCount ;
+    int     KLUmatrixLatentOps ;
+    int     KLUmatrixResCapHasLatent ;
+
+    /* Compound-fast active-submatrix KLU cache (NGSPICE_MR_COMPFAST) */
+    struct sKLUsubCache *KLUmatrixSubCache ;
+
 #ifdef CIDER
     int *KLUmatrixColCOOforCIDER ;             /* KLU Col Index for COO storage (for CIDER) */
     int *KLUmatrixRowCOOforCIDER ;             /* KLU Row Index for COO storage (for CIDER) */

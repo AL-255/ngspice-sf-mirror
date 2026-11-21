@@ -167,6 +167,15 @@ void SMPconvertCOOtoCSC (SMPmatrix *Matrix)
         Matrix->SMPkluMatrix->KLUmatrixRhsCapLen = 0 ;
         Matrix->SMPkluMatrix->KLUmatrixRhsCapValid = 0 ;
         Matrix->SMPkluMatrix->KLUmatrixIdentityMap = -1 ;
+        Matrix->SMPkluMatrix->KLUmatrixAxLatentDC = NULL ;
+        Matrix->SMPkluMatrix->KLUmatrixAxLatentCap = NULL ;
+        Matrix->SMPkluMatrix->KLUmatrixRhsLatentDC = NULL ;
+        Matrix->SMPkluMatrix->KLUmatrixRhsLatentCap = NULL ;
+        Matrix->SMPkluMatrix->KLUmatrixRhsLatentLen = 0 ;
+        Matrix->SMPkluMatrix->KLUmatrixLatentCount = 0 ;
+        Matrix->SMPkluMatrix->KLUmatrixLatentOps = 0 ;
+        Matrix->SMPkluMatrix->KLUmatrixResCapHasLatent = 0 ;
+        Matrix->SMPkluMatrix->KLUmatrixSubCache = NULL ;
 
         /* Allocate the temporary COO Column Index */
         Ap_COO = NULL ;
@@ -1162,6 +1171,1055 @@ SMPkluChordCommit (SMPmatrix *Matrix, double RHS[], const double Xold[])
             RHS [idx] = Xold [idx] + dx [j] ;
     }
 }
+
+/* ==========================================================================
+ * Prototype 3: Compound-Fast Active-Submatrix KLU Engine (NGSPICE_MR_COMPFAST)
+ *
+ * Solves A_FF * x_F = b_F - A_FS * x_S on the small active partition F during
+ * multirate micro-steps while caching up to 16 active-set symbolic/numeric
+ * factorizations (LRU) and supporting submatrix Shamanskii Chord Newton.
+ * ========================================================================== */
+
+#define KLU_SUB_CACHE_SIZE 16
+#define KLU_SUB_MAX_RAILS  8
+
+typedef struct sKLUsubEntry {
+    unsigned long long hash ;
+    unsigned long long last_tick ;
+    int valid ;
+    int numeric_valid ;
+    int nF ;
+    int sub_nz ;
+    int bnd_nz ;
+    int n_wake ;
+    int *SubToRhs ;      /* [nF] 1-based RHS equation indices */
+    unsigned char *InSub ; /* [in_sub_len] 1 iff 1-based RHS node is in this submatrix */
+    int in_sub_len ;
+    int *SubAp ;         /* [nF + 1] CSC column pointers */
+    int *SubAi ;         /* [sub_nz] CSC row indices */
+    int *SubAxMap ;      /* [sub_nz] index into full KLUmatrixAx */
+    int *SubDiag ;       /* [nF] index into SubAx for diagonal, or -1 */
+    double *SubAx ;      /* [sub_nz + 1] gathered numerical values */
+    double *SubRhs ;     /* [nF] RHS / solution scratch */
+    double *SubBaseAx ;  /* [sub_nz + 1] cached linear+latent base for current (ag0, latOps) */
+    double *BndBaseAx ;  /* [bnd_nz + 1] cached linear+latent base for current (ag0, latOps) */
+    double *RailBaseAx ; /* [rail_total + 1] cached linear+latent base for current (ag0, latOps) */
+    double  base_ag0 ;
+    int     base_lat_ops ;
+    int     base_lat_cnt ;
+    int     base_flags ;
+    int     base_valid ;
+    int *BndRow ;        /* [bnd_nz] submatrix row index 0..nF-1 */
+    int *BndColRhs ;     /* [bnd_nz] slow 1-based RHS index */
+    int *BndAxMap ;      /* [bnd_nz] index into full KLUmatrixAx */
+    int *WakeRhs ;       /* [n_wake] fast 1-based RHS nodes adjacent to non-rail slow nodes */
+    double *WakeScale ;  /* [n_wake] optional sensitivity weight max|A_{S,F}/A_{S,S}| (NULL => 1.0) */
+    /* Grounded DC rail full-row maps (excluding rail branch col) for exact i(Vvdd) */
+    int n_rails ;
+    int rail_node [KLU_SUB_MAX_RAILS] ;
+    int rail_br_col [KLU_SUB_MAX_RAILS] ;
+    int rail_f_ptr [KLU_SUB_MAX_RAILS + 1] ;
+    int *RailFAxMap ;
+    int *RailFColRhs ;
+    double rail_saved_rhs [KLU_SUB_MAX_RAILS] ;
+    klu_common Common ;
+    klu_symbolic *Symbolic ;
+    klu_numeric *Numeric ;
+} KLUsubEntry ;
+
+typedef struct sKLUsubCache {
+    unsigned long long tick ;
+    KLUsubEntry entries [KLU_SUB_CACHE_SIZE] ;
+    KLUsubEntry *active ;
+    /* Lazy symmetric adjacency CSR in 1-based RHS node space for O(deg) 1-hop expansion */
+    int adj_built ;
+    int adj_n_rhs ;
+    int *adj_p ;
+    int *adj_i ;
+    /* Scratch buffers for pattern extraction */
+    int scratch_n ;
+    int *sub_idx ;       /* [N] full KLU col/row -> sub index 0..nF-1, or -1 */
+    int *tmp_fast_rhs ;  /* [N] */
+    unsigned char *tmp_wake_mark ; /* [N] */
+    double *tmp_wake_scale ;       /* [N] */
+} KLUsubCache ;
+
+static void
+klu_sub_free_entry (KLUsubEntry *e)
+{
+    if (!e || !e->valid)
+        return ;
+    if (e->Numeric)
+        klu_free_numeric (&e->Numeric, &e->Common) ;
+    if (e->Symbolic)
+        klu_free_symbolic (&e->Symbolic, &e->Common) ;
+    free (e->SubToRhs) ;
+    free (e->InSub) ;
+    free (e->SubAp) ;
+    free (e->SubAi) ;
+    free (e->SubAxMap) ;
+    free (e->SubDiag) ;
+    free (e->SubAx) ;
+    free (e->SubRhs) ;
+    free (e->SubBaseAx) ;
+    free (e->BndBaseAx) ;
+    free (e->RailBaseAx) ;
+    free (e->BndRow) ;
+    free (e->BndColRhs) ;
+    free (e->BndAxMap) ;
+    free (e->WakeRhs) ;
+    free (e->WakeScale) ;
+    free (e->RailFAxMap) ;
+    free (e->RailFColRhs) ;
+    memset (e, 0, sizeof (*e)) ;
+}
+
+static void
+SMPkluSubDestroy (KLUmatrix *km)
+{
+    if (!km || !km->KLUmatrixSubCache)
+        return ;
+    KLUsubCache *sc = km->KLUmatrixSubCache ;
+    for (int i = 0 ; i < KLU_SUB_CACHE_SIZE ; i++)
+        klu_sub_free_entry (&sc->entries [i]) ;
+    free (sc->adj_p) ;
+    free (sc->adj_i) ;
+    free (sc->sub_idx) ;
+    free (sc->tmp_fast_rhs) ;
+    free (sc->tmp_wake_mark) ;
+    free (sc->tmp_wake_scale) ;
+    free (sc) ;
+    km->KLUmatrixSubCache = NULL ;
+}
+
+static KLUsubCache *
+klu_sub_ensure_cache (KLUmatrix *km)
+{
+    if (km->KLUmatrixSubCache)
+        return km->KLUmatrixSubCache ;
+    KLUsubCache *sc = (KLUsubCache *) calloc (1, sizeof (KLUsubCache)) ;
+    km->KLUmatrixSubCache = sc ;
+    return sc ;
+}
+
+static void
+klu_sub_ensure_adj (KLUmatrix *km, KLUsubCache *sc, int n_rhs)
+{
+    if (sc->adj_built && sc->adj_n_rhs == n_rhs)
+        return ;
+    free (sc->adj_p) ;
+    free (sc->adj_i) ;
+    sc->adj_p = NULL ;
+    sc->adj_i = NULL ;
+    sc->adj_built = 0 ;
+
+    int n = (int) km->KLUmatrixN ;
+    const int * restrict Ap = km->KLUmatrixAp ;
+    const int * restrict Ai = km->KLUmatrixAi ;
+    const unsigned int * restrict map = km->KLUmatrixNodeCollapsingNewToOld ;
+    if (n <= 0 || !Ap || !Ai || !map)
+        return ;
+
+    int *deg = (int *) calloc ((size_t) (n_rhs + 1), sizeof (int)) ;
+    if (!deg)
+        return ;
+
+    /* Undirected edges: for each off-diagonal (r, c), add r->c and c->r */
+    for (int j = 0 ; j < n ; j++) {
+        int cj = (int) map [j + 1] ;
+        if (cj <= 0 || cj >= n_rhs) continue ;
+        int p0 = Ap [j], p1 = Ap [j + 1] ;
+        for (int p = p0 ; p < p1 ; p++) {
+            int i = Ai [p] ;
+            if (i == j) continue ;
+            int ri = (int) map [i + 1] ;
+            if (ri <= 0 || ri >= n_rhs) continue ;
+            deg [cj]++ ;
+            deg [ri]++ ;
+        }
+    }
+
+    int *adj_p = (int *) malloc ((size_t) (n_rhs + 1) * sizeof (int)) ;
+    if (!adj_p) { free (deg) ; return ; }
+    adj_p [0] = 0 ;
+    for (int u = 0 ; u < n_rhs ; u++)
+        adj_p [u + 1] = adj_p [u] + deg [u] ;
+    int total = adj_p [n_rhs] ;
+    int *adj_i = (int *) malloc ((size_t) (total + 1) * sizeof (int)) ;
+    if (!adj_i) { free (deg) ; free (adj_p) ; return ; }
+
+    memcpy (deg, adj_p, (size_t) n_rhs * sizeof (int)) ;
+    for (int j = 0 ; j < n ; j++) {
+        int cj = (int) map [j + 1] ;
+        if (cj <= 0 || cj >= n_rhs) continue ;
+        int p0 = Ap [j], p1 = Ap [j + 1] ;
+        for (int p = p0 ; p < p1 ; p++) {
+            int i = Ai [p] ;
+            if (i == j) continue ;
+            int ri = (int) map [i + 1] ;
+            if (ri <= 0 || ri >= n_rhs) continue ;
+            adj_i [deg [cj]++] = ri ;
+            adj_i [deg [ri]++] = cj ;
+        }
+    }
+    free (deg) ;
+    sc->adj_p = adj_p ;
+    sc->adj_i = adj_i ;
+    sc->adj_n_rhs = n_rhs ;
+    sc->adj_built = 1 ;
+}
+
+void
+SMPkluSubExpand1Hop (SMPmatrix *Matrix, unsigned char *is_fast, int n_rhs,
+                     const unsigned char *is_rail)
+{
+    if (!Matrix || !Matrix->CKTkluMODE || !Matrix->SMPkluMatrix)
+        return ;
+    KLUmatrix *km = Matrix->SMPkluMatrix ;
+    int n = (int) km->KLUmatrixN ;
+    if (n <= 0) return ;
+
+    static int eps_init = 0, has_eps_ov = 0 ;
+    static double eps_ov = 0.0 ;
+    if (!eps_init) {
+        const char *s = getenv ("NGSPICE_MR_CF_EDGE_EPS") ;
+        if (s && s[0]) {
+            eps_ov = atof (s) ;
+            has_eps_ov = 1 ;
+        }
+        eps_init = 1 ;
+    }
+    double edge_eps = has_eps_ov ? eps_ov : ((n >= 10000) ? 0.02 : 0.0) ;
+
+    /* Strong-coupling directional 1-hop expansion for VLSI-scale matrices:
+     * Pull slow node `row` into F only if fast node `j` exerts significant
+     * sensitivity |A_{row,j}| >= edge_eps * |A_{row,row}| (breaks weak fF
+     * OpenRCX coupling caps, OFF MOSFETs, and backward drain->gate unioning). */
+    if (edge_eps > 0.0 && km->KLUmatrixAp && km->KLUmatrixAi &&
+        km->KLUmatrixAx && km->KLUmatrixNodeCollapsingNewToOld)
+    {
+        const int * restrict Ap = km->KLUmatrixAp ;
+        const int * restrict Ai = km->KLUmatrixAi ;
+        const double * restrict Ax = km->KLUmatrixAx ;
+        double ** restrict Diag = km->KLUmatrixDiag ;
+        const unsigned int * restrict map = km->KLUmatrixNodeCollapsingNewToOld ;
+        for (int j = 0 ; j < n ; j++) {
+            int u = (int) map [j + 1] ;
+            if (u <= 0 || u >= n_rhs || is_fast [u] != 1)
+                continue ;
+            if (is_rail && is_rail [u])
+                continue ;
+            int p0 = Ap [j], p1 = Ap [j + 1] ;
+            for (int p = p0 ; p < p1 ; p++) {
+                int row = Ai [p] ;
+                int v = (int) map [row + 1] ;
+                if (v <= 0 || v >= n_rhs || is_fast [v] != 0 || (is_rail && is_rail [v]))
+                    continue ;
+                double aij = fabs (Ax [p]) ;
+                if (aij == 0.0)
+                    continue ;
+                double aii = (Diag && Diag [row]) ? fabs (*Diag [row]) : 0.0 ;
+                if (aii == 0.0 || aij >= edge_eps * aii)
+                    is_fast [v] = 2 ;
+            }
+        }
+        for (int u = 1 ; u < n_rhs ; u++) {
+            if (is_fast [u] == 2)
+                is_fast [u] = 1 ;
+        }
+        return ;
+    }
+
+    KLUsubCache *sc = klu_sub_ensure_cache (km) ;
+    if (!sc) return ;
+    klu_sub_ensure_adj (km, sc, n_rhs) ;
+    if (!sc->adj_built) return ;
+
+    const int * restrict ap = sc->adj_p ;
+    const int * restrict ai = sc->adj_i ;
+
+    /* Mark 1-hop non-rail neighbors with value 2, then promote to 1 */
+    for (int u = 1 ; u < n_rhs ; u++) {
+        if (is_fast [u] != 1)
+            continue ;
+        if (is_rail && is_rail [u])
+            continue ;
+        int p0 = ap [u], p1 = ap [u + 1] ;
+        for (int p = p0 ; p < p1 ; p++) {
+            int v = ai [p] ;
+            if (v > 0 && v < n_rhs && is_fast [v] == 0 && (!is_rail || !is_rail [v]))
+                is_fast [v] = 2 ;
+        }
+    }
+    for (int u = 1 ; u < n_rhs ; u++) {
+        if (is_fast [u] == 2)
+            is_fast [u] = 1 ;
+    }
+}
+
+int
+SMPkluSubPrepare (SMPmatrix *Matrix, const unsigned char *is_fast, int n_rhs,
+                  const unsigned char *is_rail, const int *rail_nodes, int n_rails,
+                  int max_nF, int *n_fast_out, const int **fast_rhs_out,
+                  int *same_as_prev_out,
+                  unsigned long long *cache_hits_out,
+                  unsigned long long *cache_misses_out)
+{
+    if (!Matrix || !Matrix->CKTkluMODE || !Matrix->SMPkluMatrix)
+        return 0 ;
+    KLUmatrix *km = Matrix->SMPkluMatrix ;
+    int n = (int) km->KLUmatrixN ;
+    if (n <= 0 || !km->KLUmatrixAp || !km->KLUmatrixAi || !km->KLUmatrixNodeCollapsingNewToOld)
+        return 0 ;
+
+    KLUsubCache *sc = klu_sub_ensure_cache (km) ;
+    if (!sc) return 0 ;
+
+    if (sc->scratch_n < n) {
+        free (sc->sub_idx) ;
+        free (sc->tmp_fast_rhs) ;
+        free (sc->tmp_wake_mark) ;
+        free (sc->tmp_wake_scale) ;
+        sc->sub_idx        = (int *) malloc ((size_t) n * sizeof (int)) ;
+        sc->tmp_fast_rhs   = (int *) malloc ((size_t) n * sizeof (int)) ;
+        sc->tmp_wake_mark  = (unsigned char *) malloc ((size_t) n * sizeof (unsigned char)) ;
+        sc->tmp_wake_scale = (double *) malloc ((size_t) n * sizeof (double)) ;
+        if (!sc->sub_idx || !sc->tmp_fast_rhs || !sc->tmp_wake_mark || !sc->tmp_wake_scale) {
+            sc->scratch_n = 0 ;
+            return 0 ;
+        }
+        sc->scratch_n = n ;
+    }
+
+    const unsigned int * restrict map = km->KLUmatrixNodeCollapsingNewToOld ;
+    int * restrict sub_idx = sc->sub_idx ;
+    int * restrict tmp_fast = sc->tmp_fast_rhs ;
+    KLUsubEntry *prev_active = sc->active ;
+
+    int nF = 0 ;
+    unsigned long long h = 14695981039346656037ULL ;
+    for (int j = 0 ; j < n ; j++) {
+        int rn = (int) map [j + 1] ;
+        if (rn > 0 && rn < n_rhs && is_fast [rn]) {
+            sub_idx [j] = nF ;
+            tmp_fast [nF] = rn ;
+            h ^= (unsigned long long) rn ;
+            h *= 1099511628211ULL ;
+            nF++ ;
+        } else {
+            sub_idx [j] = -1 ;
+        }
+    }
+    if (nF <= 0)
+        return 0 ;
+
+    sc->tick++ ;
+
+    /* 1. Check 16-entry LRU cache for exact match OR tight superset match */
+    int lru_slot = 0 ;
+    unsigned long long lru_best = ~0ULL ;
+    int sup_limit = (int) (1.25 * (double) nF) + 32 ;
+    if (sup_limit > max_nF) sup_limit = max_nF ;
+    KLUsubEntry *best_sup = NULL ;
+
+    for (int s = 0 ; s < KLU_SUB_CACHE_SIZE ; s++) {
+        KLUsubEntry *e = &sc->entries [s] ;
+        if (e->valid) {
+            if (e->hash == h && e->nF == nF &&
+                memcmp (e->SubToRhs, tmp_fast, (size_t) nF * sizeof (int)) == 0)
+            {
+                best_sup = e ;
+                break ;
+            }
+            if (e->nF >= nF && e->nF <= sup_limit && e->InSub && e->in_sub_len >= n_rhs &&
+                (!best_sup || e->nF < best_sup->nF))
+            {
+                int is_sup = 1 ;
+                const unsigned char * restrict ins = e->InSub ;
+                for (int k = 0 ; k < nF ; k++) {
+                    if (!ins [tmp_fast [k]]) { is_sup = 0 ; break ; }
+                }
+                if (is_sup)
+                    best_sup = e ;
+            }
+            if (e->last_tick < lru_best) {
+                lru_best = e->last_tick ;
+                lru_slot = s ;
+            }
+        } else {
+            lru_slot = s ;
+            lru_best = 0 ;
+        }
+    }
+
+    if (best_sup) {
+        best_sup->last_tick = sc->tick ;
+        sc->active = best_sup ;
+        if (n_fast_out) *n_fast_out = best_sup->nF ;
+        if (fast_rhs_out) *fast_rhs_out = best_sup->SubToRhs ;
+        if (same_as_prev_out) *same_as_prev_out = (best_sup == prev_active) ? 1 : 0 ;
+        if (cache_hits_out) (*cache_hits_out)++ ;
+        return 1 ;
+    }
+
+    if (cache_misses_out) (*cache_misses_out)++ ;
+
+    /* 2. Union hysteresis: if active entry + requested set stays compact, build union
+     *    so subsequent bursts hit the superset cache instead of thrashing klu_analyze */
+    if (prev_active && prev_active->valid && prev_active->InSub && prev_active->in_sub_len >= n_rhs) {
+        const unsigned char * restrict pins = prev_active->InSub ;
+        int union_cnt = 0 ;
+        for (int j = 0 ; j < n ; j++) {
+            int rn = (int) map [j + 1] ;
+            if (rn > 0 && rn < n_rhs && (is_fast [rn] || pins [rn]) &&
+                (!is_rail || !is_rail [rn]))
+                union_cnt++ ;
+        }
+        int union_lim = (int) (1.25 * (double) nF) + 48 ;
+        if (union_lim > max_nF) union_lim = max_nF ;
+        if (union_cnt > nF && union_cnt <= union_lim) {
+            nF = 0 ;
+            h = 14695981039346656037ULL ;
+            for (int j = 0 ; j < n ; j++) {
+                int rn = (int) map [j + 1] ;
+                if (rn > 0 && rn < n_rhs && (is_fast [rn] || pins [rn]) &&
+                    (!is_rail || !is_rail [rn]))
+                {
+                    sub_idx [j] = nF ;
+                    tmp_fast [nF] = rn ;
+                    h ^= (unsigned long long) rn ;
+                    h *= 1099511628211ULL ;
+                    nF++ ;
+                } else {
+                    sub_idx [j] = -1 ;
+                }
+            }
+        }
+    }
+
+    /* Cache miss: evict lru_slot and build new submatrix entry */
+    KLUsubEntry *e = &sc->entries [lru_slot] ;
+    if (e == prev_active)
+        prev_active = NULL ;
+    klu_sub_free_entry (e) ;
+
+    const int * restrict Ap = km->KLUmatrixAp ;
+    const int * restrict Ai = km->KLUmatrixAi ;
+
+    /* Count sub_nz, bnd_nz, and full rail row entries (excluding rail branch cols) */
+    int nr = (n_rails > KLU_SUB_MAX_RAILS) ? KLU_SUB_MAX_RAILS : n_rails ;
+    if (nr < 0) nr = 0 ;
+    int rail_klu_row [KLU_SUB_MAX_RAILS] ;
+    int rail_cnt [KLU_SUB_MAX_RAILS] ;
+    for (int r = 0 ; r < nr ; r++) {
+        rail_klu_row [r] = -1 ;
+        rail_cnt [r] = 0 ;
+        e->rail_node [r] = rail_nodes [r] ;
+        e->rail_br_col [r] = -1 ;
+    }
+    for (int j = 0 ; j < n && nr > 0 ; j++) {
+        int rn = (int) map [j + 1] ;
+        for (int r = 0 ; r < nr ; r++) {
+            if (rn == rail_nodes [r])
+                rail_klu_row [r] = j ;
+        }
+    }
+
+    int sub_nz = 0, bnd_nz = 0 ;
+    for (int j = 0 ; j < n ; j++) {
+        int p0 = Ap [j], p1 = Ap [j + 1] ;
+        int col_rhs = (int) map [j + 1] ;
+        /* Skip branch-current columns (is_rail && col != rail_node) when counting rail row */
+        int col_is_rail_br = (is_rail && col_rhs > 0 && col_rhs < n_rhs && is_rail [col_rhs]) ? 1 : 0 ;
+        if (col_is_rail_br) {
+            for (int r = 0 ; r < nr ; r++) {
+                if (col_rhs == rail_nodes [r]) { col_is_rail_br = 0 ; break ; }
+            }
+        }
+        if (sub_idx [j] >= 0) {
+            for (int p = p0 ; p < p1 ; p++) {
+                int row = Ai [p] ;
+                if (sub_idx [row] >= 0)
+                    sub_nz++ ;
+                if (!col_is_rail_br) {
+                    for (int r = 0 ; r < nr ; r++) {
+                        if (row == rail_klu_row [r]) { rail_cnt [r]++ ; break ; }
+                    }
+                }
+            }
+        } else {
+            for (int p = p0 ; p < p1 ; p++) {
+                int row = Ai [p] ;
+                if (sub_idx [row] >= 0)
+                    bnd_nz++ ;
+                if (!col_is_rail_br) {
+                    for (int r = 0 ; r < nr ; r++) {
+                        if (row == rail_klu_row [r]) { rail_cnt [r]++ ; break ; }
+                    }
+                }
+            }
+        }
+    }
+
+    e->nF = nF ;
+    e->sub_nz = sub_nz ;
+    e->bnd_nz = bnd_nz ;
+    e->n_rails = nr ;
+    e->SubToRhs = (int *) malloc ((size_t) nF * sizeof (int)) ;
+    e->InSub    = (unsigned char *) calloc ((size_t) (n_rhs + 1), sizeof (unsigned char)) ;
+    e->in_sub_len = n_rhs ;
+    e->SubAp    = (int *) malloc ((size_t) (nF + 1) * sizeof (int)) ;
+    e->SubAi    = (int *) malloc ((size_t) (sub_nz + 1) * sizeof (int)) ;
+    e->SubAxMap = (int *) malloc ((size_t) (sub_nz + 1) * sizeof (int)) ;
+    e->SubDiag  = (int *) malloc ((size_t) nF * sizeof (int)) ;
+    e->SubAx    = (double *) malloc ((size_t) (sub_nz + 1) * sizeof (double)) ;
+    e->SubRhs   = (double *) malloc ((size_t) nF * sizeof (double)) ;
+    e->SubBaseAx = (double *) malloc ((size_t) (sub_nz + 1) * sizeof (double)) ;
+    e->BndBaseAx = (double *) malloc ((size_t) (bnd_nz + 1) * sizeof (double)) ;
+    e->BndRow   = (int *) malloc ((size_t) (bnd_nz + 1) * sizeof (int)) ;
+    e->BndColRhs= (int *) malloc ((size_t) (bnd_nz + 1) * sizeof (int)) ;
+    e->BndAxMap = (int *) malloc ((size_t) (bnd_nz + 1) * sizeof (int)) ;
+
+    int rail_total = 0 ;
+    e->rail_f_ptr [0] = 0 ;
+    for (int r = 0 ; r < nr ; r++) {
+        rail_total += rail_cnt [r] ;
+        e->rail_f_ptr [r + 1] = rail_total ;
+    }
+    e->RailFAxMap  = (int *) malloc ((size_t) (rail_total + 1) * sizeof (int)) ;
+    e->RailFColRhs = (int *) malloc ((size_t) (rail_total + 1) * sizeof (int)) ;
+    e->RailBaseAx  = (double *) malloc ((size_t) (rail_total + 1) * sizeof (double)) ;
+
+    if (!e->SubToRhs || !e->InSub || !e->SubAp || !e->SubAi || !e->SubAxMap || !e->SubDiag ||
+        !e->SubAx || !e->SubRhs || !e->SubBaseAx || !e->BndBaseAx || !e->RailBaseAx ||
+        !e->BndRow || !e->BndColRhs || !e->BndAxMap ||
+        !e->RailFAxMap || !e->RailFColRhs)
+    {
+        e->valid = 1 ;
+        klu_sub_free_entry (e) ;
+        return 0 ;
+    }
+
+    memcpy (e->SubToRhs, tmp_fast, (size_t) nF * sizeof (int)) ;
+    for (int sf = 0 ; sf < nF ; sf++) {
+        int rn = tmp_fast [sf] ;
+        if (rn > 0 && rn < n_rhs)
+            e->InSub [rn] = 1 ;
+    }
+    memset (sc->tmp_wake_mark, 0, (size_t) nF) ;
+    int use_wake_scale = (n >= 10000 && km->KLUmatrixAx != NULL) ;
+    if (use_wake_scale)
+        memset (sc->tmp_wake_scale, 0, (size_t) nF * sizeof (double)) ;
+    for (int sf = 0 ; sf < nF ; sf++)
+        e->SubDiag [sf] = -1 ;
+
+    int rail_pos [KLU_SUB_MAX_RAILS] ;
+    for (int r = 0 ; r < nr ; r++)
+        rail_pos [r] = e->rail_f_ptr [r] ;
+
+    const double * restrict Ax_full = km->KLUmatrixAx ;
+    double ** restrict Diag_full = km->KLUmatrixDiag ;
+    int sp = 0, bp = 0 ;
+    for (int j = 0 ; j < n ; j++) {
+        int p0 = Ap [j], p1 = Ap [j + 1] ;
+        int sc_col = sub_idx [j] ;
+        int col_rhs = (int) map [j + 1] ;
+        int col_is_rail_br = (is_rail && col_rhs > 0 && col_rhs < n_rhs && is_rail [col_rhs]) ? 1 : 0 ;
+        if (col_is_rail_br) {
+            for (int r = 0 ; r < nr ; r++) {
+                if (col_rhs == rail_nodes [r]) { col_is_rail_br = 0 ; break ; }
+            }
+        }
+        if (sc_col >= 0) {
+            e->SubAp [sc_col] = sp ;
+            for (int p = p0 ; p < p1 ; p++) {
+                int row = Ai [p] ;
+                int sr = sub_idx [row] ;
+                if (sr >= 0) {
+                    e->SubAi [sp] = sr ;
+                    e->SubAxMap [sp] = p ;
+                    if (sr == sc_col)
+                        e->SubDiag [sc_col] = sp ;
+                    sp++ ;
+                } else if (use_wake_scale) {
+                    int row_rhs = (int) map [row + 1] ;
+                    if (row_rhs > 0 && row_rhs < n_rhs && (!is_rail || !is_rail [row_rhs])) {
+                        double aij = fabs (Ax_full [p]) ;
+                        if (aij > 0.0) {
+                            double aii = (Diag_full && Diag_full [row]) ? fabs (*Diag_full [row]) : 0.0 ;
+                            double ratio = (aii > 0.0) ? (aij / aii) : 1.0 ;
+                            if (ratio > 1.0) ratio = 1.0 ;
+                            if (ratio > sc->tmp_wake_scale [sc_col]) {
+                                sc->tmp_wake_scale [sc_col] = ratio ;
+                                sc->tmp_wake_mark [sc_col] = 1 ;
+                            }
+                        }
+                    }
+                }
+                if (!col_is_rail_br) {
+                    for (int r = 0 ; r < nr ; r++) {
+                        if (row == rail_klu_row [r]) {
+                            int rp = rail_pos [r]++ ;
+                            e->RailFAxMap [rp] = p ;
+                            e->RailFColRhs [rp] = col_rhs ;
+                            break ;
+                        }
+                    }
+                }
+            }
+        } else {
+            int col_is_rail = (is_rail && col_rhs > 0 && col_rhs < n_rhs && is_rail [col_rhs]) ? 1 : 0 ;
+            for (int p = p0 ; p < p1 ; p++) {
+                int row = Ai [p] ;
+                int sr = sub_idx [row] ;
+                if (sr >= 0) {
+                    e->BndRow [bp] = sr ;
+                    e->BndColRhs [bp] = col_rhs ;
+                    e->BndAxMap [bp] = p ;
+                    bp++ ;
+                    if (!use_wake_scale && !col_is_rail)
+                        sc->tmp_wake_mark [sr] = 1 ;
+                }
+                if (!col_is_rail_br) {
+                    for (int r = 0 ; r < nr ; r++) {
+                        if (row == rail_klu_row [r]) {
+                            int rp = rail_pos [r]++ ;
+                            e->RailFAxMap [rp] = p ;
+                            e->RailFColRhs [rp] = col_rhs ;
+                            break ;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    e->SubAp [nF] = sp ;
+
+    int n_wake = 0 ;
+    for (int sf = 0 ; sf < nF ; sf++)
+        if (sc->tmp_wake_mark [sf]) n_wake++ ;
+    e->n_wake = n_wake ;
+    e->WakeRhs = (int *) malloc ((size_t) (n_wake + 1) * sizeof (int)) ;
+    e->WakeScale = use_wake_scale ? (double *) malloc ((size_t) (n_wake + 1) * sizeof (double)) : NULL ;
+    if (!e->WakeRhs || (use_wake_scale && !e->WakeScale)) {
+        e->valid = 1 ;
+        klu_sub_free_entry (e) ;
+        return 0 ;
+    }
+    int wi = 0 ;
+    for (int sf = 0 ; sf < nF ; sf++) {
+        if (sc->tmp_wake_mark [sf]) {
+            e->WakeRhs [wi] = e->SubToRhs [sf] ;
+            if (use_wake_scale)
+                e->WakeScale [wi] = sc->tmp_wake_scale [sf] ;
+            wi++ ;
+        }
+    }
+
+    klu_defaults (&e->Common) ;
+    e->Common.memgrow = km->KLUmatrixCommon->memgrow ;
+    e->Symbolic = klu_analyze (nF, e->SubAp, e->SubAi, &e->Common) ;
+    if (!e->Symbolic) {
+        e->valid = 1 ;
+        klu_sub_free_entry (e) ;
+        return 0 ;
+    }
+
+    e->hash = h ;
+    e->last_tick = sc->tick ;
+    e->numeric_valid = 0 ;
+    e->valid = 1 ;
+    sc->active = e ;
+
+    if (n_fast_out) *n_fast_out = e->nF ;
+    if (fast_rhs_out) *fast_rhs_out = e->SubToRhs ;
+    if (same_as_prev_out) *same_as_prev_out = 0 ;
+    return 1 ;
+}
+
+void
+SMPkluSubInitLoad (SMPmatrix *Matrix, double * restrict ax_main, double * restrict rhs_main,
+                   const double * restrict res_base, const double * restrict cap_unit,
+                   const double * restrict cap_rhs, const double * restrict lat_dc,
+                   const double * restrict lat_cap, const double * restrict lat_rhs_dc,
+                   const double * restrict lat_rhs_cap, double ag0)
+{
+    KLUmatrix *km = Matrix->SMPkluMatrix ;
+    KLUsubCache *sc = km ? km->KLUmatrixSubCache : NULL ;
+    KLUsubEntry *e = sc ? sc->active : NULL ;
+    if (!e) return ;
+
+    const int * restrict smap = e->SubAxMap ;
+    const int * restrict bmap = e->BndAxMap ;
+    const int * restrict frhs = e->SubToRhs ;
+    int snz = e->sub_nz ;
+    int bnz = e->bnd_nz ;
+    int nF  = e->nF ;
+    int rtot = (e->n_rails > 0) ? e->rail_f_ptr [e->n_rails] : 0 ;
+    int has_lat = (lat_dc != NULL && lat_cap != NULL) ? 1 : 0 ;
+    int flags = (res_base != NULL ? 1 : 0) | (cap_unit != NULL ? 2 : 0) | (has_lat ? 4 : 0) ;
+
+    /* Cache linear+latent base values per (ag0, latent_ops, flags) so Newton iters 2..K
+     * scatter from ONE contiguous L1/L2 buffer instead of 4 scattered full-matrix arrays! */
+    double * restrict sbase = e->SubBaseAx ;
+    double * restrict bbase = e->BndBaseAx ;
+    double * restrict rbase = e->RailBaseAx ;
+    if (!e->base_valid || e->base_ag0 != ag0 ||
+        e->base_lat_ops != km->KLUmatrixLatentOps ||
+        e->base_lat_cnt != km->KLUmatrixLatentCount ||
+        e->base_flags != flags)
+    {
+        if (has_lat) {
+            if (res_base && cap_unit) {
+                for (int k = 0 ; k < snz ; k++) {
+                    int p = smap [k] ;
+                    sbase [k] = (res_base [p] + lat_dc [p]) + ag0 * (cap_unit [p] + lat_cap [p]) ;
+                }
+                for (int k = 0 ; k < bnz ; k++) {
+                    int p = bmap [k] ;
+                    bbase [k] = (res_base [p] + lat_dc [p]) + ag0 * (cap_unit [p] + lat_cap [p]) ;
+                }
+                for (int k = 0 ; k < rtot ; k++) {
+                    int p = e->RailFAxMap [k] ;
+                    rbase [k] = (res_base [p] + lat_dc [p]) + ag0 * (cap_unit [p] + lat_cap [p]) ;
+                }
+            } else if (res_base) {
+                for (int k = 0 ; k < snz ; k++) {
+                    int p = smap [k] ;
+                    sbase [k] = (res_base [p] + lat_dc [p]) + ag0 * lat_cap [p] ;
+                }
+                for (int k = 0 ; k < bnz ; k++) {
+                    int p = bmap [k] ;
+                    bbase [k] = (res_base [p] + lat_dc [p]) + ag0 * lat_cap [p] ;
+                }
+                for (int k = 0 ; k < rtot ; k++) {
+                    int p = e->RailFAxMap [k] ;
+                    rbase [k] = (res_base [p] + lat_dc [p]) + ag0 * lat_cap [p] ;
+                }
+            } else if (cap_unit) {
+                for (int k = 0 ; k < snz ; k++) {
+                    int p = smap [k] ;
+                    sbase [k] = lat_dc [p] + ag0 * (cap_unit [p] + lat_cap [p]) ;
+                }
+                for (int k = 0 ; k < bnz ; k++) {
+                    int p = bmap [k] ;
+                    bbase [k] = lat_dc [p] + ag0 * (cap_unit [p] + lat_cap [p]) ;
+                }
+                for (int k = 0 ; k < rtot ; k++) {
+                    int p = e->RailFAxMap [k] ;
+                    rbase [k] = lat_dc [p] + ag0 * (cap_unit [p] + lat_cap [p]) ;
+                }
+            } else {
+                for (int k = 0 ; k < snz ; k++) {
+                    int p = smap [k] ;
+                    sbase [k] = lat_dc [p] + ag0 * lat_cap [p] ;
+                }
+                for (int k = 0 ; k < bnz ; k++) {
+                    int p = bmap [k] ;
+                    bbase [k] = lat_dc [p] + ag0 * lat_cap [p] ;
+                }
+                for (int k = 0 ; k < rtot ; k++) {
+                    int p = e->RailFAxMap [k] ;
+                    rbase [k] = lat_dc [p] + ag0 * lat_cap [p] ;
+                }
+            }
+        } else if (res_base && cap_unit) {
+            for (int k = 0 ; k < snz ; k++) { int p = smap [k] ; sbase [k] = res_base [p] + ag0 * cap_unit [p] ; }
+            for (int k = 0 ; k < bnz ; k++) { int p = bmap [k] ; bbase [k] = res_base [p] + ag0 * cap_unit [p] ; }
+            for (int k = 0 ; k < rtot ; k++) { int p = e->RailFAxMap [k] ; rbase [k] = res_base [p] + ag0 * cap_unit [p] ; }
+        } else if (res_base) {
+            for (int k = 0 ; k < snz ; k++) sbase [k] = res_base [smap [k]] ;
+            for (int k = 0 ; k < bnz ; k++) bbase [k] = res_base [bmap [k]] ;
+            for (int k = 0 ; k < rtot ; k++) rbase [k] = res_base [e->RailFAxMap [k]] ;
+        } else if (cap_unit) {
+            for (int k = 0 ; k < snz ; k++) sbase [k] = ag0 * cap_unit [smap [k]] ;
+            for (int k = 0 ; k < bnz ; k++) bbase [k] = ag0 * cap_unit [bmap [k]] ;
+            for (int k = 0 ; k < rtot ; k++) rbase [k] = ag0 * cap_unit [e->RailFAxMap [k]] ;
+        } else {
+            memset (sbase, 0, (size_t) snz * sizeof (double)) ;
+            memset (bbase, 0, (size_t) bnz * sizeof (double)) ;
+            memset (rbase, 0, (size_t) rtot * sizeof (double)) ;
+        }
+        e->base_ag0 = ag0 ;
+        e->base_lat_ops = km->KLUmatrixLatentOps ;
+        e->base_lat_cnt = km->KLUmatrixLatentCount ;
+        e->base_flags = flags ;
+        e->base_valid = 1 ;
+    }
+
+    for (int k = 0 ; k < snz ; k++)
+        ax_main [smap [k]] = sbase [k] ;
+    for (int k = 0 ; k < bnz ; k++)
+        ax_main [bmap [k]] = bbase [k] ;
+    for (int k = 0 ; k < rtot ; k++)
+        ax_main [e->RailFAxMap [k]] = rbase [k] ;
+    ax_main [km->KLUmatrixNZ] = 0.0 ;
+
+    /* Initialize ONLY fast RHS entries */
+    if (lat_rhs_dc && lat_rhs_cap) {
+        if (cap_rhs) {
+            for (int sf = 0 ; sf < nF ; sf++) {
+                int f = frhs [sf] ;
+                rhs_main [f] = cap_rhs [f] + lat_rhs_dc [f] + ag0 * lat_rhs_cap [f] ;
+            }
+        } else {
+            for (int sf = 0 ; sf < nF ; sf++) {
+                int f = frhs [sf] ;
+                rhs_main [f] = lat_rhs_dc [f] + ag0 * lat_rhs_cap [f] ;
+            }
+        }
+    } else if (cap_rhs) {
+        for (int sf = 0 ; sf < nF ; sf++) {
+            int f = frhs [sf] ;
+            rhs_main [f] = cap_rhs [f] ;
+        }
+    } else {
+        for (int sf = 0 ; sf < nF ; sf++)
+            rhs_main [frhs [sf]] = 0.0 ;
+    }
+
+    for (int r = 0 ; r < e->n_rails ; r++) {
+        int u = e->rail_node [r] ;
+        double rval = (cap_rhs ? cap_rhs [u] : 0.0) ;
+        if (lat_rhs_dc && lat_rhs_cap)
+            rval += lat_rhs_dc [u] + ag0 * lat_rhs_cap [u] ;
+        rhs_main [u] = rval ;
+    }
+}
+
+int
+SMPkluSubSolve (SMPmatrix *Matrix, double RHS[], const double Xold[],
+                int rhs_len, double Gmin, double ag0, int iterno,
+                double prev_dx_norm, int chord_disabled,
+                double (*sec_fn)(void),
+                int *used_chord_out, double *dx_norm_out,
+                double *decomp_time_out, double *solve_time_out,
+                int *lu_valid_io, double *lu_ag0_io, double *lu_gmin_io,
+                int *chord_cnt_io)
+{
+    KLUmatrix *km = Matrix->SMPkluMatrix ;
+    KLUsubCache *sc = km ? km->KLUmatrixSubCache : NULL ;
+    KLUsubEntry *e = sc ? sc->active : NULL ;
+    if (!e || !e->Symbolic)
+        return E_SINGULAR ;
+
+    int nF  = e->nF ;
+    int snz = e->sub_nz ;
+    int bnz = e->bnd_nz ;
+    const double * restrict ax_main = km->KLUmatrixAx ;
+    const int * restrict smap = e->SubAxMap ;
+    const int * restrict frhs = e->SubToRhs ;
+    double * restrict sax  = e->SubAx ;
+    double * restrict srhs = e->SubRhs ;
+
+    if (used_chord_out) *used_chord_out = 0 ;
+    if (decomp_time_out) *decomp_time_out = 0.0 ;
+    if (solve_time_out) *solve_time_out = 0.0 ;
+
+    /* Save rail RHS before overwriting RHS with solution */
+    for (int r = 0 ; r < e->n_rails ; r++)
+        e->rail_saved_rhs [r] = RHS [e->rail_node [r]] ;
+
+    /* 1. Gather A_FF into SubAx (+ Gmin on diagonal if active) */
+    for (int k = 0 ; k < snz ; k++)
+        sax [k] = ax_main [smap [k]] ;
+    if (Gmin != 0.0) {
+        const int * restrict sdiag = e->SubDiag ;
+        for (int sf = 0 ; sf < nF ; sf++) {
+            int d = sdiag [sf] ;
+            if (d >= 0) sax [d] += Gmin ;
+        }
+    }
+
+    /* 2. Build effective RHS: b_eff = b_F - A_FS * x_S */
+    for (int sf = 0 ; sf < nF ; sf++)
+        srhs [sf] = RHS [frhs [sf]] ;
+    {
+        const int * restrict brow = e->BndRow ;
+        const int * restrict bcol = e->BndColRhs ;
+        const int * restrict bmap = e->BndAxMap ;
+        for (int k = 0 ; k < bnz ; k++)
+            srhs [brow [k]] -= ax_main [bmap [k]] * Xold [bcol [k]] ;
+    }
+
+    /* 3. Optional Submatrix Shamanskii Chord Newton */
+    {
+        int vlsi_sub = (km->KLUmatrixN >= 10000) ;
+        int max_c = vlsi_sub ? 16 : 8 ;
+        double lu_ag0 = lu_ag0_io ? *lu_ag0_io : 0.0 ;
+        int ag0_ok = vlsi_sub
+            ? (lu_ag0 > 0.0 && ag0 >= 0.75 * lu_ag0 && ag0 <= 1.33 * lu_ag0)
+            : (lu_ag0 == ag0) ;
+        int iter_ok = vlsi_sub
+            ? (iterno == 1 || prev_dx_norm <= 0.50)
+            : (iterno >= 2 && prev_dx_norm <= 0.05) ;
+        if (!chord_disabled && iter_ok && e->numeric_valid && e->Numeric &&
+            lu_valid_io && *lu_valid_io && ag0_ok &&
+            lu_gmin_io && *lu_gmin_io == Gmin &&
+            chord_cnt_io && *chord_cnt_io < max_c)
+        {
+            double t0 = sec_fn ? sec_fn () : 0.0 ;
+            /* Residual r = b_eff - A_FF * x_F_old */
+            const int * restrict sap = e->SubAp ;
+            const int * restrict sai = e->SubAi ;
+            for (int j = 0 ; j < nF ; j++) {
+                double xj = Xold [frhs [j]] ;
+                if (xj == 0.0) continue ;
+                int p0 = sap [j], p1 = sap [j + 1] ;
+                for (int p = p0 ; p < p1 ; p++)
+                    srhs [sai [p]] -= sax [p] * xj ;
+            }
+            int ret = klu_solve (e->Symbolic, e->Numeric, nF, 1, srhs, &e->Common) ;
+            if (ret != 0) {
+                double max_dx = 0.0 ;
+                int ok = 1 ;
+                for (int j = 0 ; j < nF ; j++) {
+                    double a = fabs (srhs [j]) ;
+                    if (!(a < 1.0e100)) { ok = 0 ; break ; }
+                    if (a > max_dx) max_dx = a ;
+                }
+                int accept = 0 ;
+                if (ok) {
+                    if (vlsi_sub) {
+                        accept = (iterno == 1)
+                            ? (max_dx < 0.05)
+                            : (max_dx < 0.30 && (max_dx <= 0.65 * prev_dx_norm || max_dx <= 1.0e-4)) ;
+                    } else {
+                        accept = (max_dx < 0.04 && (max_dx <= 0.35 * prev_dx_norm || max_dx <= 5.0e-5)) ;
+                    }
+                }
+                if (accept) {
+                    memcpy (RHS, Xold, (size_t) rhs_len * sizeof (double)) ;
+                    for (int sf = 0 ; sf < nF ; sf++)
+                        RHS [frhs [sf]] = Xold [frhs [sf]] + srhs [sf] ;
+                    if (solve_time_out && sec_fn) *solve_time_out = sec_fn () - t0 ;
+                    if (used_chord_out) *used_chord_out = 1 ;
+                    if (dx_norm_out) *dx_norm_out = max_dx ;
+                    (*chord_cnt_io)++ ;
+                    return spOKAY ;
+                }
+            }
+            /* Chord did not contract enough: rebuild b_eff and fall through to refactor */
+            for (int sf = 0 ; sf < nF ; sf++)
+                srhs [sf] = RHS [frhs [sf]] ;
+            const int * restrict brow = e->BndRow ;
+            const int * restrict bcol = e->BndColRhs ;
+            const int * restrict bmap = e->BndAxMap ;
+            for (int k = 0 ; k < bnz ; k++)
+                srhs [brow [k]] -= ax_main [bmap [k]] * Xold [bcol [k]] ;
+        }
+    }
+
+    /* 4. Refactor or Factor the small nF x nF submatrix */
+    double t0 = sec_fn ? sec_fn () : 0.0 ;
+    int fac_ok = 0 ;
+    if (e->numeric_valid && e->Numeric) {
+        fac_ok = klu_refactor (e->SubAp, e->SubAi, sax, e->Symbolic, e->Numeric, &e->Common) ;
+        if (!fac_ok || e->Common.status == KLU_SINGULAR) {
+            klu_free_numeric (&e->Numeric, &e->Common) ;
+            e->numeric_valid = 0 ;
+            fac_ok = 0 ;
+        }
+    }
+    if (!fac_ok) {
+        e->Numeric = klu_factor (e->SubAp, e->SubAi, sax, e->Symbolic, &e->Common) ;
+        if (!e->Numeric || e->Common.status == KLU_SINGULAR || e->Common.status < KLU_OK) {
+            if (e->Numeric)
+                klu_free_numeric (&e->Numeric, &e->Common) ;
+            e->numeric_valid = 0 ;
+            if (lu_valid_io) *lu_valid_io = 0 ;
+            if (decomp_time_out && sec_fn) *decomp_time_out = sec_fn () - t0 ;
+            return E_SINGULAR ;
+        }
+        e->numeric_valid = 1 ;
+    }
+    double t1 = sec_fn ? sec_fn () : 0.0 ;
+    if (decomp_time_out) *decomp_time_out = t1 - t0 ;
+
+    if (lu_valid_io) *lu_valid_io = 1 ;
+    if (lu_ag0_io) *lu_ag0_io = ag0 ;
+    if (lu_gmin_io) *lu_gmin_io = Gmin ;
+    if (chord_cnt_io) *chord_cnt_io = 0 ;
+
+    /* 5. Backsolve nF x nF system */
+    int sret = klu_solve (e->Symbolic, e->Numeric, nF, 1, srhs, &e->Common) ;
+    if (sret == 0) {
+        if (solve_time_out && sec_fn) *solve_time_out = sec_fn () - t1 ;
+        return E_SINGULAR ;
+    }
+
+    /* 6. Scatter fast solution while keeping slow nodes bit-identical to Xold */
+    memcpy (RHS, Xold, (size_t) rhs_len * sizeof (double)) ;
+    double max_dx = 0.0 ;
+    for (int sf = 0 ; sf < nF ; sf++) {
+        int idx = frhs [sf] ;
+        double v = srhs [sf] ;
+        if (!(fabs (v) < 1.0e100)) {
+            if (solve_time_out && sec_fn) *solve_time_out = sec_fn () - t1 ;
+            return E_SINGULAR ;
+        }
+        double d = fabs (v - Xold [idx]) ;
+        if (d > max_dx) max_dx = d ;
+        RHS [idx] = v ;
+    }
+    if (solve_time_out && sec_fn) *solve_time_out = sec_fn () - t1 ;
+    if (dx_norm_out) *dx_norm_out = max_dx ;
+    return spOKAY ;
+}
+
+int
+SMPkluSubCheckWake (SMPmatrix *Matrix, const double * restrict rhs_now,
+                    const double * restrict v_macro, double v_wake)
+{
+    KLUmatrix *km = Matrix ? Matrix->SMPkluMatrix : NULL ;
+    KLUsubCache *sc = km ? km->KLUmatrixSubCache : NULL ;
+    KLUsubEntry *e = sc ? sc->active : NULL ;
+    if (!e) return 1 ;
+
+    const int * restrict wr = e->WakeRhs ;
+    const double * restrict ws = e->WakeScale ;
+    int nw = e->n_wake ;
+    if (ws) {
+        for (int i = 0 ; i < nw ; i++) {
+            int u = wr [i] ;
+            if (ws [i] * fabs (rhs_now [u] - v_macro [u]) > v_wake)
+                return 1 ;
+        }
+    } else {
+        for (int i = 0 ; i < nw ; i++) {
+            int u = wr [i] ;
+            if (fabs (rhs_now [u] - v_macro [u]) > v_wake)
+                return 1 ;
+        }
+    }
+    return 0 ;
+}
+
+void
+SMPkluSubRailUpdate (SMPmatrix *Matrix, const double * restrict ax_main,
+                     const double * restrict rhs_main, double * restrict x_sol,
+                     const int *rail_nodes, const int *rail_br,
+                     const double *rail_sgn, int n_rails)
+{
+    (void) rhs_main ;
+    KLUmatrix *km = Matrix ? Matrix->SMPkluMatrix : NULL ;
+    KLUsubCache *sc = km ? km->KLUmatrixSubCache : NULL ;
+    KLUsubEntry *e = sc ? sc->active : NULL ;
+    if (!e || e->n_rails <= 0 || n_rails <= 0)
+        return ;
+
+    int nr = (e->n_rails < n_rails) ? e->n_rails : n_rails ;
+    for (int r = 0 ; r < nr ; r++) {
+        int u = e->rail_node [r] ;
+        if (u != rail_nodes [r] || rail_br [r] <= 0)
+            continue ;
+        double sum = e->rail_saved_rhs [r] ;
+        int p0 = e->rail_f_ptr [r], p1 = e->rail_f_ptr [r + 1] ;
+        for (int k = p0 ; k < p1 ; k++)
+            sum -= ax_main [e->RailFAxMap [k]] * x_sol [e->RailFColRhs [k]] ;
+        x_sol [rail_br [r]] = rail_sgn [r] * sum ;
+    }
+}
 #endif
 
 #ifdef CIDER
@@ -1324,6 +2382,15 @@ SMPnewMatrix (SMPmatrix *Matrix, int size)
         Matrix->SMPkluMatrix->KLUmatrixRhsCapLen = 0 ;
         Matrix->SMPkluMatrix->KLUmatrixRhsCapValid = 0 ;
         Matrix->SMPkluMatrix->KLUmatrixIdentityMap = -1 ;
+        Matrix->SMPkluMatrix->KLUmatrixAxLatentDC = NULL ;
+        Matrix->SMPkluMatrix->KLUmatrixAxLatentCap = NULL ;
+        Matrix->SMPkluMatrix->KLUmatrixRhsLatentDC = NULL ;
+        Matrix->SMPkluMatrix->KLUmatrixRhsLatentCap = NULL ;
+        Matrix->SMPkluMatrix->KLUmatrixRhsLatentLen = 0 ;
+        Matrix->SMPkluMatrix->KLUmatrixLatentCount = 0 ;
+        Matrix->SMPkluMatrix->KLUmatrixLatentOps = 0 ;
+        Matrix->SMPkluMatrix->KLUmatrixResCapHasLatent = 0 ;
+        Matrix->SMPkluMatrix->KLUmatrixSubCache = NULL ;
 
         /* Initialize the KLU Common Data Structure */
         klu_defaults (Matrix->SMPkluMatrix->KLUmatrixCommon) ;
@@ -1388,6 +2455,15 @@ SMPnewMatrixKLUforCIDER (SMPmatrix *Matrix, int size, unsigned int KLUmatrixIsCo
         Matrix->SMPkluMatrix->KLUmatrixRhsCapLen = 0 ;
         Matrix->SMPkluMatrix->KLUmatrixRhsCapValid = 0 ;
         Matrix->SMPkluMatrix->KLUmatrixIdentityMap = -1 ;
+        Matrix->SMPkluMatrix->KLUmatrixAxLatentDC = NULL ;
+        Matrix->SMPkluMatrix->KLUmatrixAxLatentCap = NULL ;
+        Matrix->SMPkluMatrix->KLUmatrixRhsLatentDC = NULL ;
+        Matrix->SMPkluMatrix->KLUmatrixRhsLatentCap = NULL ;
+        Matrix->SMPkluMatrix->KLUmatrixRhsLatentLen = 0 ;
+        Matrix->SMPkluMatrix->KLUmatrixLatentCount = 0 ;
+        Matrix->SMPkluMatrix->KLUmatrixLatentOps = 0 ;
+        Matrix->SMPkluMatrix->KLUmatrixResCapHasLatent = 0 ;
+        Matrix->SMPkluMatrix->KLUmatrixSubCache = NULL ;
 
         /* Initialize the KLU Common Data Structure */
         klu_defaults (Matrix->SMPkluMatrix->KLUmatrixCommon) ;
@@ -1451,6 +2527,13 @@ SMPdestroy (SMPmatrix *Matrix)
         free (Matrix->SMPkluMatrix->KLUmatrixAxCapUnit) ;
         free (Matrix->SMPkluMatrix->KLUmatrixAxResCapBase) ;
         free (Matrix->SMPkluMatrix->KLUmatrixRhsCapCache) ;
+        free (Matrix->SMPkluMatrix->KLUmatrixAxLatentDC) ;
+        free (Matrix->SMPkluMatrix->KLUmatrixAxLatentCap) ;
+        free (Matrix->SMPkluMatrix->KLUmatrixRhsLatentDC) ;
+        free (Matrix->SMPkluMatrix->KLUmatrixRhsLatentCap) ;
+#if NGSPICE_OPT_GENERAL
+        SMPkluSubDestroy (Matrix->SMPkluMatrix) ;
+#endif
         free (Matrix->SMPkluMatrix->KLUmatrixCommon) ;
         free (Matrix->SMPkluMatrix) ;
     } else {
@@ -1491,6 +2574,13 @@ SMPdestroyKLUforCIDER (SMPmatrix *Matrix)
         free (Matrix->SMPkluMatrix->KLUmatrixAxCapUnit) ;
         free (Matrix->SMPkluMatrix->KLUmatrixAxResCapBase) ;
         free (Matrix->SMPkluMatrix->KLUmatrixRhsCapCache) ;
+        free (Matrix->SMPkluMatrix->KLUmatrixAxLatentDC) ;
+        free (Matrix->SMPkluMatrix->KLUmatrixAxLatentCap) ;
+        free (Matrix->SMPkluMatrix->KLUmatrixRhsLatentDC) ;
+        free (Matrix->SMPkluMatrix->KLUmatrixRhsLatentCap) ;
+#if NGSPICE_OPT_GENERAL
+        SMPkluSubDestroy (Matrix->SMPkluMatrix) ;
+#endif
         free (Matrix->SMPkluMatrix->KLUmatrixCommon) ;
         free (Matrix->SMPkluMatrix) ;
     } else {

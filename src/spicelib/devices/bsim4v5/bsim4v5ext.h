@@ -38,5 +38,6 @@ extern int BSIM4v5loadKluPar (GENmodel*, CKTcircuit*, double*, double*) ;
 #if NGSPICE_OPT_ZEN4
 extern int BSIM4v5convTestAvx(GENmodel*, CKTcircuit*);
 extern int BSIM4v5truncAvx(GENmodel*, CKTcircuit*, double*);
+extern void BSIM4v5freeAvxLatent(void*);
 extern int BSIM4v5AvxNeedAosSync;
 #endif

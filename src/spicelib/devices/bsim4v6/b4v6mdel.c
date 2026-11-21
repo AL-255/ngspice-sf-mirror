@@ -32,6 +32,8 @@ BSIM4v6mDelete(GENmodel *gen_model)
     model->BSIM4v6AvxBlocks = NULL;
     free(model->BSIM4v6AvxDyn);
     model->BSIM4v6AvxDyn = NULL;
+    BSIM4v6freeAvxLatent(model->BSIM4v6AvxLatent);
+    model->BSIM4v6AvxLatent = NULL;
     model->BSIM4v6AvxDynValid = 0;
     FREE(model->BSIM4v6AvxFallbackIdx);
     model->BSIM4v6AvxBuilt = 0;

@@ -41,7 +41,11 @@ SPICEdev CAPinfo = {
     .DEVtrunc = CAPtrunc,
     .DEVfindBranch = NULL,
     .DEVacLoad = CAPacLoad,
+#if NGSPICE_OPT_GENERAL
+    .DEVaccept = CAPaccept,
+#else
     .DEVaccept = NULL,
+#endif
     .DEVdestroy = NULL,
     .DEVmodDelete = CAPmDelete,
     .DEVdelete = NULL,

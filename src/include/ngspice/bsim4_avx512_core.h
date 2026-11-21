@@ -604,14 +604,18 @@ typedef struct __attribute__((aligned(64))) {
 
     /* Cache validity metadata */
     double last_time;
-    double last_ag0, last_ag1, last_ag2;
+    double last_ag0, last_ag1, last_ag2, last_ag3;
     double last_gmin;
     const double *last_s0;
     const double *last_s1;
     const double *last_s2;
+    const double *last_s3;
     int last_int_mode;
+    int last_active_step;
     uint8_t phys_valid;
     uint8_t stamp_valid;
+    uint8_t latent_frozen;
+    uint8_t latent_streak;
 
     /* Cached timestep charge-integration history (invariant across Newton iters of same step) */
     v8d hist_b, hist_g, hist_d;
@@ -659,6 +663,37 @@ typedef struct __attribute__((aligned(64))) {
     double   p[B4_PARAM_PADDED];
     uint64_t mask_bits;
 } BSIM4Avx512Inst;
+
+/* Dynamic latent-partition state for BSIM4 AVX-512 companion freezing (NGSPICE_MR_LATENT) */
+typedef struct {
+    int     nBlocks;
+    int     nNodes;
+    int     nActive;
+    int     nFrozen;
+    int     lastAccepted;
+    double  lastGmin;
+    int    *activeList;
+    int    *activePos;
+    int    *nodeBlkPtr;
+    int    *nodeBlkIdx;
+    double *vSnap;
+    int    *nodeFrozenCnt;
+    unsigned long long statCalls;
+    unsigned long long statFrozenSum;
+    unsigned long long statFreezes;
+    unsigned long long statWakes;
+    unsigned long long statResets;
+    unsigned long long statFailIcap;
+    unsigned long long statFailCache;
+    unsigned long long statFailSnap;
+    unsigned long long statFailValid;
+    /* Compound-fast active-submatrix block filtering (NGSPICE_MR_COMPFAST) */
+    unsigned int       cfEpoch;
+    int                cfNFast;
+    int                cfNeedsSync;
+    int               *cfFastList;
+    unsigned char     *cfIsFastBlk;
+} BSIM4AvxLatentState;
 
 _Static_assert(offsetof(BSIM4Avx512Block, m_ngate_valid) % sizeof(v8d) == 0,
                "BSIM4Avx512Block v8d params must be contiguous");
@@ -802,11 +837,12 @@ bsim4_avx512_integrate_and_assemble_mask(
     BSIM4Avx512Dyn * restrict dyn,
     v8d vds, v8d vgs, v8d vbs,
     int has_dv,
-    double ag0, double ag1, double ag2,
-    int is_gear2, int is_trap2,
+    double ag0, double ag1, double ag2, double ag3,
+    int is_gear3, int is_gear2, int is_trap2,
     double * restrict s0,
     const double * restrict s1,
     const double * restrict s2,
+    const double * restrict s3,
     __mmask8 write_mask)
 {
     double a_cqb[8] = {0}, a_cqg[8] = {0}, a_cqd[8] = {0};
@@ -846,7 +882,11 @@ bsim4_avx512_integrate_and_assemble_mask(
             s0[st + 15] = qd;
 
             double hb, hg, hd;
-            if (is_gear2) {
+            if (is_gear3) {
+                hb = ag3 * s3[st + 11] + ag2 * s2[st + 11] + ag1 * s1[st + 11];
+                hg = ag3 * s3[st + 13] + ag2 * s2[st + 13] + ag1 * s1[st + 13];
+                hd = ag3 * s3[st + 15] + ag2 * s2[st + 15] + ag1 * s1[st + 15];
+            } else if (is_gear2) {
                 hb = ag2 * s2[st + 11] + ag1 * s1[st + 11];
                 hg = ag2 * s2[st + 13] + ag1 * s1[st + 13];
                 hd = ag2 * s2[st + 15] + ag1 * s1[st + 15];
@@ -882,7 +922,11 @@ bsim4_avx512_integrate_and_assemble_mask(
             s0[st + 15] = qd;
 
             double hb, hg, hd;
-            if (is_gear2) {
+            if (is_gear3) {
+                hb = ag3 * s3[st + 11] + ag2 * s2[st + 11] + ag1 * s1[st + 11];
+                hg = ag3 * s3[st + 13] + ag2 * s2[st + 13] + ag1 * s1[st + 13];
+                hd = ag3 * s3[st + 15] + ag2 * s2[st + 15] + ag1 * s1[st + 15];
+            } else if (is_gear2) {
                 hb = ag2 * s2[st + 11] + ag1 * s1[st + 11];
                 hg = ag2 * s2[st + 13] + ag1 * s1[st + 13];
                 hd = ag2 * s2[st + 15] + ag1 * s1[st + 15];
@@ -960,15 +1004,17 @@ bsim4_avx512_integrate_and_assemble(
     BSIM4Avx512Dyn * restrict dyn,
     v8d vds, v8d vgs, v8d vbs,
     int has_dv,
-    double ag0, double ag1, double ag2,
-    int is_gear2, int is_trap2,
+    double ag0, double ag1, double ag2, double ag3,
+    int is_gear3, int is_gear2, int is_trap2,
     double * restrict s0,
     const double * restrict s1,
-    const double * restrict s2)
+    const double * restrict s2,
+    const double * restrict s3)
 {
     bsim4_avx512_integrate_and_assemble_mask(b, dyn, vds, vgs, vbs, has_dv,
-                                             ag0, ag1, ag2, is_gear2, is_trap2,
-                                             s0, s1, s2,
+                                             ag0, ag1, ag2, ag3,
+                                             is_gear3, is_gear2, is_trap2,
+                                             s0, s1, s2, s3,
                                              (__mmask8)((1u << dyn->n_active) - 1u));
 }
 
@@ -983,11 +1029,12 @@ bsim4_avx512_eval_block(
     BSIM4Avx512Dyn * restrict dyn,
     v8d vds, v8d vgs, v8d vbs,
     double ckt_gmin,
-    double ag0, double ag1, double ag2,
-    int is_gear2, int is_trap2,
+    double ag0, double ag1, double ag2, double ag3,
+    int is_gear3, int is_gear2, int is_trap2,
     double * restrict s0,
     const double * restrict s1,
     const double * restrict s2,
+    const double * restrict s3,
     BSIM4Avx512Out * restrict out,
     int need_aos,
     int dc_only)
@@ -2631,7 +2678,8 @@ bsim4_avx512_eval_block(
         /* 13. Integrate Charges & Assemble Matrix/RHS Stamps in dyn->st_*       */
         /* ===================================================================== */
         bsim4_avx512_integrate_and_assemble(b, dyn, vds, vgs, vbs, 0,
-                                            ag0, ag1, ag2, is_gear2, is_trap2, s0, s1, s2);
+                                            ag0, ag1, ag2, ag3,
+                                            is_gear3, is_gear2, is_trap2, s0, s1, s2, s3);
     } else {
         v8_store(dyn->st_rhsd, dyn->mdc_rhsd);
         v8_store(dyn->st_rhsg, z0);

@@ -153,15 +153,42 @@ typedef struct sCAPmodel {      /* model structure for a capacitor */
     CAPhotEntry  *CAPhotArr;
     double       *CAPceqCache;
     double        CAPcacheTime;
-    double        CAPcacheAg0, CAPcacheAg1, CAPcacheAg2;
+    double        CAPcacheAg0, CAPcacheAg1, CAPcacheAg2, CAPcacheAg3;
     const double *CAPcacheS1;
     const double *CAPcacheS2;
+    const double *CAPcacheS3;
     int           CAPcacheIntMode;
     int           CAPcacheValid;
     int CAPfastCount;
     unsigned long long CAPfastVer;
     double *CAPfastKluAxBase;
     unsigned int CAPfastKluNz;
+#if NGSPICE_OPT_GENERAL
+    /* Multirate deferred nodal CAP integration & active-node CAPtrunc state */
+    int           CAPmrBuilt;
+    unsigned long long CAPmrVer;
+    int           CAPmrN;
+    int           CAPmrHasIc;
+    int           CAPmrCscNz;
+    int          *CAPmrCscCp;
+    int          *CAPmrCscCi;
+    double       *CAPmrCscCx;
+    double       *CAPmrNodeCmax;
+    int          *CAPmrNodeCapPtr;
+    int          *CAPmrNodeCapIdx;
+    unsigned int *CAPmrCapStamp;
+    unsigned int  CAPmrStampGen;
+    int           CAPmrHistValid;
+    int           CAPmrStateLazy;
+    int           CAPmrIncrAge;
+    int           CAPmrAcceptedSteps;
+    double       *CAPmrVhist[4];
+    double       *CAPmrQnode[3];
+    double       *CAPmrInodePrev;
+    double       *CAPmrDvdtPrev;
+    double       *CAPmrDvdtTmp;
+    double       *CAPmrNodeDd;
+#endif
 } CAPmodel;
 
 /* device parameters */

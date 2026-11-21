@@ -193,7 +193,9 @@ BSIM4v5kluPrep(GENmodel *inModel, CKTcircuit *ckt)
         (BSIM4v5isAvxEligibleTran(ckt) || BSIM4v5isAvxEligibleDcOp(ckt))) {
         BSIM4v5ensureAvxPack(head, ckt);
         BSIM4v5syncAvxDynFromInst(head);
+        BSIM4v5latentSync(head, ckt, km);
     } else {
+        BSIM4v5latentUnfreezeAll(head, ckt, km);
         head->BSIM4v5AvxDynValid = 0;
     }
 #endif
@@ -234,7 +236,17 @@ BSIM4v5loadKluPar(GENmodel *inModel, CKTcircuit *ckt, double *my_ax, double *my_
             }
             return error;
         }
-        BSIM4v5evalAvxRange(blocks, dyn, nBlocks, InstArray, ckt, my_ax, my_rhs, 0, is_dc_avx, force_aos);
+        const BSIM4AvxLatentState *lat = (const BSIM4AvxLatentState *)head->BSIM4v5AvxLatent;
+        const int *act_list = NULL;
+        int n_iter = nBlocks;
+        if (!is_dc_avx && ckt->CKTmrSubActive && lat && lat->cfEpoch == ckt->CKTmrSubEpoch) {
+            act_list = lat->cfFastList;
+            n_iter = lat->cfNFast;
+        } else if (!is_dc_avx && lat && lat->nFrozen > 0) {
+            act_list = lat->activeList;
+            n_iter = lat->nActive;
+        }
+        BSIM4v5evalAvxRangeList(blocks, dyn, nBlocks, act_list, n_iter, InstArray, ckt, my_ax, my_rhs, 0, is_dc_avx, force_aos);
         for (int fi = 0; fi < nFb; fi++) {
             int idx = fbIdx[fi];
             int local_error = BSIM4v5LoadOMP_core(InstArray[idx], ckt, my_ax, my_rhs, &koffArr[idx]);
@@ -595,51 +607,66 @@ for (; model != NULL; model = BSIM4v5nextModel(model))
 	       {   xfact = ckt->CKTdelta / ckt->CKTdeltaOld[1];
                    *(ckt->CKTstate0 + here->BSIM4v5vds) = 
                          *(ckt->CKTstate1 + here->BSIM4v5vds);
-                   vds = (1.0 + xfact)* (*(ckt->CKTstate1 + here->BSIM4v5vds))
-                         - (xfact * (*(ckt->CKTstate2 + here->BSIM4v5vds)));
                    *(ckt->CKTstate0 + here->BSIM4v5vgs) = 
                          *(ckt->CKTstate1 + here->BSIM4v5vgs);
-                   vgs = (1.0 + xfact)* (*(ckt->CKTstate1 + here->BSIM4v5vgs))
-                         - (xfact * (*(ckt->CKTstate2 + here->BSIM4v5vgs)));
                    *(ckt->CKTstate0 + here->BSIM4v5vges) =
                          *(ckt->CKTstate1 + here->BSIM4v5vges);
-                   vges = (1.0 + xfact)* (*(ckt->CKTstate1 + here->BSIM4v5vges))
-                         - (xfact * (*(ckt->CKTstate2 + here->BSIM4v5vges)));
                    *(ckt->CKTstate0 + here->BSIM4v5vgms) =
                          *(ckt->CKTstate1 + here->BSIM4v5vgms);
-                   vgms = (1.0 + xfact)* (*(ckt->CKTstate1 + here->BSIM4v5vgms))
-                         - (xfact * (*(ckt->CKTstate2 + here->BSIM4v5vgms)));
                    *(ckt->CKTstate0 + here->BSIM4v5vbs) = 
                          *(ckt->CKTstate1 + here->BSIM4v5vbs);
-                   vbs = (1.0 + xfact)* (*(ckt->CKTstate1 + here->BSIM4v5vbs))
-                         - (xfact * (*(ckt->CKTstate2 + here->BSIM4v5vbs)));
                    *(ckt->CKTstate0 + here->BSIM4v5vbd) = 
                          *(ckt->CKTstate0 + here->BSIM4v5vbs)
                          - *(ckt->CKTstate0 + here->BSIM4v5vds);
                    *(ckt->CKTstate0 + here->BSIM4v5vdbs) =
                          *(ckt->CKTstate1 + here->BSIM4v5vdbs);
-                   vdbs = (1.0 + xfact)* (*(ckt->CKTstate1 + here->BSIM4v5vdbs))
-                         - (xfact * (*(ckt->CKTstate2 + here->BSIM4v5vdbs)));
                    *(ckt->CKTstate0 + here->BSIM4v5vdbd) =
                          *(ckt->CKTstate0 + here->BSIM4v5vdbs)
                          - *(ckt->CKTstate0 + here->BSIM4v5vds);
                    *(ckt->CKTstate0 + here->BSIM4v5vsbs) =
                          *(ckt->CKTstate1 + here->BSIM4v5vsbs);
-                   vsbs = (1.0 + xfact)* (*(ckt->CKTstate1 + here->BSIM4v5vsbs))
-                         - (xfact * (*(ckt->CKTstate2 + here->BSIM4v5vsbs)));
                    *(ckt->CKTstate0 + here->BSIM4v5vses) =
                          *(ckt->CKTstate1 + here->BSIM4v5vses);
-                   vses = (1.0 + xfact)* (*(ckt->CKTstate1 + here->BSIM4v5vses))
-                         - (xfact * (*(ckt->CKTstate2 + here->BSIM4v5vses)));
                    *(ckt->CKTstate0 + here->BSIM4v5vdes) =
                          *(ckt->CKTstate1 + here->BSIM4v5vdes);
-                   vdes = (1.0 + xfact)* (*(ckt->CKTstate1 + here->BSIM4v5vdes))
-                         - (xfact * (*(ckt->CKTstate2 + here->BSIM4v5vdes)));
-
                    *(ckt->CKTstate0 + here->BSIM4v5qdef) =
                          *(ckt->CKTstate1 + here->BSIM4v5qdef);
-                   qdef = (1.0 + xfact)* (*(ckt->CKTstate1 + here->BSIM4v5qdef))
-                        -(xfact * (*(ckt->CKTstate2 + here->BSIM4v5qdef)));
+#if NGSPICE_OPT_GENERAL
+                   if (ckt->CKTtaPredActive) {
+                       vds = model->BSIM4v5type * (*(ckt->CKTrhsOld + here->BSIM4v5dNodePrime) - *(ckt->CKTrhsOld + here->BSIM4v5sNodePrime));
+                       vgs = model->BSIM4v5type * (*(ckt->CKTrhsOld + here->BSIM4v5gNodePrime) - *(ckt->CKTrhsOld + here->BSIM4v5sNodePrime));
+                       vbs = model->BSIM4v5type * (*(ckt->CKTrhsOld + here->BSIM4v5bNodePrime) - *(ckt->CKTrhsOld + here->BSIM4v5sNodePrime));
+                       vges = model->BSIM4v5type * (*(ckt->CKTrhsOld + here->BSIM4v5gNodeExt) - *(ckt->CKTrhsOld + here->BSIM4v5sNodePrime));
+                       vgms = model->BSIM4v5type * (*(ckt->CKTrhsOld + here->BSIM4v5gNodeMid) - *(ckt->CKTrhsOld + here->BSIM4v5sNodePrime));
+                       vdbs = model->BSIM4v5type * (*(ckt->CKTrhsOld + here->BSIM4v5dbNode) - *(ckt->CKTrhsOld + here->BSIM4v5sNodePrime));
+                       vsbs = model->BSIM4v5type * (*(ckt->CKTrhsOld + here->BSIM4v5sbNode) - *(ckt->CKTrhsOld + here->BSIM4v5sNodePrime));
+                       vses = model->BSIM4v5type * (*(ckt->CKTrhsOld + here->BSIM4v5sNode) - *(ckt->CKTrhsOld + here->BSIM4v5sNodePrime));
+                       vdes = model->BSIM4v5type * (*(ckt->CKTrhsOld + here->BSIM4v5dNode) - *(ckt->CKTrhsOld + here->BSIM4v5sNodePrime));
+                       qdef = (here->BSIM4v5trnqsMod) ? (*(ckt->CKTrhsOld + here->BSIM4v5qNode)) : 0.0;
+                   } else
+#endif
+                   {
+                       vds = (1.0 + xfact)* (*(ckt->CKTstate1 + here->BSIM4v5vds))
+                             - (xfact * (*(ckt->CKTstate2 + here->BSIM4v5vds)));
+                       vgs = (1.0 + xfact)* (*(ckt->CKTstate1 + here->BSIM4v5vgs))
+                             - (xfact * (*(ckt->CKTstate2 + here->BSIM4v5vgs)));
+                       vges = (1.0 + xfact)* (*(ckt->CKTstate1 + here->BSIM4v5vges))
+                             - (xfact * (*(ckt->CKTstate2 + here->BSIM4v5vges)));
+                       vgms = (1.0 + xfact)* (*(ckt->CKTstate1 + here->BSIM4v5vgms))
+                             - (xfact * (*(ckt->CKTstate2 + here->BSIM4v5vgms)));
+                       vbs = (1.0 + xfact)* (*(ckt->CKTstate1 + here->BSIM4v5vbs))
+                             - (xfact * (*(ckt->CKTstate2 + here->BSIM4v5vbs)));
+                       vdbs = (1.0 + xfact)* (*(ckt->CKTstate1 + here->BSIM4v5vdbs))
+                             - (xfact * (*(ckt->CKTstate2 + here->BSIM4v5vdbs)));
+                       vsbs = (1.0 + xfact)* (*(ckt->CKTstate1 + here->BSIM4v5vsbs))
+                             - (xfact * (*(ckt->CKTstate2 + here->BSIM4v5vsbs)));
+                       vses = (1.0 + xfact)* (*(ckt->CKTstate1 + here->BSIM4v5vses))
+                             - (xfact * (*(ckt->CKTstate2 + here->BSIM4v5vses)));
+                       vdes = (1.0 + xfact)* (*(ckt->CKTstate1 + here->BSIM4v5vdes))
+                             - (xfact * (*(ckt->CKTstate2 + here->BSIM4v5vdes)));
+                       qdef = (1.0 + xfact)* (*(ckt->CKTstate1 + here->BSIM4v5qdef))
+                            -(xfact * (*(ckt->CKTstate2 + here->BSIM4v5qdef)));
+                   }
                }
 	       else
 	       {

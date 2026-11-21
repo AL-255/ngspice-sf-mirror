@@ -60,7 +60,11 @@ NIconvTest(CKTcircuit *ckt)
         double voltTol = ckt->CKTvoltTol;
         double abstol = ckt->CKTabstol;
 
-        for (i = 1; i <= size; i++) {
+        int sub_only = (ckt->CKTmrSubActive && ckt->CKTmrFastNodes && ckt->CKTmrSubNFast > 0);
+        int n_loop = sub_only ? ckt->CKTmrSubNFast : size;
+        for (int li = 0; li < n_loop; li++) {
+            i = sub_only ? ckt->CKTmrFastNodes[li] : (li + 1);
+            if (i <= 0 || i > size) continue;
             new = rhs[i];
             old = rhsOld[i];
             double abs_tol = isVolt[i] ? voltTol : abstol;
