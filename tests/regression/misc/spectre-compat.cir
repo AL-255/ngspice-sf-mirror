@@ -30,6 +30,30 @@ Dd1 di 0 spe_dio
 Vr1 r1 0 2.0
 Xr1 r1 0 spe_res_t rbase=1000 m=4
 
+* Structural if/else if/else conditional parameters + unparenthesized instance
+Vr_c1 rc1 0 2.0
+Xr_c1 rc1 0 spe_cond_res mode=1 rval=1000
+Vr_c2 rc2 0 2.0
+Xr_c2 rc2 0 spe_cond_res mode=2 rval=1000
+
+* Multi-level nested Spectre real functions (spe_r_eff -> spe_scale_step -> spe_is_hi)
+Vr_fn rfn 0 3.0
+Rr_fn rfn 0 {spe_r_eff(1000, 2.0)}
+
+* Behavioral voltage-dependent Spectre resistor: r = 1000*(1 + 0.25*2.0) = 1500 Ohm -> I = 2/1500
+Vr_nl rnl 0 2.0
+Xr_nl rnl 0 spe_vdep_res r0=1000 alpha=0.25
+
+* Subcircuit call passing temp expression (temp=27 -> r=1000 -> I = 2mA)
+Vr_tw rtw 0 2.0
+Xr_tw rtw 0 spe_temp_wrap rbase=1000
+
+* Mutual inductor DC continuity check
+Vx1 x1 0 1.0
+Rx1 x1 x1m 100
+Xxf x1m 0 x2 0 spe_xfmr
+Rx2 x2 0 100
+
 .control
 op
 
@@ -66,7 +90,31 @@ if abs(-i(vr1) - 8e-3) > 1e-9
     let fail_count = fail_count + 1
 end
 
-echo "INFO: $&fail_count of 5 tests failed"
+* 6. Structural if/else if/else conditional parameters + unparenthesized instance
+if (abs(-i(vr_c1) - 1e-3) > 1e-9) | (abs(-i(vr_c2) - 5e-4) > 1e-9)
+    echo "ERROR: conditional if/else resistor currents unexpected"
+    let fail_count = fail_count + 1
+end
+
+* 7. Multi-level nested Spectre real functions: r = 1000*(1+0.5*1) = 1500 -> I = 3/1500 = 2mA
+if abs(-i(vr_fn) - 2e-3) > 1e-9
+    echo "ERROR: nested real function resistor current unexpected"
+    let fail_count = fail_count + 1
+end
+
+* 8. Behavioral voltage-dependent Spectre resistor: I = 2/1500 = 1.333333e-3
+if abs(-i(vr_nl) - (2.0/1500.0)) > 1e-9
+    echo "ERROR: behavioral voltage-dependent resistor current unexpected"
+    let fail_count = fail_count + 1
+end
+
+* 9. Subcircuit call passing temp expression + mutual inductor DC check
+if (abs(-i(vr_tw) - 2e-3) > 1e-9) | (abs(-i(vx1) - 1e-2) > 1e-9)
+    echo "ERROR: temp subckt arg or mutual_inductor check failed"
+    let fail_count = fail_count + 1
+end
+
+echo "INFO: $&fail_count of 9 tests failed"
 if fail_count > 0
     quit 1
 end

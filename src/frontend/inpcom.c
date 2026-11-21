@@ -4730,8 +4730,9 @@ static char *inp_expand_macro_in_str(struct function_env *env, char *str)
         fcn_name = open_paren_ptr;
         while (--fcn_name >= search_ptr)
             /* function name consists of numbers, letters and special
-             * characters (VALIDCHARS) */
-            if (!isalnum_c(*fcn_name) && !strchr(VALIDCHARS, *fcn_name))
+             * characters (VALIDCHARS); in Spectre mode, ?, !, & are operators */
+            if (!isalnum_c(*fcn_name) &&
+                !strchr(newcompat.spe ? "$%_#@.[]" : VALIDCHARS, *fcn_name))
                 break;
         fcn_name++;
 
@@ -4860,9 +4861,21 @@ static char *inp_expand_macro_in_str(struct function_env *env, char *str)
 static void inp_expand_macros_in_func(struct function_env *env)
 {
     struct function *f;
-
-    for (f = env->functions; f; f = f->next)
-        f->body = inp_expand_macro_in_str(env, f->body);
+    /* Iterate to fixed point (capped) so multi-level nested .func calls
+     * (e.g. A -> B -> C -> D in PDK BEOL/LLE equations) expand regardless of
+     * linked-list order in env->functions. */
+    for (int pass = 0; pass < 16; pass++) {
+        bool changed = FALSE;
+        for (f = env->functions; f; f = f->next) {
+            char *old_body = copy(f->body);
+            f->body = inp_expand_macro_in_str(env, f->body);
+            if (strcmp(old_body, f->body) != 0)
+                changed = TRUE;
+            tfree(old_body);
+        }
+        if (!changed)
+            break;
+    }
 }
 
 
@@ -5228,7 +5241,9 @@ struct dependency {
     int skip;
     char *param_name;
     char *param_str;
-    char *depends_on[DEPENDSON];
+    char **depends_on;
+    int num_deps;
+    int cap_deps;
     struct card *card;
 };
 
@@ -5519,6 +5534,9 @@ static void inp_sort_params(struct card *param_cards,
     for (c = param_cards; c; c = c->nextcard)
         // ignore .param lines without '='
         if (strchr(c->line, '=')) {
+            deps[num_params].cap_deps = 16;
+            deps[num_params].num_deps = 0;
+            deps[num_params].depends_on = TMALLOC(char *, deps[num_params].cap_deps);
             deps[num_params].depends_on[0] = NULL;
             deps[num_params].level = -1;
             deps[num_params].skip = 0;
@@ -5549,15 +5567,12 @@ static void inp_sort_params(struct card *param_cards,
             for (j = 0; j < num_params; j++)
                 if (j != i &&
                         search_plain_identifier(deps[j].param_str, param)) {
-                    for (ind = 0; deps[j].depends_on[ind]; ind++)
-                        ;
-                    deps[j].depends_on[ind++] = param;
-                    if (ind == DEPENDSON) {
-                        fprintf(stderr, "Error in netlist: Too many parameter dependencies (> %d)\n", ind);
-                        fprintf(stderr, "    Please check your netlist.\n");
-                        controlled_exit(EXIT_BAD);
+                    if (deps[j].num_deps + 2 >= deps[j].cap_deps) {
+                        deps[j].cap_deps *= 2;
+                        deps[j].depends_on = TREALLOC(char *, deps[j].depends_on, deps[j].cap_deps);
                     }
-                    deps[j].depends_on[ind] = NULL;
+                    deps[j].depends_on[deps[j].num_deps++] = param;
+                    deps[j].depends_on[deps[j].num_deps] = NULL;
                 }
         }
 
@@ -5597,6 +5612,7 @@ static void inp_sort_params(struct card *param_cards,
     for (i = 0; i < arr_size; i++) {
         tfree(deps[i].param_name);
         tfree(deps[i].param_str);
+        tfree(deps[i].depends_on);
     }
 
     tfree(deps);
@@ -7514,8 +7530,9 @@ static bool inp_temper_compat(struct card *card)
         else if (skip_control > 0) {
             continue;
         }
-        /* exclude some elements */
-        if (strchr("*vbiegfhVBIEGFH", curr_line[0]))
+        /* exclude some elements (and subcircuit calls X, whose param=val
+         * tokenization would be corrupted by inp_modify_exp) */
+        if (strchr("*vbiegfhxVBIEGFHX", curr_line[0]))
             continue;
         /* exclude all dot commands except .model */
         if (curr_line[0] == '.' && !prefix(".model", curr_line))
