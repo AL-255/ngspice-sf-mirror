@@ -784,7 +784,13 @@ operate(char op, double x, double y)
         x = x / y;
         break;
     case '^':                   /* power */
-        if (newcompat.hs) {
+        if (newcompat.spe) {
+            if (x < 0)
+                x = pow(x, round(y));
+            else
+                x = pow(x, y);
+        }
+        else if (newcompat.hs) {
             if (x < 0)
                 x = pow(x, round(y));
             else if (x == 0)

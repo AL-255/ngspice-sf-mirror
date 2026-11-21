@@ -199,11 +199,15 @@ void DIOtempUpdate(DIOmodel *inModel, DIOinstance *here, double Temp, CKTcircuit
     /* and Vcrit */
     totalSatCur = here->DIOtSatCur + here->DIOtSatSWCur;
     if(model->DIOresistSWGiven) {
-        here->DIOtVcrit = vte * log(vte/(CONSTroot2*here->DIOtSatCur));
-        here->DIOtVcritSW = vts * log(vts/(CONSTroot2*here->DIOtSatSWCur));
+        here->DIOtVcrit = (here->DIOtSatCur > 0.0)
+            ? vte * log(vte/(CONSTroot2*here->DIOtSatCur)) : 0.0;
+        here->DIOtVcritSW = (here->DIOtSatSWCur > 0.0)
+            ? vts * log(vts/(CONSTroot2*here->DIOtSatSWCur)) : 0.0;
     } else {
-        here->DIOtVcrit = vte * log(vte/(CONSTroot2*totalSatCur));
-        here->DIOtVcritSW = vts * log(vts/(CONSTroot2*here->DIOtSatSWCur)); 
+        here->DIOtVcrit = (totalSatCur > 0.0)
+            ? vte * log(vte/(CONSTroot2*totalSatCur)) : 0.0;
+        here->DIOtVcritSW = (here->DIOtSatSWCur > 0.0)
+            ? vts * log(vts/(CONSTroot2*here->DIOtSatSWCur)) : 0.0;
     }
     /* and now to compute the breakdown voltage, again, using
      * temperature adjusted basic parameters */
@@ -218,7 +222,7 @@ void DIOtempUpdate(DIOmodel *inModel, DIOinstance *here, double Temp, CKTcircuit
         } else { /* level=3 */
             cbv = model->DIObreakdownCurrent * here->DIOarea * here->DIOm;
         }
-        if (cbv < totalSatCur * tBreakdownVoltage/vt) {
+        if (totalSatCur <= 0.0 || cbv < totalSatCur * tBreakdownVoltage/vt) {
 #ifdef TRACE
             cbv=totalSatCur * tBreakdownVoltage/vt;
             SPfrontEnd->IFerrorf (ERR_WARNING, "%s: breakdown current increased to %g to resolve", here->DIOname, cbv);

@@ -576,6 +576,35 @@ static int spe_osdi_num_terms(const char *name)
 
 /* Return canonical OSDI module name if `mtype` is a CMC/industry compact model
  * supported via OSDI (rather than built-in SPICE primitives), else NULL. */
+static const char *spe_cur_dir_name = NULL;
+
+static void spe_try_load_osdi_by_stem(const char *stem, const char *dir_name, bool quiet);
+
+/* Resolve an available CMC HiSIM_HV OSDI module (prefers 4-terminal hisimhv_n4_va),
+ * attempting to auto-load `hisimhv_n4.osdi` / `hisim_hv.osdi` / `hisimhv.osdi`.
+ * Returns NULL when no HiSIM_HV OSDI binary is available (caller falls back to level=73). */
+static const char *spe_resolve_hisimhv_osdi(const char *dir_name)
+{
+    static const char * const dev_names[] = {
+        "hisimhv_n4_va", "hisimhv_va", "hisimhv_n5_va", "hisim_hv", "hisimhv", NULL
+    };
+    static const char * const stems[] = {
+        "hisimhv_n4", "hisim_hv", "hisimhv", NULL
+    };
+    for (int i = 0; dev_names[i]; i++) {
+        if (spe_is_loaded_osdi_device(dev_names[i]))
+            return dev_names[i];
+    }
+    for (int i = 0; stems[i]; i++) {
+        spe_try_load_osdi_by_stem(stems[i], dir_name, TRUE);
+        for (int j = 0; dev_names[j]; j++) {
+            if (spe_is_loaded_osdi_device(dev_names[j]))
+                return dev_names[j];
+        }
+    }
+    return NULL;
+}
+
 static const char *spe_cmc_osdi_type(const char *mtype)
 {
     if (!mtype) return NULL;
@@ -590,12 +619,15 @@ static const char *spe_cmc_osdi_type(const char *mtype)
     if (strcasecmp(mtype, "r2_cmc") == 0)    return "r2_cmc";
     if (strcasecmp(mtype, "hicum2") == 0)    return "hicum2";
     if (strcasecmp(mtype, "mextram") == 0)   return "mextram";
+    if (strcasecmp(mtype, "hisim_hv") == 0 || strcasecmp(mtype, "hisimhv") == 0 ||
+        strcasecmp(mtype, "hisimhv2") == 0)
+        return spe_resolve_hisimhv_osdi(spe_cur_dir_name);
     return NULL;
 }
 
 /* Attempt to auto-load `<stem>.osdi` from `<dir_name>`, `$NGSPICE_OSDI_DIR`, or
  * `$HOME/.cache/ngspice/osdi`. Safe to call repeatedly (deduplicated). */
-static void spe_try_load_osdi_by_stem(const char *stem, const char *dir_name)
+static void spe_try_load_osdi_by_stem(const char *stem, const char *dir_name, bool quiet)
 {
 #ifdef OSDI
     if (!stem || !*stem)
@@ -642,7 +674,7 @@ static void spe_try_load_osdi_by_stem(const char *stem, const char *dir_name)
         }
     }
 
-    if (!spe_va_already_warned(stem)) {
+    if (!quiet && !spe_va_already_warned(stem)) {
         fprintf(stderr,
                 "Warning: Spectre model type '%s': no compiled '%s.osdi' found "
                 "(place '%s.osdi' in $NGSPICE_OSDI_DIR or ~/.cache/ngspice/osdi)\n",
@@ -653,6 +685,7 @@ static void spe_try_load_osdi_by_stem(const char *stem, const char *dir_name)
 #else
     (void)stem;
     (void)dir_name;
+    (void)quiet;
 #endif
 }
 
@@ -1642,7 +1675,7 @@ static void spe_translate_model(const char *stmt, const char *dir_name, SpeLines
     const char *cmc = spe_cmc_osdi_type(mtype);
     bool is_osdi_cmc = (cmc != NULL);
     if (is_osdi_cmc)
-        spe_try_load_osdi_by_stem(cmc, dir_name);
+        spe_try_load_osdi_by_stem(cmc, dir_name, FALSE);
 
     SpeKind mk = spectre_model_type_to_kind(mtype);
     if (mk != SPE_KIND_UNKNOWN)
@@ -1981,11 +2014,15 @@ static void spe_translate_instance(const char *stmt, const SpeSymTab *syms,
         sb_putc(&inst_line, ' ');
         sb_puts(&inst_line, nodes.buf);
 
-        /* Append isolated thermal node if OSDI module (e.g. bsimimg) declares 5 terminals
-         * `(d, fg, s, bg, t)` while the Spectre instance specifies 4 electrical terminals */
+        /* Ensure CMC OSDI module is loaded so terminal count & param scope queries succeed */
+        if (osdi_type)
+            spe_try_load_osdi_by_stem(osdi_type, spe_cur_dir_name, FALSE);
+
+        /* Append isolated optional nodes (e.g. thermal/substrate) when an OSDI module
+         * declares more terminals than the Spectre instance specifies */
         if (osdi_type) {
             int req_terms = spe_osdi_num_terms(osdi_type);
-            if (req_terms == n_nodes + 1) {
+            for (int extra = n_nodes; extra < req_terms && extra < n_nodes + 2; extra++) {
                 char thnode[64];
                 snprintf(thnode, sizeof(thnode), " __spe_th_%lu", ++spe_va_uid);
                 sb_puts(&inst_line, thnode);
@@ -2010,9 +2047,21 @@ static void spe_translate_instance(const char *stmt, const SpeSymTab *syms,
                 if (strcasecmp(key, "area") == 0) okey = "ab";
                 else if (strcasecmp(key, "peri") == 0 || strcasecmp(key, "perim") == 0) okey = "ls";
                 else if (strcasecmp(key, "pgate") == 0) okey = "lg";
-                else if (strcasecmp(key, "trise") == 0 || strcasecmp(key, "dtemp") == 0) okey = "dta";
+                else if (strcasecmp(key, "trise") == 0 || strcasecmp(key, "dtemp") == 0) {
+                    if (osdi_type && spe_osdi_param_scope(osdi_type, "dta") == 1)
+                        okey = "dta";
+                    else if (osdi_type && spe_osdi_param_scope(osdi_type, "dtemp") == 1)
+                        okey = "dtemp";
+                    else
+                        okey = "dt";
+                }
             } else {
-                if (strcasecmp(key, "trise") == 0) okey = "dtemp";
+                if (strcasecmp(key, "trise") == 0) {
+                    if (osdi_type && spe_osdi_param_scope(osdi_type, "dtemp") == 1)
+                        okey = "dtemp";
+                    else
+                        okey = "dt";
+                }
             }
             /* Filter unknown instance params when the OSDI device is loaded */
             if (osdi_type && spe_is_loaded_osdi_device(osdi_type)) {
@@ -2943,6 +2992,9 @@ char **inp_spectre_translate_fp(FILE *fp, const char *dir_name,
 {
     *out_nlines = 0;
 
+    const char *prev_dir_name = spe_cur_dir_name;
+    spe_cur_dir_name = dir_name;
+
     newcompat.spe = TRUE;
     newcompat.isset = TRUE;
 
@@ -3054,6 +3106,7 @@ char **inp_spectre_translate_fp(FILE *fp, const char *dir_name,
 
     sym_free(&syms);
     st_free(&stmts);
+    spe_cur_dir_name = prev_dir_name;
 
     *out_nlines = out.count;
     return out.lines;

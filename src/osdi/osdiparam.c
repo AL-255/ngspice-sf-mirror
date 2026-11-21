@@ -116,8 +116,7 @@ extern int OSDImParam(int param, IFvalue *value, GENmodel *modelPtr) {
   OsdiRegistryEntry *entry = osdi_reg_entry_model(modelPtr);
   const OsdiDescriptor *descr = entry->descriptor;
 
-  if (param > (int)descr->num_params ||
-      param < (int)descr->num_instance_params) {
+  if (param < 0 || param >= (int)descr->num_params) {
     return (E_BADPARM);
   }
 

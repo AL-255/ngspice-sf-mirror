@@ -22,9 +22,11 @@ Vbc c1 0 3.0
 Vbe b1 0 0.7
 Xq1 c1 b1 0 0 spe_npn
 
-* Diode with compatible=hspice
+* Diode with compatible=hspice + zero-area breakdown diode (must not NaN)
 Vdi di 0 0.65
 Dd1 di 0 spe_dio
+Vdi0 di0 0 3.3
+Dd0 0 di0 spe_dio area=0 pj=0
 
 * Temperature-dependent Spectre resistor (temp -> temper) with m=4
 Vr1 r1 0 2.0
@@ -36,9 +38,11 @@ Xr_c1 rc1 0 spe_cond_res mode=1 rval=1000
 Vr_c2 rc2 0 2.0
 Xr_c2 rc2 0 spe_cond_res mode=2 rval=1000
 
-* Multi-level nested Spectre real functions (spe_r_eff -> spe_scale_step -> spe_is_hi)
+* Multi-level nested Spectre real functions (spe_r_eff -> spe_scale_step -> spe_is_hi) + signed (-1)**3
 Vr_fn rfn 0 3.0
 Rr_fn rfn 0 {spe_r_eff(1000, 2.0)}
+Vr_nc rnc 0 1.6
+Rr_nc rnc 0 {spe_neg_cube}
 
 * Behavioral voltage-dependent Spectre resistor: r = 1000*(1 + 0.25*2.0) = 1500 Ohm -> I = 2/1500
 Vr_nl rnl 0 2.0
@@ -78,8 +82,8 @@ if i(vbc) > -1e-5
     let fail_count = fail_count + 1
 end
 
-* 4. Diode forward current
-if i(vdi) > -1e-5
+* 4. Diode forward current + zero-area breakdown diode convergence (finite near-zero current)
+if (i(vdi) > -1e-5) | (abs(i(vdi0)) > 1e-9)
     echo "ERROR: Diode current unexpected"
     let fail_count = fail_count + 1
 end
@@ -96,9 +100,9 @@ if (abs(-i(vr_c1) - 1e-3) > 1e-9) | (abs(-i(vr_c2) - 5e-4) > 1e-9)
     let fail_count = fail_count + 1
 end
 
-* 7. Multi-level nested Spectre real functions: r = 1000*(1+0.5*1) = 1500 -> I = 3/1500 = 2mA
-if abs(-i(vr_fn) - 2e-3) > 1e-9
-    echo "ERROR: nested real function resistor current unexpected"
+* 7. Multi-level nested Spectre real functions: r=1500 -> I=2mA; signed (-1)**3: r=800 -> I=2mA
+if (abs(-i(vr_fn) - 2e-3) > 1e-9) | (abs(-i(vr_nc) - 2e-3) > 1e-9)
+    echo "ERROR: nested real function or signed power resistor current unexpected"
     let fail_count = fail_count + 1
 end
 

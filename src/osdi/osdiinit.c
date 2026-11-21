@@ -143,15 +143,15 @@ extern SPICEdev *osdi_create_spicedev(const OsdiRegistryEntry *entry) {
   write_param_info(&dst, descr, descr->num_params,
                    descr->num_params + descr->num_opvars, true);
 
-  // allocate and fill model params
+  // allocate and fill model params (include 0..num_instance_params so OSDI
+  // dual model/instance defaults can be specified on .model cards per spec)
   int *num_model_para_names = TMALLOC(int, 1);
-  for (uint32_t i = descr->num_instance_params; i < descr->num_params; i++) {
+  for (uint32_t i = 0; i < descr->num_params; i++) {
     *num_model_para_names += (int)(1 + descr->param_opvar[i].num_alias);
   }
   IFparm *model_para_names = TMALLOC(IFparm, *num_model_para_names);
   dst = model_para_names;
-  write_param_info(&dst, descr, descr->num_instance_params, descr->num_params,
-                   true);
+  write_param_info(&dst, descr, 0, descr->num_params, true);
 
   // Allocate SPICE device
   SPICEdev *OSDIinfo = TMALLOC(SPICEdev, 1);
