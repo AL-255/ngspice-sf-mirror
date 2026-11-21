@@ -286,3 +286,31 @@ Precompiling the full GF180 typical PDK (`design.ngspice` + `sm141064.ngspice` c
      - At VLSI scale (`N >= 10,000`, strictly zero change for `N < 10,000`): uses directional strong-coupling 1-hop expansion (`|A_{row,j}| >= 0.02 * |A_{row,row}|`), exact first-order sensitivity-weighted wake (`WakeScale[i] = max_{j in S} |A_{j,i}|/|A_{j,j}|`), `vntol`-scaled thresholds, and VLSI-adaptive exact Chord Newton (`niiter.c` + `SMPkluSubSolve`).
   4. **Opt-In Time-Axis Predictor, PI+Deadband+NL Controller, Breakpoint Smoothing, Gear-3 & `CKTnodeIsVolt` Leak Fix (Default OFF)** (`cktdefs.h`, `cktdest.c`, `dctran.c`, `niiter.c`, `dioload.c`, `b4v5ld.c`, `b4v6ld.c`, `bsim4_avx512_core.h`, `bsim4_avx512_glue.h`, `capload.c`, `captrunc.c`, `NGSPICE_OPT_GENERAL`):
      - Opt-in toggles `NGSPICE_TA_PRED=0..3` (slope-limited 2nd-order Lagrange predictor, fast-only during `COMPFAST` bursts), `NGSPICE_TA_CTRL=1` (`TA_PI` Soderlind H211PI + `TA_DB=1.35` `ag0`-hold deadband + `TA_NL` Newton-aware damping + `TA_CHORD`), `NGSPICE_TA_BKPT=1`, and `NGSPICE_TA_ORD3=1` (native Gear-3 across AVX-512 BSIM4 and deferred KLU CAP); fixes unconditional `CKTnodeIsVolt` free in `cktdest.c`.
+
+### Stage G (Apple Silicon): Zen 4 Stages 11–12 Convergence & Per-Instance NEON Multirate Port (`170df01bf`..`2cdc02f45`, `NGSPICE_OPT_GENERAL` + `NGSPICE_OPT_APPLE`)
+- **Scope:**
+  - **Stages 11–12 Merge (`170df01bf`):** Merged `origin/opt/zen4-transient@c9300bfb9` cleanly into `opt/apple-silicon-transient`, unifying all 16 portable Stage 11/12 files under `NGSPICE_OPT_GENERAL` (including exact row-oriented CSR backward solve in `spSolve`, deferred nodal `CAP` integration, active-node `CKTtrunc`, KLU latent accumulators, and 2-level `COMPFAST` active-submatrix multirate), combining Apple NEON full-scan with Stage 12 `sub_only` in `NIconvTest` (`niconv.c`), and preserving all Apple Silicon invariants (strict IEEE-754 exact division in `klu_solve.c` under `&& !NGSPICE_OPT_APPLE`, Clang 21 `ft_numparse()` UB fix, `CKTdiagGmin == 0.0` `MODETRANOP` guard, macOS `st_mtimespec` & `cntvct_el0` timer).
+  - **Apple Silicon BSIM4 NEON Port (`18f241351`):** Ported all 4 Stage 12 BSIM4 optimizations into `bsim4_apple_core.h` and `bsim4_apple_glue.h` at **per-instance (`W=1`)** granularity:
+    1. Per-instance dynamic latent-partition companion freezing (`MR_LATENT`, default ON) + `COMPFAST` active-submatrix filtering (`CKTmrSubActive`), keeping `BSIM4AppleCheck` at exact 128 bytes (`last_active_step` in `pad0`, `_Static_assert`), partitioning `grpActiveList` per `BSIM4AppleGroup` slice for O(1) freeze/wake while preserving 2-wide NEON batching, bucketing `cfFastList` by group on `cfEpoch` change via zero-allocation `pack->eval_q` scratch, exact CSR `nodeInstPtr`/`nodeInstIdx` wake-up, `stampFrozenDelta` (including internal `has_dint`/`has_sint` offsets via `ptrToKluOff`), and `s0..s4` state resync on wake/burst-exit.
+    2. Active-node `BSIM4truncAvx` stationary skipping (`NGSPICE_NO_MR_TRUNC`, default ON) with dense 2-wide NEON `terrPairNeon` pairing of remaining active instances.
+    3. Opt-in time-axis predictor (`CKTtaPredActive`) in `evalAppleGroupList` `MODEINITPRED`.
+    4. Opt-in native Gear-3 (`NGSPICE_TA_ORD3=1`) across `isAvxEligibleTran`, `BSIM4ApplePack` step cache, `bsim4_apple_l2_assemble_one`, `bsim4_apple_eval_batch`, and 2-wide NEON `terrPairNeon`/`truncAvx`.
+  - **L1-Resident Sparse DCOP Stamping Fix (`0e4339961`..`2cdc02f45`):** For L1-resident circuits (`nFb == 0 && nElig <= 64`, `<= 24 KB` working set), Sparse 1t `dc_only` stamps in exact `InstArray[0..nElig-1]` order (`pack->orig_order`) to match stock Sparse summation order on high-gain analog cells (`opa1k_pvt16` Sparse fixed to `2.57e-06` across all 16,000 tasks), while large circuits (`nElig > 64`) use single-pass inline grouped stamping (avoiding second-pass L1D spill and preserving 115/115 bit-exact PDM on `sdm16_120cyc` Sparse).
+- **Verified Results — Apple M6 Super Core, Fresh PGO + ThinLTO (`2cdc02f45` vs Stage F `f54075591`, 12/12 Strict Golden PASS, 0 env vars, strict IEEE-754):**
+
+| Workload | Solver | `f54075591` PGO | **`2cdc02f45` PGO** | `tran_s` | Speedup | Golden Result & Key Metric |
+|---|---|---:|---:|---:|---:|---|
+| `opa1k_pvt16` | **KLU** | 99.86 s | **103.45 s** | — | 0.965× | **PASS** `rel_rms = 5.31e-05 (ac_pk)`, 16k tasks |
+| `opa1k_pvt16` | Sparse | 99.05 s *(FAIL)* | **101.10 s** | — | 0.980× | **PASS** `rel_rms = 2.57e-06 (ac_dc)`, 16k tasks *(fixed)* |
+| `sdm16_120cyc` | **KLU** | 19.94 s | **19.52 s** | 19.23 s | **1.022×** | **PASS** 115/115 bit-exact PDM, `6.33e-03`, `r = 0.99932` |
+| `sdm16_120cyc` | Sparse | 26.18 s | **27.05 s** | 26.68 s | 0.968× | **PASS** 115/115 bit-exact PDM, `6.77e-03`, `r = 0.99932` |
+| `pll_ring_150m_4us` | **KLU** | 21.57 s | **17.69 s** | 17.59 s | **1.219×** | **PASS** `pll = 31/31`, `vc_err = 0.952 mV`, `8.76e-03` |
+| `pll_ring_150m_4us` | Sparse | 23.54 s | **23.70 s** | 23.60 s | 0.993× | **PASS** `pll = 31/31`, `vc_err = 0.139 mV`, `5.89e-04` |
+| `ti12_full_300ns` | **KLU** | 14.97 s | **8.93 s** | 8.14 s | **1.677×** | **PASS** `rel_rms = 6.96e-06 (v(dout_0))` |
+| `ti12_full_300ns` | Sparse | 27.47 s | **30.13 s** | 29.17 s | 0.912× | **PASS** `rel_rms = 3.12e-11 (v(dout_6))` |
+| `sar12_probe_2cyc` | **KLU** | 6.89 s | **5.66 s** | 5.36 s | **1.219×** | **PASS** 2/2 codes, `eoc_dt = 119.6 ps`, `2.48e-02` |
+| `sar12_probe_2cyc` | Sparse | 8.62 s | **10.47 s** | 8.60 s | 0.823× | **PASS** 2/2 codes, `eoc_dt = 27.7 ps`, `1.66e-02` |
+| `sar12_hero_16cyc` | **KLU** | 53.74 s | **43.14 s** | 42.83 s | **1.246×** | **PASS** 16/16 codes, `eoc_dt = 119.6 ps`, `1.50e-02` |
+| `sar12_hero_16cyc` | Sparse | 68.84 s | **69.68 s** | 67.79 s | 0.988× | **PASS** 16/16 codes, `eoc_dt = 75.8 ps`, `8.27e-03` |
+
+- **Highlights:** **1.260×** geomean across the 5 KLU transient workloads (**1.205×** across all 6 KLU workloads), **12/12 `all_ok=True`** (upgraded from 11/12 on `f54075591`), `tests/bsim4` **2/2 PASS** on ThinLTO and PGO+ThinLTO, `-DNGSPICE_OPT_APPLE=0 -fsyntax-only` **12/12 PASS**, and opt-in `NGSPICE_TA_*` verified PASS (`ti12` KLU `TA_P123+ORD3`: `8.99 s` ThinLTO, `7.65e-05`; `sar12_probe_2cyc` KLU `TA_P123`: `5.70 s` ThinLTO, `17.5 ps`, 2/2 codes; NEON Gear-3 matches pure scalar Gear-3 identically).
