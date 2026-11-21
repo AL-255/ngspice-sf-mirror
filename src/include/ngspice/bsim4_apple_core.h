@@ -800,11 +800,13 @@ typedef struct __attribute__((aligned(128))) {
     int dNodePrime, gNodePrime, sNodePrime, bNodePrime;  /* 16B */
     int stateBase, instIdx;                              /* 24B */
     uint8_t has_dint, has_sint, phys_valid, stamp_valid; /* 28B */
-    int pad0;                                            /* 32B */
+    int last_active_step;                                /* 32B */
     double type, last_vds, last_vgs, last_vbs;           /* 64B */
     double Idtot, cd_g, cd_d, cd_b;                      /* 96B */
     double Ibtot, cb_g, cb_d, cb_b;                      /* 128B */
 } BSIM4AppleCheck;
+
+_Static_assert(sizeof(BSIM4AppleCheck) == 128, "BSIM4AppleCheck must be 128 bytes");
 
 /* Compact per-instance stamp + limiter metadata (NOT touched on L1 delta-stamp hits!) */
 typedef struct __attribute__((aligned(64))) {
@@ -859,11 +861,56 @@ typedef struct {
     int              nGroups;
     int              nElig;
     /* Pack-level step cache metadata (checked ONCE per CKTload instead of per transistor!) */
-    double           last_time, last_ag0, last_ag1, last_ag2, last_gmin;
-    const double    *last_s0, *last_s1, *last_s2;
+    double           last_time, last_ag0, last_ag1, last_ag2, last_ag3, last_gmin;
+    const double    *last_s0, *last_s1, *last_s2, *last_s3;
     int              last_int_mode;
     int              step_valid;
 } BSIM4ApplePack;
+
+/* Per-instance dynamic latent-partition & compound-fast state (NGSPICE_MR_LATENT + COMPFAST) */
+typedef struct {
+    int     nElig;
+    int     nGroups;
+    int     nNodes;
+    int     nActive;
+    int     nFrozen;
+    int     lastAccepted;
+    double  lastGmin;
+
+    uint8_t *latentFrozen;
+    uint8_t *latentStreak;
+    int     *instGroup;
+
+    int     *activeList;
+    int     *activePos;
+
+    int     *grpActiveList;
+    int     *grpActivePos;
+    int     *grpActiveCnt;
+
+    int     *nodeInstPtr;
+    int     *nodeInstIdx;
+    double  *vSnap;
+    int     *nodeFrozenCnt;
+
+    unsigned long long statCalls;
+    unsigned long long statFrozenSum;
+    unsigned long long statFreezes;
+    unsigned long long statWakes;
+    unsigned long long statResets;
+    unsigned long long statFailIcap;
+    unsigned long long statFailCache;
+    unsigned long long statFailSnap;
+    unsigned long long statFailValid;
+
+    unsigned int       cfEpoch;
+    int                cfNFast;
+    int                cfNeedsSync;
+    int               *cfFastList;
+    int               *cfGrpStart;
+    int               *cfGrpCnt;
+    unsigned char     *cfIsFastInst;
+} BSIM4AppleLatentState;
 
 typedef struct __attribute__((aligned(64))) {
     vad vds;
@@ -989,11 +1036,12 @@ bsim4_apple_l2_assemble_one(
     BSIM4AppleStamp * restrict sp,
     double vds, double vgs, double vbs,
     int has_dv,
-    double ag0, double ag1, double ag2,
-    int is_gear2, int is_trap2,
+    double ag0, double ag1, double ag2, double ag3,
+    int is_gear3, int is_gear2, int is_trap2,
     double * restrict s0,
     const double * restrict s1,
-    const double * restrict s2)
+    const double * restrict s2,
+    const double * restrict s3)
 {
     double dqg = 0.0, dqd = 0.0, dqb = 0.0;
     double qb_st = l2->qb_st, qg_st = l2->qg_st, qd_st = l2->qd_st;
@@ -1029,7 +1077,11 @@ bsim4_apple_l2_assemble_one(
     s0[st + 15] = qd;
 
     double base_cqb, base_cqg, base_cqd;
-    if (is_gear2) {
+    if (is_gear3) {
+        base_cqb = ag3 * s3[st + 11] + ag2 * s2[st + 11] + ag1 * s1[st + 11] + ag0 * qb_st;
+        base_cqg = ag3 * s3[st + 13] + ag2 * s2[st + 13] + ag1 * s1[st + 13] + ag0 * qg_st;
+        base_cqd = ag3 * s3[st + 15] + ag2 * s2[st + 15] + ag1 * s1[st + 15] + ag0 * qd_st;
+    } else if (is_gear2) {
         base_cqb = ag2 * s2[st + 11] + ag1 * s1[st + 11] + ag0 * qb_st;
         base_cqg = ag2 * s2[st + 13] + ag1 * s1[st + 13] + ag0 * qg_st;
         base_cqd = ag2 * s2[st + 15] + ag1 * s1[st + 15] + ag0 * qd_st;
@@ -1109,11 +1161,12 @@ extern void bsim4_apple_eval_batch(
     const double vgs_in[B4A_W],
     const double vbs_in[B4A_W],
     double ckt_gmin,
-    double ag0, double ag1, double ag2,
-    int is_gear2, int is_trap2,
+    double ag0, double ag1, double ag2, double ag3,
+    int is_gear3, int is_gear2, int is_trap2,
     double * restrict s0,
     const double * restrict s1,
     const double * restrict s2,
+    const double * restrict s3,
     BSIM4AppleOut * restrict out,
     int need_aos,
     int dc_only);
@@ -2451,11 +2504,12 @@ bsim4_apple_p3_cv_jct(
     BSIM4AppleStamp * const spts[B4A_W],
     BSIM4AppleL2 * const l2pts[B4A_W],
     int nact,
-    double ag0, double ag1, double ag2,
-    int is_gear2, int is_trap2,
+    double ag0, double ag1, double ag2, double ag3,
+    int is_gear3, int is_gear2, int is_trap2,
     double * restrict s0,
     const double * restrict s1,
     const double * restrict s2,
+    const double * restrict s3,
     int need_aos)
 {
     const vad z0 = va_set1(0.0);
@@ -3006,7 +3060,8 @@ bsim4_apple_p3_cv_jct(
     for (int l = 0; l < nact; l++) {
         bsim4_apple_l2_assemble_one(cpts[l], l2pts[l], spts[l],
                                     l2pts[l]->a_vds, l2pts[l]->a_vgs, l2pts[l]->a_vbs, 0,
-                                    ag0, ag1, ag2, is_gear2, is_trap2, s0, s1, s2);
+                                    ag0, ag1, ag2, ag3, is_gear3, is_gear2, is_trap2,
+                                    s0, s1, s2, s3);
     }
 }
 
@@ -3022,11 +3077,12 @@ bsim4_apple_eval_batch(
     const double vgs_in[B4A_W],
     const double vbs_in[B4A_W],
     double ckt_gmin,
-    double ag0, double ag1, double ag2,
-    int is_gear2, int is_trap2,
+    double ag0, double ag1, double ag2, double ag3,
+    int is_gear3, int is_gear2, int is_trap2,
     double * restrict s0,
     const double * restrict s1,
     const double * restrict s2,
+    const double * restrict s3,
     BSIM4AppleOut * restrict out,
     int need_aos,
     int dc_only)
@@ -3050,8 +3106,8 @@ bsim4_apple_eval_batch(
 
     if (!dc_only) {
         bsim4_apple_p3_cv_jct(pp, &pipe, jpts, cpts, spts, l2pts,
-                              nact, ag0, ag1, ag2, is_gear2, is_trap2,
-                              s0, s1, s2, need_aos);
+                              nact, ag0, ag1, ag2, ag3, is_gear3, is_gear2, is_trap2,
+                              s0, s1, s2, s3, need_aos);
     } else {
         for (int l = 0; l < nact; l++) {
             int st = cpts[l]->stateBase;

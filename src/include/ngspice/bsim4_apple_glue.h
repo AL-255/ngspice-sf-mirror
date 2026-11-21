@@ -34,7 +34,8 @@ B4P(isAvxEligibleTran)(CKTcircuit *ckt)
     if (ckt->CKTbypass)
         return 0;
     if ((ckt->CKTintegrateMethod != GEAR && ckt->CKTintegrateMethod != TRAPEZOIDAL) ||
-        (ckt->CKTorder != 1 && ckt->CKTorder != 2))
+        !(ckt->CKTorder == 1 || ckt->CKTorder == 2 ||
+          (ckt->CKTintegrateMethod == GEAR && ckt->CKTorder == 3)))
         return 0;
     return 1;
 }
@@ -65,30 +66,114 @@ B4P(isAvxEligibleDcOp)(CKTcircuit *ckt)
     return 1;
 }
 
-/* Temporary no-op stubs for Stage 12 merge compilation; replaced by Apple BSIM4 port */
 void
 B4P(freeAvxLatent)(void *p)
 {
-    (void)p;
+    BSIM4AppleLatentState *lat = (BSIM4AppleLatentState *)p;
+    if (!lat) return;
+    if (getenv("NGSPICE_MR_STATS") != NULL && lat->statCalls > 0) {
+        double avg_f = (double)lat->statFrozenSum / (double)lat->statCalls;
+        double pct = 100.0 * avg_f / (double)(lat->nElig > 0 ? lat->nElig : 1);
+        fprintf(stderr,
+                "[MR_LATENT] insts=%d calls=%llu avg_frozen=%.1f (%.1f%%) freezes=%llu wakes=%llu resets=%llu fail(val=%llu icap=%llu cache=%llu snap=%llu)\n",
+                lat->nElig, lat->statCalls, avg_f, pct,
+                lat->statFreezes, lat->statWakes, lat->statResets,
+                lat->statFailValid, lat->statFailIcap, lat->statFailCache, lat->statFailSnap);
+    }
+    free(lat->latentFrozen);
+    free(lat->latentStreak);
+    free(lat->instGroup);
+    free(lat->activeList);
+    free(lat->activePos);
+    free(lat->grpActiveList);
+    free(lat->grpActivePos);
+    free(lat->grpActiveCnt);
+    free(lat->nodeInstPtr);
+    free(lat->nodeInstIdx);
+    free(lat->vSnap);
+    free(lat->nodeFrozenCnt);
+    free(lat->cfFastList);
+    free(lat->cfGrpStart);
+    free(lat->cfGrpCnt);
+    free(lat->cfIsFastInst);
+    free(lat);
 }
 
 #ifdef KLU
-static inline void
-B4P(latentUnfreezeAll)(B4P(model) *head, CKTcircuit *ckt, KLUmatrix *km)
+static void B4P(latentUnfreezeAll)(B4P(model) *head, CKTcircuit *ckt, KLUmatrix *km);
+#endif
+
+static inline int
+B4P(mrLatentEnabled)(void)
 {
-    (void)head;
-    (void)ckt;
-    (void)km;
+    static int init = 0, en = 1;
+    if (!init) {
+        en = 1;
+        if (getenv("NGSPICE_NO_MR_LATENT") != NULL) {
+            en = 0;
+        } else {
+            const char *v = getenv("NGSPICE_MR_LATENT");
+            if (v != NULL && v[0] != '\0')
+                en = (v[0] != '0');
+        }
+        init = 1;
+    }
+    return en;
 }
 
-static inline void
-B4P(latentSync)(B4P(model) *head, CKTcircuit *ckt, KLUmatrix *km)
+static inline double
+B4P(mrLatentVtol)(const CKTcircuit *ckt)
 {
-    (void)head;
-    (void)ckt;
-    (void)km;
+    static int init = 0, has_ov = 0;
+    static double ov = 1.0e-5;
+    if (!init) {
+        const char *v = getenv("NGSPICE_MR_LATENT_VTOL");
+        if (v && v[0]) {
+            ov = atof(v);
+            has_ov = 1;
+        }
+        init = 1;
+    }
+    if (has_ov) return ov;
+    double vt = ckt->CKTvoltTol;
+    double vcap = (ckt->CKTmaxEqNum >= 10000) ? 1.0e-4 : 1.0e-5;
+    return (vt < vcap) ? vt : vcap;
 }
-#endif /* KLU */
+
+static inline double
+B4P(mrLatentItol)(const CKTcircuit *ckt)
+{
+    static int init = 0, has_ov = 0;
+    static double ov = 0.0;
+    if (!init) {
+        const char *v = getenv("NGSPICE_MR_LATENT_ITOL");
+        if (v && v[0]) {
+            ov = atof(v);
+            has_ov = 1;
+        }
+        init = 1;
+    }
+    if (has_ov) return ov;
+    double base = 2.0 * ckt->CKTabstol;
+    if (ckt->CKTmaxEqNum >= 10000 && ckt->CKTvoltTol > 2.0e-6)
+        base *= (ckt->CKTvoltTol / 1.0e-6);
+    return base;
+}
+
+static inline int
+B4P(mrLatentStreakReq)(void)
+{
+    static int init = 0, req = 3;
+    if (!init) {
+        const char *v = getenv("NGSPICE_MR_LATENT_STREAK");
+        if (v && v[0]) {
+            int k = atoi(v);
+            if (k >= 1 && k <= 20) req = k;
+        }
+        init = 1;
+    }
+    return req;
+}
 
 void
 B4P(freeApplePack)(B4P(model) *head)
@@ -461,6 +546,11 @@ B4P(ensureAvxPack)(B4P(model) *head, CKTcircuit *ckt)
         head->B4P(AvxKluNz) == nz)
         return;
 
+#ifdef KLU
+    if (head->B4P(AvxLatent) && ckt->CKTmatrix && ckt->CKTmatrix->CKTkluMODE &&
+        ckt->CKTmatrix->SMPkluMatrix)
+        B4P(latentUnfreezeAll)(head, ckt, ckt->CKTmatrix->SMPkluMatrix);
+#endif
     B4P(freeApplePack)(head);
     FREE(head->B4P(AvxFallbackIdx));
     head->B4P(AvxFallbackCount) = 0;
@@ -731,6 +821,7 @@ B4P(syncAvxDynFromInst)(B4P(model) *head)
         sp->von = InstArray[c->instIdx]->B4P(von);
         c->phys_valid = 0;
         c->stamp_valid = 0;
+        c->last_active_step = -100;
     }
     pack->step_valid = 0;
     head->B4P(AvxDynValid) = 1;
@@ -1005,18 +1096,702 @@ B4P(scatterAosOne)(B4P(instance) *here, const BSIM4AppleOut *out, int lane)
     here->B4P(ggisld) = -(out->ggisls[lane] + out->ggislg[lane] + out->ggislb[lane]);
 }
 
+#ifdef KLU
+static inline int
+B4P(collectUniqueNodesInst)(const BSIM4AppleCheck * restrict c, int N, int out[4])
+{
+    int nu = 0;
+    int nd[4] = { c->dNodePrime, c->gNodePrime, c->sNodePrime, c->bNodePrime };
+    for (int t = 0; t < 4; t++) {
+        int u = nd[t];
+        if (u <= 0 || u >= N) continue;
+        int dup = 0;
+        for (int k = 0; k < nu; k++) {
+            if (out[k] == u) { dup = 1; break; }
+        }
+        if (!dup) out[nu++] = u;
+    }
+    return nu;
+}
+
+static inline void
+B4P(stampFrozenDelta)(
+    const BSIM4AppleCheck * restrict c,
+    const BSIM4AppleStamp * restrict sp,
+    const BSIM4AppleL2 * restrict l2,
+    B4P(instance) **InstArray,
+    KLUmatrix *km,
+    double ag0,
+    double sign)
+{
+    int inz = (int)km->KLUmatrixNZ;
+    double * restrict ldc  = km->KLUmatrixAxLatentDC;
+    double * restrict lcap = km->KLUmatrixAxLatentCap;
+    double * restrict rdc  = km->KLUmatrixRhsLatentDC;
+    double * restrict rcap = km->KLUmatrixRhsLatentCap;
+    int upd_rcb = (km->KLUmatrixResCapValid && km->KLUmatrixResCapHasLatent &&
+                   km->KLUmatrixResCapAg0 == ag0 && km->KLUmatrixAxResCapBase != NULL);
+    if (!upd_rcb)
+        km->KLUmatrixResCapValid = 0;
+    double * restrict rcb = upd_rcb ? km->KLUmatrixAxResCapBase : NULL;
+
+    double vm    = l2->m * sign;
+    double mtype = l2->mtype * sign;
+
+    double u_ceqqg = l2->q_lin_g * mtype;
+    double u_ceqqd = l2->q_lin_d * mtype;
+    double u_ceqqb = l2->q_lin_b * mtype;
+
+    double drhsd = l2->mdc_rhsd * sign;
+    double drhsb = l2->mdc_rhsb * sign;
+    double drhss = l2->mdc_rhss * sign;
+    double crhsd = -u_ceqqd;
+    double crhsg = -u_ceqqg;
+    double crhsb = -u_ceqqb;
+    double crhss = u_ceqqg + u_ceqqb + u_ceqqd;
+
+    double c34 = l2->Cggb * vm, c35 = l2->Cgdb * vm, c36 = l2->Cgsb * vm;
+    double c37 = -(c34 + c35 + c36);
+    double c44 = l2->Cddb * vm, c46 = l2->Cdgb * vm, c47 = l2->Cdsb * vm;
+    double c48 = -(c46 + c44 + c47);
+    double c51 = l2->Csdb * vm, c52 = l2->Csgb * vm, c53 = l2->Cssb * vm;
+    double c55 = -(c52 + c51 + c53);
+    double c58 = l2->Cbdb * vm, c59 = l2->Cbgb * vm, c60 = l2->Cbsb * vm;
+    double c61 = -(c59 + c58 + c60);
+
+    double d44 =  l2->mdc44 * sign, d46 =  l2->mdc46 * sign;
+    double d47 = -l2->mdc47 * sign, d48 = -l2->mdc48 * sign;
+    double d51 = -l2->mdc51 * sign, d52 =  l2->mdc52 * sign;
+    double d53 =  l2->mdc53 * sign, d55 = -l2->mdc55 * sign;
+    double d58 =  l2->mdc58 * sign, d59 =  l2->mdc59 * sign;
+    double d60 =  l2->mdc60 * sign, d61 =  l2->mdc61 * sign;
+
+#define B4A_LAT_ADD_CAP(o, cv) do { \
+    int _o = (o); \
+    if (_o < inz) { \
+        lcap[_o] += (cv); \
+        if (upd_rcb) rcb[_o] += ag0 * (cv); \
+    } \
+} while (0)
+
+#define B4A_LAT_ADD_BOTH(o, dv, cv) do { \
+    int _o = (o); \
+    if (_o < inz) { \
+        ldc[_o]  += (dv); \
+        lcap[_o] += (cv); \
+        if (upd_rcb) rcb[_o] += (dv) + ag0 * (cv); \
+    } \
+} while (0)
+
+    const int * restrict off = sp->kluOff;
+    int dn = c->dNodePrime;
+    int gn = c->gNodePrime;
+    int sn = c->sNodePrime;
+    int bn = c->bNodePrime;
+    if (dn) { rdc[dn] += drhsd; rcap[dn] += crhsd; }
+    if (gn) { rcap[gn] += crhsg; }
+    if (bn) { rdc[bn] += drhsb; rcap[bn] += crhsb; }
+    if (sn) { rdc[sn] += drhss; rcap[sn] += crhss; }
+
+    B4A_LAT_ADD_CAP(off[0], c34);
+    B4A_LAT_ADD_CAP(off[1], c35);
+    B4A_LAT_ADD_BOTH(off[4], d44, c44);
+    B4A_LAT_ADD_BOTH(off[5], d46, c46);
+    if (sn != 0 && bn != 0) {
+        B4A_LAT_ADD_CAP(off[2], c36);
+        B4A_LAT_ADD_CAP(off[3], c37);
+        B4A_LAT_ADD_BOTH(off[6],  d47, c47);
+        B4A_LAT_ADD_BOTH(off[7],  d48, c48);
+        B4A_LAT_ADD_BOTH(off[8],  d51, c51);
+        B4A_LAT_ADD_BOTH(off[9],  d52, c52);
+        B4A_LAT_ADD_BOTH(off[10], d53, c53);
+        B4A_LAT_ADD_BOTH(off[11], d55, c55);
+        B4A_LAT_ADD_BOTH(off[12], d58, c58);
+        B4A_LAT_ADD_BOTH(off[13], d59, c59);
+        B4A_LAT_ADD_BOTH(off[14], d60, c60);
+        B4A_LAT_ADD_BOTH(off[15], d61, c61);
+    } else if (sn != 0) {
+        B4A_LAT_ADD_CAP(off[2], c36);
+        B4A_LAT_ADD_BOTH(off[6],  d47, c47);
+        B4A_LAT_ADD_BOTH(off[8],  d51, c51);
+        B4A_LAT_ADD_BOTH(off[9],  d52, c52);
+        B4A_LAT_ADD_BOTH(off[10], d53, c53);
+    } else if (bn != 0) {
+        B4A_LAT_ADD_CAP(off[3], c37);
+        B4A_LAT_ADD_BOTH(off[7],  d48, c48);
+        B4A_LAT_ADD_BOTH(off[12], d58, c58);
+        B4A_LAT_ADD_BOTH(off[13], d59, c59);
+        B4A_LAT_ADD_BOTH(off[15], d61, c61);
+    }
+
+    if (__builtin_expect(c->has_dint | c->has_sint, 0)) {
+        B4P(instance) *here = InstArray[c->instIdx];
+        uintptr_t ax_addr = (uintptr_t)km->KLUmatrixAx;
+        size_t ax_bytes = (size_t)inz * sizeof(double);
+        if (c->has_dint) {
+            double mgd = sp->mgd * sign;
+            int o16 = B4P(ptrToKluOff)(here->B4P(DPdPtr), ax_addr, ax_bytes, inz);
+            int o17 = B4P(ptrToKluOff)(here->B4P(DdpPtr), ax_addr, ax_bytes, inz);
+            int o18 = B4P(ptrToKluOff)(here->B4P(DdPtr),  ax_addr, ax_bytes, inz);
+            if (o16 < inz) { ldc[o16] -= mgd; if (upd_rcb) rcb[o16] -= mgd; }
+            if (o17 < inz) { ldc[o17] -= mgd; if (upd_rcb) rcb[o17] -= mgd; }
+            if (o18 < inz) { ldc[o18] += mgd; if (upd_rcb) rcb[o18] += mgd; }
+        }
+        if (c->has_sint) {
+            double mgs = sp->mgs * sign;
+            int o19 = B4P(ptrToKluOff)(here->B4P(SPsPtr), ax_addr, ax_bytes, inz);
+            int o20 = B4P(ptrToKluOff)(here->B4P(SspPtr), ax_addr, ax_bytes, inz);
+            int o21 = B4P(ptrToKluOff)(here->B4P(SsPtr),  ax_addr, ax_bytes, inz);
+            if (o19 < inz) { ldc[o19] -= mgs; if (upd_rcb) rcb[o19] -= mgs; }
+            if (o20 < inz) { ldc[o20] -= mgs; if (upd_rcb) rcb[o20] -= mgs; }
+            if (o21 < inz) { ldc[o21] += mgs; if (upd_rcb) rcb[o21] += mgs; }
+        }
+    }
+#undef B4A_LAT_ADD_CAP
+#undef B4A_LAT_ADD_BOTH
+    km->KLUmatrixLatentOps++;
+}
+
+static inline void
+B4P(syncFrozenStateOnWake)(
+    const BSIM4AppleCheck * restrict c,
+    const BSIM4AppleL2 * restrict l2,
+    CKTcircuit *ckt,
+    int sync_s0)
+{
+    double *s0 = ckt->CKTstate0;
+    double *s1 = ckt->CKTstate1;
+    double *s2 = ckt->CKTstate2;
+    double *s3 = ckt->CKTstates[3];
+    double *s4 = ckt->CKTstates[4];
+    int st = c->stateBase;
+    double vbd = l2->a_vbd, vbs = l2->a_vbs, vgs = l2->a_vgs, vds = l2->a_vds;
+    double qb  = l2->qb_st, qg  = l2->qg_st, qd  = l2->qd_st;
+    if (s1) {
+        s1[st + 0]  = vbd; s1[st + 1]  = vbs; s1[st + 2]  = vgs; s1[st + 3]  = vds;
+        s1[st + 11] = qb;  s1[st + 12] = 0.0;
+        s1[st + 13] = qg;  s1[st + 14] = 0.0;
+        s1[st + 15] = qd;  s1[st + 16] = 0.0;
+    }
+    if (s2) {
+        s2[st + 0]  = vbd; s2[st + 1]  = vbs; s2[st + 2]  = vgs; s2[st + 3]  = vds;
+        s2[st + 11] = qb;  s2[st + 12] = 0.0;
+        s2[st + 13] = qg;  s2[st + 14] = 0.0;
+        s2[st + 15] = qd;  s2[st + 16] = 0.0;
+    }
+    if (s3) {
+        s3[st + 11] = qb; s3[st + 13] = qg; s3[st + 15] = qd;
+    }
+    if (s4) {
+        s4[st + 11] = qb; s4[st + 13] = qg; s4[st + 15] = qd;
+    }
+    if (sync_s0 && s0) {
+        s0[st + 0]  = vbd; s0[st + 1]  = vbs; s0[st + 2]  = vgs; s0[st + 3]  = vds;
+        s0[st + 11] = qb;  s0[st + 12] = 0.0;
+        s0[st + 13] = qg;  s0[st + 14] = 0.0;
+        s0[st + 15] = qd;  s0[st + 16] = 0.0;
+    }
+}
+
+static void
+B4P(latentUnfreezeAll)(B4P(model) *head, CKTcircuit *ckt, KLUmatrix *km)
+{
+    BSIM4AppleLatentState *lat = (BSIM4AppleLatentState *)head->B4P(AvxLatent);
+    if (!lat || lat->nFrozen == 0)
+        return;
+    BSIM4ApplePack *pack = (BSIM4ApplePack *)head->B4P(AvxBlocks);
+    if (!pack) return;
+    BSIM4AppleCheck *checks = pack->checks;
+    const BSIM4AppleStamp *stamps = pack->stamps;
+    const BSIM4AppleL2 *l2s = pack->l2s;
+    B4P(instance) **InstArray = head->B4P(InstanceArray);
+    int nElig = lat->nElig;
+    int nGroups = lat->nGroups;
+    int sync_s0 = ((ckt->CKTmode & MODETRAN) && !(ckt->CKTmode & MODEINITPRED));
+    double ag0 = ckt->CKTag[0];
+    int acc = ckt->CKTstat->STATaccepted;
+    int all_mine = (km && km->KLUmatrixLatentCount == lat->nFrozen);
+
+    for (int i = 0; i < nElig; i++) {
+        if (lat->latentFrozen[i]) {
+            if (!all_mine && km && km->KLUmatrixAxLatentDC)
+                B4P(stampFrozenDelta)(&checks[i], &stamps[i], &l2s[i], InstArray, km, ag0, -1.0);
+            if (ckt->CKTmode & MODETRAN)
+                B4P(syncFrozenStateOnWake)(&checks[i], &l2s[i], ckt, sync_s0);
+            lat->latentFrozen[i] = 0;
+            lat->latentStreak[i] = 0;
+            checks[i].stamp_valid = 0;
+            checks[i].last_active_step = acc;
+        }
+        lat->activeList[i] = i;
+        lat->activePos[i] = i;
+    }
+    for (int gi = 0; gi < nGroups; gi++) {
+        int goff = pack->groups[gi].offset;
+        int gcnt = pack->groups[gi].count;
+        lat->grpActiveCnt[gi] = gcnt;
+        for (int k = 0; k < gcnt; k++) {
+            lat->grpActiveList[goff + k] = goff + k;
+            lat->grpActivePos[goff + k] = k;
+        }
+    }
+    if (km) {
+        km->KLUmatrixLatentCount -= lat->nFrozen;
+        if (km->KLUmatrixLatentCount <= 0) {
+            km->KLUmatrixLatentCount = 0;
+            km->KLUmatrixLatentOps = 0;
+            km->KLUmatrixResCapValid = 0;
+            if (km->KLUmatrixAxLatentDC)
+                memset(km->KLUmatrixAxLatentDC, 0, ((size_t)km->KLUmatrixNZ + 1) * sizeof(double));
+            if (km->KLUmatrixAxLatentCap)
+                memset(km->KLUmatrixAxLatentCap, 0, ((size_t)km->KLUmatrixNZ + 1) * sizeof(double));
+            if (km->KLUmatrixRhsLatentDC && km->KLUmatrixRhsLatentLen > 0)
+                memset(km->KLUmatrixRhsLatentDC, 0, (size_t)km->KLUmatrixRhsLatentLen * sizeof(double));
+            if (km->KLUmatrixRhsLatentCap && km->KLUmatrixRhsLatentLen > 0)
+                memset(km->KLUmatrixRhsLatentCap, 0, (size_t)km->KLUmatrixRhsLatentLen * sizeof(double));
+        }
+    }
+    memset(lat->nodeFrozenCnt, 0, (size_t)(lat->nNodes + 1) * sizeof(int));
+    lat->nActive = nElig;
+    lat->nFrozen = 0;
+    lat->cfEpoch = 0;
+}
+
+static int
+B4P(ensureLatentBuffers)(KLUmatrix *km, int rhs_len)
+{
+    int nz = (int)km->KLUmatrixNZ;
+    if (!km->KLUmatrixAxLatentDC) {
+        if (posix_memalign((void **)&km->KLUmatrixAxLatentDC, 128, ((size_t)nz + 1) * sizeof(double)) != 0)
+            km->KLUmatrixAxLatentDC = NULL;
+        else
+            memset(km->KLUmatrixAxLatentDC, 0, ((size_t)nz + 1) * sizeof(double));
+    }
+    if (!km->KLUmatrixAxLatentCap) {
+        if (posix_memalign((void **)&km->KLUmatrixAxLatentCap, 128, ((size_t)nz + 1) * sizeof(double)) != 0)
+            km->KLUmatrixAxLatentCap = NULL;
+        else
+            memset(km->KLUmatrixAxLatentCap, 0, ((size_t)nz + 1) * sizeof(double));
+    }
+    if (km->KLUmatrixRhsLatentLen < rhs_len || !km->KLUmatrixRhsLatentDC || !km->KLUmatrixRhsLatentCap) {
+        free(km->KLUmatrixRhsLatentDC);
+        free(km->KLUmatrixRhsLatentCap);
+        km->KLUmatrixRhsLatentDC = NULL;
+        km->KLUmatrixRhsLatentCap = NULL;
+        km->KLUmatrixRhsLatentLen = 0;
+        if (posix_memalign((void **)&km->KLUmatrixRhsLatentDC, 128, (size_t)rhs_len * sizeof(double)) == 0 &&
+            posix_memalign((void **)&km->KLUmatrixRhsLatentCap, 128, (size_t)rhs_len * sizeof(double)) == 0)
+        {
+            memset(km->KLUmatrixRhsLatentDC, 0, (size_t)rhs_len * sizeof(double));
+            memset(km->KLUmatrixRhsLatentCap, 0, (size_t)rhs_len * sizeof(double));
+            km->KLUmatrixRhsLatentLen = rhs_len;
+        }
+    }
+    return (km->KLUmatrixAxLatentDC && km->KLUmatrixAxLatentCap &&
+            km->KLUmatrixRhsLatentDC && km->KLUmatrixRhsLatentCap);
+}
+
+static BSIM4AppleLatentState *
+B4P(ensureLatentState)(B4P(model) *head, CKTcircuit *ckt)
+{
+    BSIM4ApplePack *pack = (BSIM4ApplePack *)head->B4P(AvxBlocks);
+    if (!pack) return NULL;
+    int nElig = pack->nElig;
+    int nGroups = pack->nGroups;
+    int N = ckt->CKTmaxEqNum;
+    BSIM4AppleLatentState *lat = (BSIM4AppleLatentState *)head->B4P(AvxLatent);
+    if (lat && lat->nElig == nElig && lat->nGroups == nGroups && lat->nNodes == N)
+        return lat;
+
+    B4P(freeAvxLatent)(lat);
+    head->B4P(AvxLatent) = NULL;
+    if (nElig <= 32 || nGroups <= 0 || N <= 1)
+        return NULL;
+
+    lat = (BSIM4AppleLatentState *)calloc(1, sizeof(BSIM4AppleLatentState));
+    if (!lat) return NULL;
+    lat->nElig = nElig;
+    lat->nGroups = nGroups;
+    lat->nNodes = N;
+    lat->nActive = nElig;
+    lat->nFrozen = 0;
+    lat->lastAccepted = -1;
+    lat->lastGmin = ckt->CKTgmin;
+
+    lat->latentFrozen  = (uint8_t *)calloc((size_t)nElig, sizeof(uint8_t));
+    lat->latentStreak  = (uint8_t *)calloc((size_t)nElig, sizeof(uint8_t));
+    lat->instGroup     = (int *)malloc((size_t)nElig * sizeof(int));
+    lat->activeList    = (int *)malloc((size_t)nElig * sizeof(int));
+    lat->activePos     = (int *)malloc((size_t)nElig * sizeof(int));
+    lat->grpActiveList = (int *)malloc((size_t)nElig * sizeof(int));
+    lat->grpActivePos  = (int *)malloc((size_t)nElig * sizeof(int));
+    lat->grpActiveCnt  = (int *)malloc((size_t)nGroups * sizeof(int));
+    lat->nodeInstPtr   = (int *)calloc((size_t)(N + 2), sizeof(int));
+    lat->vSnap         = (double *)calloc((size_t)(N + 1), sizeof(double));
+    lat->nodeFrozenCnt = (int *)calloc((size_t)(N + 1), sizeof(int));
+    lat->cfFastList    = (int *)malloc((size_t)nElig * sizeof(int));
+    lat->cfGrpStart    = (int *)malloc((size_t)nGroups * sizeof(int));
+    lat->cfGrpCnt      = (int *)calloc((size_t)nGroups, sizeof(int));
+    lat->cfIsFastInst  = (unsigned char *)calloc((size_t)nElig, sizeof(unsigned char));
+
+    if (!lat->latentFrozen || !lat->latentStreak || !lat->instGroup ||
+        !lat->activeList || !lat->activePos || !lat->grpActiveList ||
+        !lat->grpActivePos || !lat->grpActiveCnt || !lat->nodeInstPtr ||
+        !lat->vSnap || !lat->nodeFrozenCnt || !lat->cfFastList ||
+        !lat->cfGrpStart || !lat->cfGrpCnt || !lat->cfIsFastInst)
+    {
+        B4P(freeAvxLatent)(lat);
+        return NULL;
+    }
+
+    const BSIM4AppleCheck *checks = pack->checks;
+    for (int gi = 0; gi < nGroups; gi++) {
+        int goff = pack->groups[gi].offset;
+        int gcnt = pack->groups[gi].count;
+        lat->grpActiveCnt[gi] = gcnt;
+        for (int k = 0; k < gcnt; k++) {
+            int idx = goff + k;
+            lat->instGroup[idx] = gi;
+            lat->grpActiveList[idx] = idx;
+            lat->grpActivePos[idx] = k;
+        }
+    }
+
+    int uniq[4];
+    for (int i = 0; i < nElig; i++) {
+        lat->activeList[i] = i;
+        lat->activePos[i] = i;
+        int nu = B4P(collectUniqueNodesInst)(&checks[i], N, uniq);
+        for (int k = 0; k < nu; k++)
+            lat->nodeInstPtr[uniq[k] + 1]++;
+    }
+    for (int i = 1; i <= N; i++)
+        lat->nodeInstPtr[i] += lat->nodeInstPtr[i - 1];
+    int total = lat->nodeInstPtr[N];
+    lat->nodeInstIdx = (int *)malloc((size_t)(total > 0 ? total : 1) * sizeof(int));
+    int *cur = (int *)malloc((size_t)(N + 1) * sizeof(int));
+    if (!lat->nodeInstIdx || !cur) {
+        free(cur);
+        B4P(freeAvxLatent)(lat);
+        return NULL;
+    }
+    memcpy(cur, lat->nodeInstPtr, (size_t)(N + 1) * sizeof(int));
+    for (int i = 0; i < nElig; i++) {
+        int nu = B4P(collectUniqueNodesInst)(&checks[i], N, uniq);
+        for (int k = 0; k < nu; k++)
+            lat->nodeInstIdx[cur[uniq[k]]++] = i;
+    }
+    free(cur);
+
+    head->B4P(AvxLatent) = lat;
+    return lat;
+}
+
+static void
+B4P(latentSync)(B4P(model) *head, CKTcircuit *ckt, KLUmatrix *km)
+{
+    int lat_en = B4P(mrLatentEnabled)();
+    int cf_active = ckt->CKTmrSubActive;
+    BSIM4ApplePack *pack = (BSIM4ApplePack *)head->B4P(AvxBlocks);
+    BSIM4AppleLatentState *lat_cur = (BSIM4AppleLatentState *)head->B4P(AvxLatent);
+
+    /* Restore slow unfrozen BSIM4 instances' states when returning from a compound-fast micro-burst */
+    int cf_just_synced = 0;
+    if (!cf_active && lat_cur && lat_cur->cfNeedsSync && pack) {
+        BSIM4AppleCheck *checks = pack->checks;
+        const BSIM4AppleL2 *l2s = pack->l2s;
+        int nElig = lat_cur->nElig;
+        int sync_s0 = ((ckt->CKTmode & MODETRAN) && !(ckt->CKTmode & MODEINITPRED));
+        for (int i = 0; i < nElig; i++) {
+            if (!lat_cur->cfIsFastInst[i] && !lat_cur->latentFrozen[i]) {
+                if (checks[i].phys_valid && (ckt->CKTmode & MODETRAN))
+                    B4P(syncFrozenStateOnWake)(&checks[i], &l2s[i], ckt, sync_s0);
+                checks[i].stamp_valid = 0;
+            }
+        }
+        lat_cur->cfNeedsSync = 0;
+        cf_just_synced = 1;
+    }
+
+    if (!lat_en && !cf_active)
+        return;
+
+    int nFb = head->B4P(AvxFallbackCount);
+    int nthreads = 1;
+#ifdef USE_OMP
+    nthreads = omp_get_max_threads();
+#endif
+    int eligible = (head->B4P(AvxBuilt) && head->B4P(AvxDynValid) && pack &&
+                    B4P(isAvxEligibleTran)(ckt) && !B4P(AvxNeedAosSync) &&
+                    pack->nElig > 32 && nFb == 0 && nthreads == 1 &&
+                    ckt->CKTtime > 0.0 && ckt->CKTsenInfo == NULL);
+    if (!eligible) {
+        if (lat_en)
+            B4P(latentUnfreezeAll)(head, ckt, km);
+        return;
+    }
+
+    BSIM4AppleLatentState *lat = B4P(ensureLatentState)(head, ckt);
+    if (!lat) return;
+
+    BSIM4AppleCheck *checks = pack->checks;
+    const BSIM4AppleStamp *stamps = pack->stamps;
+    const BSIM4AppleL2 *l2s = pack->l2s;
+    B4P(instance) **InstArray = head->B4P(InstanceArray);
+    int nElig = lat->nElig;
+    int nGroups = lat->nGroups;
+    int N = lat->nNodes;
+    int acc = ckt->CKTstat->STATaccepted;
+    double ag0 = ckt->CKTag[0];
+
+    if (lat_en) {
+        int rhs_len = (int)km->KLUmatrixNrhs + 1;
+        if (rhs_len < ckt->CKTmaxEqNum + 1) rhs_len = ckt->CKTmaxEqNum + 1;
+        if (!B4P(ensureLatentBuffers)(km, rhs_len))
+            goto build_cf_list;
+
+        double vtol = B4P(mrLatentVtol)(ckt);
+        if (vtol < 0.0) {
+            B4P(latentUnfreezeAll)(head, ckt, km);
+            goto build_cf_list;
+        }
+
+        if (ckt->CKTgmin != lat->lastGmin || km->KLUmatrixLatentOps > 65536 || acc < lat->lastAccepted) {
+            if (lat->nFrozen > 0)
+                lat->statResets++;
+            B4P(latentUnfreezeAll)(head, ckt, km);
+            lat->lastGmin = ckt->CKTgmin;
+            lat->lastAccepted = acc;
+            lat->cfEpoch = 0;
+        }
+
+        const double * restrict rhsOld = ckt->CKTrhsOld;
+        int is_pred = ((ckt->CKTmode & MODEINITPRED) != 0);
+
+        /* 1. Exact node-based wake-up pass (fast nodes only during micro-steps!) */
+        if (lat->nFrozen > 0) {
+            double half_wake = 0.5 * vtol;
+            const int * restrict fcnt = lat->nodeFrozenCnt;
+            double * restrict vsnap = lat->vSnap;
+            const int * restrict niptr = lat->nodeInstPtr;
+            const int * restrict niidx = lat->nodeInstIdx;
+            int uniq[4];
+            int woke_any = 0;
+
+            int sub_only = (cf_active && ckt->CKTmrFastNodes && ckt->CKTmrSubNFast > 0);
+            int n_loop = sub_only ? ckt->CKTmrSubNFast : (N - 1);
+            for (int li = 0; li < n_loop; li++) {
+                int node = sub_only ? ckt->CKTmrFastNodes[li] : (li + 1);
+                if (node <= 0 || node >= N || fcnt[node] == 0) continue;
+                double vnow = rhsOld[node];
+                if (fabs(vnow - vsnap[node]) <= half_wake) continue;
+                vsnap[node] = vnow;
+                int p0 = niptr[node], p1 = niptr[node + 1];
+                for (int p = p0; p < p1; p++) {
+                    int idx = niidx[p];
+                    if (!lat->latentFrozen[idx]) continue;
+                    BSIM4AppleCheck *c = &checks[idx];
+                    B4P(stampFrozenDelta)(c, &stamps[idx], &l2s[idx], InstArray, km, ag0, -1.0);
+                    int nu = B4P(collectUniqueNodesInst)(c, N, uniq);
+                    for (int k = 0; k < nu; k++)
+                        lat->nodeFrozenCnt[uniq[k]]--;
+                    B4P(syncFrozenStateOnWake)(c, &l2s[idx], ckt, !is_pred);
+                    lat->latentFrozen[idx] = 0;
+                    lat->latentStreak[idx] = 0;
+                    c->stamp_valid = 0;
+                    c->last_active_step = acc;
+                    lat->activePos[idx] = lat->nActive;
+                    lat->activeList[lat->nActive++] = idx;
+                    int gi = lat->instGroup[idx];
+                    int goff = pack->groups[gi].offset;
+                    int gpos = lat->grpActiveCnt[gi]++;
+                    lat->grpActiveList[goff + gpos] = idx;
+                    lat->grpActivePos[idx] = gpos;
+                    lat->nFrozen--;
+                    km->KLUmatrixLatentCount--;
+                    lat->statWakes++;
+                    woke_any = 1;
+                }
+            }
+            if (woke_any)
+                lat->cfEpoch = 0;
+            if (km->KLUmatrixLatentCount <= 0) {
+                km->KLUmatrixLatentCount = 0;
+                km->KLUmatrixLatentOps = 0;
+                km->KLUmatrixResCapValid = 0;
+                memset(km->KLUmatrixAxLatentDC, 0, ((size_t)km->KLUmatrixNZ + 1) * sizeof(double));
+                memset(km->KLUmatrixAxLatentCap, 0, ((size_t)km->KLUmatrixNZ + 1) * sizeof(double));
+                memset(km->KLUmatrixRhsLatentDC, 0, (size_t)km->KLUmatrixRhsLatentLen * sizeof(double));
+                memset(km->KLUmatrixRhsLatentCap, 0, (size_t)km->KLUmatrixRhsLatentLen * sizeof(double));
+            }
+        }
+
+        /* 2. Freeze pass: only on full-circuit steps (not during compound-fast micro-bursts) */
+        if (!cf_active && acc > lat->lastAccepted && acc >= 3 && is_pred) {
+            const double * restrict v_acc =
+                (ckt->CKTtaPredActive && ckt->CKTtaSol[0]) ? ckt->CKTtaSol[0] : rhsOld;
+            int prev_acc = lat->lastAccepted;
+            int delta_acc = (prev_acc >= 0) ? (acc - prev_acc) : 1;
+            if (delta_acc < 1) delta_acc = 1;
+            lat->lastAccepted = acc;
+            int streak_req = B4P(mrLatentStreakReq)();
+            const double * restrict s1 = ckt->CKTstate1;
+            double reltol = ckt->CKTreltol;
+            double abstol = ckt->CKTabstol;
+            double icap_floor = B4P(mrLatentItol)(ckt);
+            double q_snap_tol = 0.4 * vtol;
+            int pack_gmin_ok = (pack->step_valid && pack->last_gmin == ckt->CKTgmin);
+            int uniq[4];
+
+            for (int ai = lat->nActive - 1; ai >= 0; ai--) {
+                int idx = lat->activeList[ai];
+                if (cf_just_synced && !lat->cfIsFastInst[idx])
+                    continue;
+                BSIM4AppleCheck *c = &checks[idx];
+                if (!pack_gmin_ok || !c->phys_valid || !c->stamp_valid) {
+                    lat->latentStreak[idx] = 0;
+                    lat->statFailValid++;
+                    continue;
+                }
+                int st = c->stateBase;
+                double tol_i = 0.1 * (reltol * fabs(c->Idtot) + abstol);
+                if (tol_i < icap_floor) tol_i = icap_floor;
+                if (fabs(s1[st + 12]) > tol_i ||
+                    fabs(s1[st + 14]) > tol_i ||
+                    fabs(s1[st + 16]) > tol_i)
+                {
+                    lat->latentStreak[idx] = 0;
+                    lat->statFailIcap++;
+                    continue;
+                }
+                double vs = v_acc[c->sNodePrime];
+                double t  = c->type;
+                double vds_r = (v_acc[c->dNodePrime] - vs) * t;
+                double vgs_r = (v_acc[c->gNodePrime] - vs) * t;
+                double vbs_r = (v_acc[c->bNodePrime] - vs) * t;
+                int ez = 0;
+                if (!B4P(instCacheMatch)(c, vds_r, vgs_r, vbs_r, vtol, reltol, abstol, &ez)) {
+                    lat->latentStreak[idx] = 0;
+                    lat->statFailCache++;
+                    continue;
+                }
+                int inc = (c->last_active_step <= prev_acc) ? delta_acc : 1;
+                int ns = (int)lat->latentStreak[idx] + inc;
+                lat->latentStreak[idx] = (uint8_t)(ns > 255 ? 255 : ns);
+                if ((int)lat->latentStreak[idx] < streak_req)
+                    continue;
+
+                int nu = B4P(collectUniqueNodesInst)(c, N, uniq);
+                int snap_ok = 1;
+                for (int k = 0; k < nu; k++) {
+                    int u = uniq[k];
+                    if (lat->nodeFrozenCnt[u] > 0 && fabs(v_acc[u] - lat->vSnap[u]) > q_snap_tol) {
+                        snap_ok = 0;
+                        break;
+                    }
+                }
+                if (!snap_ok) {
+                    lat->statFailSnap++;
+                    continue;
+                }
+
+                for (int k = 0; k < nu; k++) {
+                    int u = uniq[k];
+                    if (lat->nodeFrozenCnt[u] == 0)
+                        lat->vSnap[u] = v_acc[u];
+                    lat->nodeFrozenCnt[u]++;
+                }
+                B4P(stampFrozenDelta)(c, &stamps[idx], &l2s[idx], InstArray, km, ag0, +1.0);
+                lat->latentFrozen[idx] = 1;
+                int last_idx = lat->activeList[--lat->nActive];
+                lat->activeList[ai] = last_idx;
+                lat->activePos[last_idx] = ai;
+                lat->activePos[idx] = -1;
+                int gi = lat->instGroup[idx];
+                int goff = pack->groups[gi].offset;
+                int gpos = lat->grpActivePos[idx];
+                int glast = lat->grpActiveList[goff + --lat->grpActiveCnt[gi]];
+                lat->grpActiveList[goff + gpos] = glast;
+                lat->grpActivePos[glast] = gpos;
+                lat->grpActivePos[idx] = -1;
+                lat->nFrozen++;
+                km->KLUmatrixLatentCount++;
+                lat->statFreezes++;
+            }
+        }
+        lat->statCalls++;
+        lat->statFrozenSum += (unsigned long long)lat->nFrozen;
+    }
+
+build_cf_list:
+    if (cf_active && ckt->CKTmrFastNodes && ckt->CKTmrSubNFast > 0 &&
+        lat->cfEpoch != ckt->CKTmrSubEpoch)
+    {
+        memset(lat->cfIsFastInst, 0, (size_t)nElig);
+        memset(lat->cfGrpCnt, 0, (size_t)nGroups * sizeof(int));
+        const int * restrict fn = ckt->CKTmrFastNodes;
+        int nF = ckt->CKTmrSubNFast;
+        const int * restrict niptr = lat->nodeInstPtr;
+        const int * restrict niidx = lat->nodeInstIdx;
+        int * restrict tmp = pack->eval_q;
+        int n_fast_inst = 0;
+        for (int fi = 0; fi < nF; fi++) {
+            int node = fn[fi];
+            if (node <= 0 || node >= N) continue;
+            int p0 = niptr[node], p1 = niptr[node + 1];
+            for (int p = p0; p < p1; p++) {
+                int idx = niidx[p];
+                if (!lat->cfIsFastInst[idx]) {
+                    lat->cfIsFastInst[idx] = 1;
+                    if (!lat->latentFrozen[idx]) {
+                        tmp[n_fast_inst++] = idx;
+                        lat->cfGrpCnt[lat->instGroup[idx]]++;
+                    }
+                }
+            }
+        }
+        /* Include any non-frozen instance that has never been evaluated yet */
+        for (int idx = 0; idx < nElig; idx++) {
+            if (!lat->cfIsFastInst[idx] && !lat->latentFrozen[idx] && !checks[idx].phys_valid) {
+                lat->cfIsFastInst[idx] = 1;
+                tmp[n_fast_inst++] = idx;
+                lat->cfGrpCnt[lat->instGroup[idx]]++;
+            }
+        }
+        /* Bucket fast non-frozen instances by group for dense 2-wide NEON batching */
+        int pos = 0;
+        for (int gi = 0; gi < nGroups; gi++) {
+            lat->cfGrpStart[gi] = pos;
+            pos += lat->cfGrpCnt[gi];
+            lat->cfGrpCnt[gi] = 0;
+        }
+        for (int k = 0; k < n_fast_inst; k++) {
+            int idx = tmp[k];
+            int gi = lat->instGroup[idx];
+            lat->cfFastList[lat->cfGrpStart[gi] + lat->cfGrpCnt[gi]++] = idx;
+        }
+        lat->cfNFast = n_fast_inst;
+        lat->cfEpoch = ckt->CKTmrSubEpoch;
+        if (n_fast_inst < nElig - lat->nFrozen)
+            lat->cfNeedsSync = 1;
+    }
+}
+#endif /* KLU */
+
 /*
- * Evaluate one BSIM4AppleGroup:
+ * Evaluate one BSIM4AppleGroup (all instances when idx_list == NULL, or a subset idx_list[0..idx_count-1]):
  *   1. Sequential W=1 scan over 128B BSIM4AppleCheck entries:
- *      - L1 stationary hits -> optional scalar Taylor charge sync + zero stamp (if delta) or direct stamp
- *      - L2 stationary hits -> scalar L2 integrate/assemble + delta/direct stamp
+ *      - L1 stationary hits -> optional scalar Taylor charge sync + direct stamp
+ *      - L2 stationary hits -> scalar L2 integrate/assemble + direct stamp
  *      - Active misses      -> compact into eval_q[]
  *   2. Flush eval_q[] in dense 2-wide NEON pairs sharing identical BSIM4ApplePParam *pp!
  */
 static void
-B4P(evalAppleGroup)(
+B4P(evalAppleGroupList)(
     BSIM4ApplePack * restrict pack,
     int gi,
+    const int * restrict idx_list,
+    int idx_count,
     B4P(instance) **InstArray,
     CKTcircuit *ckt,
     double * restrict my_ax,
@@ -1042,29 +1817,34 @@ B4P(evalAppleGroup)(
     double * restrict s0 = ckt->CKTstate0;
     const double * restrict s1 = dc_only ? NULL : ckt->CKTstate1;
     const double * restrict s2 = dc_only ? NULL : ckt->CKTstate2;
+    const double * restrict s3 = dc_only ? NULL : ckt->CKTstate3;
     const double cur_gmin = ckt->CKTgmin;
     const double reltol   = ckt->CKTreltol;
     const double abstol   = ckt->CKTabstol;
     const double ag0 = dc_only ? 0.0 : ckt->CKTag[0];
     const double ag1 = dc_only ? 0.0 : ckt->CKTag[1];
     const double ag2 = dc_only ? 0.0 : ckt->CKTag[2];
-    const int is_pred  = (!dc_only && (ckt->CKTmode & MODEINITPRED) != 0);
+    const double ag3 = dc_only ? 0.0 : ckt->CKTag[3];
+    const int is_pred    = (!dc_only && (ckt->CKTmode & MODEINITPRED) != 0);
     const int is_initjct = (dc_only && (ckt->CKTmode & MODEINITJCT) != 0);
-    const int is_gear2 = (!dc_only && ckt->CKTintegrateMethod == GEAR && ckt->CKTorder == 2);
-    const int is_trap2 = (!dc_only && ckt->CKTintegrateMethod == TRAPEZOIDAL && ckt->CKTorder == 2);
-    const int need_aos = B4P(AvxNeedAosSync) || force_aos;
-    const double vtol  = dc_only ? -1.0 : B4P(avxBypassTol)(ckt);
-    const double xfact = is_pred ? (ckt->CKTdelta / ckt->CKTdeltaOld[1]) : 0.0;
+    const int is_gear3   = (!dc_only && ckt->CKTintegrateMethod == GEAR && ckt->CKTorder == 3);
+    const int is_gear2   = (!dc_only && ckt->CKTintegrateMethod == GEAR && ckt->CKTorder == 2);
+    const int is_trap2   = (!dc_only && ckt->CKTintegrateMethod == TRAPEZOIDAL && ckt->CKTorder == 2);
+    const int need_aos   = B4P(AvxNeedAosSync) || force_aos;
+    const double vtol    = dc_only ? -1.0 : B4P(avxBypassTol)(ckt);
+    const double xfact   = is_pred ? (ckt->CKTdelta / ckt->CKTdeltaOld[1]) : 0.0;
     const double one_p_xf = 1.0 + xfact;
     const int do_l1 = (!dc_only && !is_pred && !need_aos && vtol >= 0.0 && l1_step_ok);
     const int do_l2 = (!dc_only && !need_aos && vtol >= 0.0 && l2_gmin_ok);
+    const int acc   = ckt->CKTstat->STATaccepted;
 
     int start = grp->offset;
-    int end   = start + grp->count;
+    int n_iter = idx_list ? idx_count : grp->count;
     int n_eval = 0;
     int noncon_add = 0;
 
-    for (int i = start; i < end; i++) {
+    for (int ii = 0; ii < n_iter; ii++) {
+        int i = idx_list ? idx_list[ii] : (start + ii);
         BSIM4AppleCheck * restrict c = &checks[i];
 
         double vds, vgs, vbs;
@@ -1102,6 +1882,7 @@ B4P(evalAppleGroup)(
                 if (B4P(instCacheMatch)(c, vds, vgs, vbs, vtol, reltol, abstol, &exact_zero)) {
                     if (!exact_zero) {
                         bsim4_apple_l1_sync_one(c, &l2s[i], vds, vgs, vbs, ag0, s0);
+                        c->last_active_step = acc;
                     }
                     B4P(stampOneDirect)(c, &stamps[i], InstArray, my_ax, my_rhs, stamp_mode);
                     continue;
@@ -1121,9 +1902,20 @@ B4P(evalAppleGroup)(
             s0[st + 2] = s0_vgs = s1_vgs;
             s0[st + 1] = s0_vbs = s1_vbs;
             s0[st + 0] = s0_vbd = s1_vbd;
-            vds = one_p_xf * s1_vds - xfact * s2[st + 3];
-            vgs = one_p_xf * s1_vgs - xfact * s2[st + 2];
-            vbs = one_p_xf * s1_vbs - xfact * s2[st + 1];
+#if NGSPICE_OPT_GENERAL
+            if (ckt->CKTtaPredActive) {
+                double vs = rhsOld[c->sNodePrime];
+                double t  = c->type;
+                vds = (rhsOld[c->dNodePrime] - vs) * t;
+                vgs = (rhsOld[c->gNodePrime] - vs) * t;
+                vbs = (rhsOld[c->bNodePrime] - vs) * t;
+            } else
+#endif
+            {
+                vds = one_p_xf * s1_vds - xfact * s2[st + 3];
+                vgs = one_p_xf * s1_vgs - xfact * s2[st + 2];
+                vbs = one_p_xf * s1_vbs - xfact * s2[st + 1];
+            }
         }
 
         BSIM4AppleStamp * restrict sp = &stamps[i];
@@ -1157,7 +1949,10 @@ B4P(evalAppleGroup)(
             int exact_zero = 0;
             if (B4P(instCacheMatch)(c, vds, vgs, vbs, vtol, reltol, abstol, &exact_zero)) {
                 bsim4_apple_l2_assemble_one(c, &l2s[i], sp, vds, vgs, vbs, !exact_zero,
-                                            ag0, ag1, ag2, is_gear2, is_trap2, s0, s1, s2);
+                                            ag0, ag1, ag2, ag3, is_gear3, is_gear2, is_trap2,
+                                            s0, s1, s2, s3);
+                if (!exact_zero)
+                    c->last_active_step = acc;
                 c->stamp_valid = 1;
                 B4P(stampOneDirect)(c, sp, InstArray, my_ax, my_rhs, stamp_mode);
                 continue;
@@ -1211,8 +2006,8 @@ B4P(evalAppleGroup)(
         bsim4_apple_eval_batch(
             pp, jpts, cpts, spts, l2pts, nact,
             bvds, bvgs, bvbs,
-            cur_gmin, ag0, ag1, ag2, is_gear2, is_trap2,
-            s0, s1, s2, need_aos ? &out : NULL, need_aos, dc_only);
+            cur_gmin, ag0, ag1, ag2, ag3, is_gear3, is_gear2, is_trap2,
+            s0, s1, s2, s3, need_aos ? &out : NULL, need_aos, dc_only);
 
         for (int l = 0; l < nact; l++) {
             if (dc_only) {
@@ -1223,6 +2018,7 @@ B4P(evalAppleGroup)(
                 else
                     InstArray[cpts[l]->instIdx]->B4P(von) = spts[l]->von;
             } else {
+                cpts[l]->last_active_step = acc;
                 cpts[l]->phys_valid = 1;
                 cpts[l]->stamp_valid = !need_aos;
                 if (need_aos)
@@ -1257,17 +2053,22 @@ B4P(runApplePack)(
     const double ag0 = dc_only ? 0.0 : ckt->CKTag[0];
     const double ag1 = dc_only ? 0.0 : ckt->CKTag[1];
     const double ag2 = dc_only ? 0.0 : ckt->CKTag[2];
+    const double ag3 = dc_only ? 0.0 : ckt->CKTag[3];
+    const int is_gear3 = (!dc_only && ckt->CKTintegrateMethod == GEAR && ckt->CKTorder == 3);
     const int is_gear2 = (!dc_only && ckt->CKTintegrateMethod == GEAR && ckt->CKTorder == 2);
     const int is_trap2 = (!dc_only && ckt->CKTintegrateMethod == TRAPEZOIDAL && ckt->CKTorder == 2);
-    const int int_mode = is_gear2 ? 2 : (is_trap2 ? 1 : 0);
+    const int int_mode = is_gear3 ? 3 : (is_gear2 ? 2 : (is_trap2 ? 1 : 0));
     const double *s0 = ckt->CKTstate0, *s1 = ckt->CKTstate1, *s2 = ckt->CKTstate2;
+    const double *s3 = dc_only ? NULL : ckt->CKTstate3;
 
     int l2_gmin_ok = (!dc_only && pack->step_valid && pack->last_gmin == cur_gmin);
     int l1_step_ok = (l2_gmin_ok &&
                       pack->last_time == cur_time &&
                       pack->last_ag0 == ag0 && pack->last_ag1 == ag1 && pack->last_ag2 == ag2 &&
+                      (!is_gear3 || pack->last_ag3 == ag3) &&
                       pack->last_int_mode == int_mode &&
-                      pack->last_s0 == s0 && pack->last_s1 == s1 && pack->last_s2 == s2);
+                      pack->last_s0 == s0 && pack->last_s1 == s1 && pack->last_s2 == s2 &&
+                      (!is_gear3 || pack->last_s3 == s3));
 
 #ifdef USE_OMP
     if (omp_in_parallel()) {
@@ -1281,9 +2082,10 @@ B4P(runApplePack)(
         if (tq && tvd && tvg && tvb) {
             #pragma omp for schedule(dynamic, 1) nowait
             for (int gi = 0; gi < nGroups; gi++) {
-                B4P(evalAppleGroup)(pack, gi, InstArray, ckt, my_ax, my_rhs,
-                                    stamp_mode, dc_only, force_aos,
-                                    l1_step_ok, l2_gmin_ok, tq, tvd, tvg, tvb);
+                B4P(evalAppleGroupList)(pack, gi, NULL, pack->groups[gi].count,
+                                        InstArray, ckt, my_ax, my_rhs,
+                                        stamp_mode, dc_only, force_aos,
+                                        l1_step_ok, l2_gmin_ok, tq, tvd, tvg, tvb);
             }
         }
         free(tq); free(tvd); free(tvg); free(tvb);
@@ -1293,9 +2095,9 @@ B4P(runApplePack)(
                 pack->step_valid = 0;
             } else {
                 pack->last_time = cur_time; pack->last_gmin = cur_gmin;
-                pack->last_ag0 = ag0; pack->last_ag1 = ag1; pack->last_ag2 = ag2;
+                pack->last_ag0 = ag0; pack->last_ag1 = ag1; pack->last_ag2 = ag2; pack->last_ag3 = ag3;
                 pack->last_int_mode = int_mode;
-                pack->last_s0 = s0; pack->last_s1 = s1; pack->last_s2 = s2;
+                pack->last_s0 = s0; pack->last_s1 = s1; pack->last_s2 = s2; pack->last_s3 = s3;
                 pack->step_valid = !(B4P(AvxNeedAosSync) || force_aos);
             }
         }
@@ -1303,20 +2105,44 @@ B4P(runApplePack)(
     }
 #endif
 
-    for (int gi = 0; gi < nGroups; gi++) {
-        B4P(evalAppleGroup)(pack, gi, InstArray, ckt, my_ax, my_rhs,
-                            stamp_mode, dc_only, force_aos,
-                            l1_step_ok, l2_gmin_ok,
-                            pack->eval_q, pack->eval_vds, pack->eval_vgs, pack->eval_vbs);
+    const BSIM4AppleLatentState *lat = (const BSIM4AppleLatentState *)head->B4P(AvxLatent);
+    if (stamp_mode == 1 && !dc_only && ckt->CKTmrSubActive && lat && lat->cfEpoch == ckt->CKTmrSubEpoch) {
+        for (int gi = 0; gi < nGroups; gi++) {
+            int gcnt = lat->cfGrpCnt[gi];
+            if (gcnt <= 0) continue;
+            B4P(evalAppleGroupList)(pack, gi, lat->cfFastList + lat->cfGrpStart[gi], gcnt,
+                                    InstArray, ckt, my_ax, my_rhs,
+                                    stamp_mode, dc_only, force_aos,
+                                    l1_step_ok, l2_gmin_ok,
+                                    pack->eval_q, pack->eval_vds, pack->eval_vgs, pack->eval_vbs);
+        }
+    } else if (stamp_mode == 1 && !dc_only && lat && lat->nFrozen > 0) {
+        for (int gi = 0; gi < nGroups; gi++) {
+            int gcnt = lat->grpActiveCnt[gi];
+            if (gcnt <= 0) continue;
+            B4P(evalAppleGroupList)(pack, gi, lat->grpActiveList + pack->groups[gi].offset, gcnt,
+                                    InstArray, ckt, my_ax, my_rhs,
+                                    stamp_mode, dc_only, force_aos,
+                                    l1_step_ok, l2_gmin_ok,
+                                    pack->eval_q, pack->eval_vds, pack->eval_vgs, pack->eval_vbs);
+        }
+    } else {
+        for (int gi = 0; gi < nGroups; gi++) {
+            B4P(evalAppleGroupList)(pack, gi, NULL, pack->groups[gi].count,
+                                    InstArray, ckt, my_ax, my_rhs,
+                                    stamp_mode, dc_only, force_aos,
+                                    l1_step_ok, l2_gmin_ok,
+                                    pack->eval_q, pack->eval_vds, pack->eval_vgs, pack->eval_vbs);
+        }
     }
 
     if (dc_only) {
         pack->step_valid = 0;
     } else {
         pack->last_time = cur_time; pack->last_gmin = cur_gmin;
-        pack->last_ag0 = ag0; pack->last_ag1 = ag1; pack->last_ag2 = ag2;
+        pack->last_ag0 = ag0; pack->last_ag1 = ag1; pack->last_ag2 = ag2; pack->last_ag3 = ag3;
         pack->last_int_mode = int_mode;
-        pack->last_s0 = s0; pack->last_s1 = s1; pack->last_s2 = s2;
+        pack->last_s0 = s0; pack->last_s1 = s1; pack->last_s2 = s2; pack->last_s3 = s3;
         pack->step_valid = !(B4P(AvxNeedAosSync) || force_aos);
     }
 }
@@ -1342,7 +2168,19 @@ B4P(convTestAvx)(GENmodel *inModel, CKTcircuit *ckt)
     const double reltol = ckt->CKTreltol;
     const double abstol = ckt->CKTabstol;
 
-    for (int i = 0; i < nElig; i++) {
+    const BSIM4AppleLatentState *lat = (const BSIM4AppleLatentState *)head->B4P(AvxLatent);
+    const int *act_list = NULL;
+    int n_iter = nElig;
+    if (ckt->CKTmrSubActive && lat && lat->cfEpoch == ckt->CKTmrSubEpoch) {
+        act_list = lat->cfFastList;
+        n_iter = lat->cfNFast;
+    } else if (lat && lat->nFrozen > 0) {
+        act_list = lat->activeList;
+        n_iter = lat->nActive;
+    }
+
+    for (int ii = 0; ii < n_iter; ii++) {
+        int i = act_list ? act_list[ii] : ii;
         const BSIM4AppleCheck * restrict c = &checks[i];
         double vs = rhsOld[c->sNodePrime];
         double t  = c->type;
@@ -1377,13 +2215,46 @@ B4P(terrPairNeon)(
     int st0, int st1, int nact,
     const double * restrict s0, const double * restrict s1,
     const double * restrict s2, const double * restrict s3,
+    const double * restrict s4,
     int ord,
     float64x2_t v_abstol, float64x2_t v_reltol, float64x2_t v_relInvD, float64x2_t v_chgtol,
-    float64x2_t v_trtol, float64x2_t v_tfac, float64x2_t v_w0, float64x2_t v_w1, float64x2_t v_w2, float64x2_t v_w3,
+    float64x2_t v_trtol, float64x2_t v_tfac,
+    float64x2_t v_w0, float64x2_t v_w1, float64x2_t v_w2, float64x2_t v_w3, float64x2_t v_w4,
     double cur)
 {
     static const int qoffs[3] = { 11, 13, 15 };
-    if (ord == 2) {
+    if (ord == 3) {
+        double cur_cu = (cur < 1.0e100) ? (cur * cur * cur) : 1.0e300;
+        for (int c = 0; c < 3; c++) {
+            int i0 = st0 + qoffs[c];
+            int i1 = (nact > 1) ? (st1 + qoffs[c]) : i0;
+            float64x2_t q0 = b4a_t2_pair(s0[i0], s0[i1]);
+            float64x2_t q1 = b4a_t2_pair(s1[i0], s1[i1]);
+            float64x2_t q2 = b4a_t2_pair(s2[i0], s2[i1]);
+            float64x2_t q3 = b4a_t2_pair(s3[i0], s3[i1]);
+            float64x2_t q4 = b4a_t2_pair(s4[i0], s4[i1]);
+            float64x2_t c0 = vabsq_f64(b4a_t2_pair(s0[i0 + 1], s0[i1 + 1]));
+            float64x2_t c1 = vabsq_f64(b4a_t2_pair(s1[i0 + 1], s1[i1 + 1]));
+            float64x2_t volttol = vfmaq_f64(v_abstol, v_reltol, vmaxnmq_f64(c0, c1));
+            float64x2_t qmax = vmaxnmq_f64(vabsq_f64(q0), vabsq_f64(q1));
+            float64x2_t chargetol = vmulq_f64(v_relInvD, vmaxnmq_f64(qmax, v_chgtol));
+            float64x2_t tol = vmaxnmq_f64(volttol, chargetol);
+            float64x2_t d0 = vfmaq_f64(
+                vfmaq_f64(vfmaq_f64(vfmaq_f64(vmulq_f64(v_w0, q0), v_w1, q1), v_w2, q2), v_w3, q3),
+                v_w4, q4);
+            float64x2_t den = vmaxnmq_f64(v_abstol, vmulq_f64(v_tfac, vabsq_f64(d0)));
+            float64x2_t num = vmulq_f64(v_trtol, tol);
+            if (__builtin_expect(cur >= 1.0e100 || vmaxvq_u32(vreinterpretq_u32_u64(vcltq_f64(num, vmulq_f64(vdupq_n_f64(cur_cu), den)))) != 0, 0)) {
+                float64x2_t ratio = vdivq_f64(num, den);
+                double r0 = vgetq_lane_f64(ratio, 0);
+                if (r0 < cur_cu) { cur = cbrt(r0); cur_cu = r0; }
+                if (nact > 1) {
+                    double r1 = vgetq_lane_f64(ratio, 1);
+                    if (r1 < cur_cu) { cur = cbrt(r1); cur_cu = r1; }
+                }
+            }
+        }
+    } else if (ord == 2) {
         double cur_sq = (cur < 1.0e150) ? (cur * cur) : 1.0e300;
         for (int c = 0; c < 3; c++) {
             int i0 = st0 + qoffs[c];
@@ -1446,7 +2317,7 @@ B4P(truncAvx)(GENmodel *inModel, CKTcircuit *ckt, double *timeStep)
 {
     B4P(model) *head = (B4P(model) *)inModel;
     int ord = ckt->CKTorder;
-    if (!head->B4P(AvxBuilt) || !ckt->CKTterrCacheValid || (ord != 1 && ord != 2))
+    if (!head->B4P(AvxBuilt) || !ckt->CKTterrCacheValid || (ord != 1 && ord != 2 && ord != 3))
         return -1;
     BSIM4ApplePack *pack = (BSIM4ApplePack *)head->B4P(AvxBlocks);
     if (!pack) return -1;
@@ -1456,7 +2327,8 @@ B4P(truncAvx)(GENmodel *inModel, CKTcircuit *ckt, double *timeStep)
     const double * restrict s0 = ckt->CKTstate0;
     const double * restrict s1 = ckt->CKTstate1;
     const double * restrict s2 = ckt->CKTstates[2];
-    const double * restrict s3 = (ord == 2) ? ckt->CKTstates[3] : NULL;
+    const double * restrict s3 = (ord >= 2) ? ckt->CKTstates[3] : NULL;
+    const double * restrict s4 = (ord >= 3) ? ckt->CKTstates[4] : NULL;
     const double *w = ckt->CKTterrWeights;
 
     float64x2_t v_abstol  = vdupq_n_f64(ckt->CKTabstol);
@@ -1468,30 +2340,78 @@ B4P(truncAvx)(GENmodel *inModel, CKTcircuit *ckt, double *timeStep)
     float64x2_t v_w0      = vdupq_n_f64(w[0]);
     float64x2_t v_w1      = vdupq_n_f64(w[1]);
     float64x2_t v_w2      = vdupq_n_f64(w[2]);
-    float64x2_t v_w3      = vdupq_n_f64(ord == 2 ? w[3] : 0.0);
+    float64x2_t v_w3      = vdupq_n_f64(ord >= 2 ? w[3] : 0.0);
+    float64x2_t v_w4      = vdupq_n_f64(ord >= 3 ? w[4] : 0.0);
+
+    static int mr_trunc_init = 0, mr_trunc_en = 1;
+    if (!mr_trunc_init) {
+        const char *no_v = getenv("NGSPICE_NO_MR_TRUNC");
+        const char *v = getenv("NGSPICE_MR_TRUNC");
+        if (no_v != NULL && no_v[0] != '\0' && no_v[0] != '0')
+            mr_trunc_en = 0;
+        else if (v != NULL && v[0] != '\0')
+            mr_trunc_en = (v[0] != '0');
+        else
+            mr_trunc_en = 1;
+        mr_trunc_init = 1;
+    }
+    int active_cutoff = mr_trunc_en ? (ckt->CKTstat->STATaccepted - (ord + 2)) : -1000000;
 
     double minStep = *timeStep;
 #ifdef USE_OMP
     if (nElig > 512 && omp_get_max_threads() > 1) {
         #pragma omp parallel for reduction(min:minStep)
         for (int i = 0; i < nElig; i += 2) {
-            int nact = (i + 1 < nElig) ? 2 : 1;
+            int a0 = !(mr_trunc_en && checks[i].phys_valid && checks[i].last_active_step < active_cutoff);
+            int a1 = (i + 1 < nElig) &&
+                     !(mr_trunc_en && checks[i + 1].phys_valid && checks[i + 1].last_active_step < active_cutoff);
+            if (!a0 && !a1)
+                continue;
+            int st0 = a0 ? checks[i].stateBase : checks[i + 1].stateBase;
+            int st1 = (a0 && a1) ? checks[i + 1].stateBase : st0;
+            int nact = (a0 && a1) ? 2 : 1;
             minStep = B4P(terrPairNeon)(
-                checks[i].stateBase, (nact > 1) ? checks[i + 1].stateBase : checks[i].stateBase, nact,
-                s0, s1, s2, s3, ord,
+                st0, st1, nact,
+                s0, s1, s2, s3, s4, ord,
                 v_abstol, v_reltol, v_relInvD, v_chgtol, v_trtol, v_tfac,
-                v_w0, v_w1, v_w2, v_w3, minStep);
+                v_w0, v_w1, v_w2, v_w3, v_w4, minStep);
         }
     } else
 #endif
     {
-        for (int i = 0; i < nElig; i += 2) {
-            int nact = (i + 1 < nElig) ? 2 : 1;
+        const BSIM4AppleLatentState *lat = (const BSIM4AppleLatentState *)head->B4P(AvxLatent);
+        const int *act_list = NULL;
+        int n_iter = nElig;
+        if (ckt->CKTmrSubActive && lat && lat->cfEpoch == ckt->CKTmrSubEpoch) {
+            act_list = lat->cfFastList;
+            n_iter = lat->cfNFast;
+        } else if (lat && lat->nFrozen > 0) {
+            act_list = lat->activeList;
+            n_iter = lat->nActive;
+        }
+        int pend_st = -1;
+        for (int ii = 0; ii < n_iter; ii++) {
+            int i = act_list ? act_list[ii] : ii;
+            if (mr_trunc_en && checks[i].phys_valid && checks[i].last_active_step < active_cutoff)
+                continue;
+            int st = checks[i].stateBase;
+            if (pend_st < 0) {
+                pend_st = st;
+            } else {
+                minStep = B4P(terrPairNeon)(
+                    pend_st, st, 2,
+                    s0, s1, s2, s3, s4, ord,
+                    v_abstol, v_reltol, v_relInvD, v_chgtol, v_trtol, v_tfac,
+                    v_w0, v_w1, v_w2, v_w3, v_w4, minStep);
+                pend_st = -1;
+            }
+        }
+        if (pend_st >= 0) {
             minStep = B4P(terrPairNeon)(
-                checks[i].stateBase, (nact > 1) ? checks[i + 1].stateBase : checks[i].stateBase, nact,
-                s0, s1, s2, s3, ord,
+                pend_st, pend_st, 1,
+                s0, s1, s2, s3, s4, ord,
                 v_abstol, v_reltol, v_relInvD, v_chgtol, v_trtol, v_tfac,
-                v_w0, v_w1, v_w2, v_w3, minStep);
+                v_w0, v_w1, v_w2, v_w3, v_w4, minStep);
         }
     }
 
