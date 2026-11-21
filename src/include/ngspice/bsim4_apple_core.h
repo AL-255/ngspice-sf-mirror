@@ -855,6 +855,7 @@ typedef struct {
     BSIM4AppleL2    *l2s;
     BSIM4AppleJct   *jcts;
     int             *eval_q;
+    int             *orig_order;
     double          *eval_vds;
     double          *eval_vgs;
     double          *eval_vbs;

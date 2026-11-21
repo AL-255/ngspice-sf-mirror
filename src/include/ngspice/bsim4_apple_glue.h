@@ -186,6 +186,7 @@ B4P(freeApplePack)(B4P(model) *head)
         free(pack->l2s);
         free(pack->jcts);
         free(pack->eval_q);
+        free(pack->orig_order);
         free(pack->eval_vds);
         free(pack->eval_vgs);
         free(pack->eval_vbs);
@@ -631,11 +632,13 @@ B4P(ensureAvxPack)(B4P(model) *head, CKTcircuit *ckt)
         if (alloc_ok && posix_memalign((void **)&pack->l2s, 64, (size_t)nElig * sizeof(BSIM4AppleL2)) != 0) alloc_ok = 0;
         if (alloc_ok && posix_memalign((void **)&pack->jcts, 64, (size_t)nElig * sizeof(BSIM4AppleJct)) != 0) alloc_ok = 0;
         if (alloc_ok) {
-            pack->eval_q   = (int *)malloc((size_t)(nElig + 2) * sizeof(int));
-            pack->eval_vds = (double *)malloc((size_t)(nElig + 2) * sizeof(double));
-            pack->eval_vgs = (double *)malloc((size_t)(nElig + 2) * sizeof(double));
-            pack->eval_vbs = (double *)malloc((size_t)(nElig + 2) * sizeof(double));
-            if (!pack->eval_q || !pack->eval_vds || !pack->eval_vgs || !pack->eval_vbs)
+            pack->eval_q     = (int *)malloc((size_t)(nElig + 2) * sizeof(int));
+            pack->orig_order = (nFb == 0) ? (int *)malloc((size_t)(nElig + 2) * sizeof(int)) : NULL;
+            pack->eval_vds   = (double *)malloc((size_t)(nElig + 2) * sizeof(double));
+            pack->eval_vgs   = (double *)malloc((size_t)(nElig + 2) * sizeof(double));
+            pack->eval_vbs   = (double *)malloc((size_t)(nElig + 2) * sizeof(double));
+            if (!pack->eval_q || (nFb == 0 && !pack->orig_order) ||
+                !pack->eval_vds || !pack->eval_vgs || !pack->eval_vbs)
                 alloc_ok = 0;
         }
     }
@@ -644,7 +647,8 @@ B4P(ensureAvxPack)(B4P(model) *head, CKTcircuit *ckt)
         if (pack) {
             free(pack->groups); free(pack->checks); free(pack->stamps);
             free(pack->l2s); free(pack->jcts);
-            free(pack->eval_q); free(pack->eval_vds); free(pack->eval_vgs); free(pack->eval_vbs);
+            free(pack->eval_q); free(pack->orig_order);
+            free(pack->eval_vds); free(pack->eval_vgs); free(pack->eval_vbs);
             free(pack);
         }
         FREE(keys);
@@ -699,6 +703,8 @@ B4P(ensureAvxPack)(B4P(model) *head, CKTcircuit *ckt)
         c->bNodePrime = h->B4P(bNodePrime);
         c->stateBase  = h->B4P(states);
         c->instIdx    = keys[i].orig_idx;
+        if (pack->orig_order)
+            pack->orig_order[keys[i].orig_idx] = i;
         c->has_dint   = (h->B4P(dNode) != h->B4P(dNodePrime)) ? 1 : 0;
         c->has_sint   = (h->B4P(sNode) != h->B4P(sNodePrime)) ? 1 : 0;
         c->type       = (double)m->B4P(type);
@@ -2024,7 +2030,8 @@ B4P(evalAppleGroupList)(
                 if (need_aos)
                     B4P(scatterAosOne)(InstArray[cpts[l]->instIdx], &out, l);
             }
-            B4P(stampOneDirect)(cpts[l], spts[l], InstArray, my_ax, my_rhs, stamp_mode);
+            if (stamp_mode != 3)
+                B4P(stampOneDirect)(cpts[l], spts[l], InstArray, my_ax, my_rhs, stamp_mode);
         }
     }
 }
@@ -2125,6 +2132,21 @@ B4P(runApplePack)(
                                     stamp_mode, dc_only, force_aos,
                                     l1_step_ok, l2_gmin_ok,
                                     pack->eval_q, pack->eval_vds, pack->eval_vgs, pack->eval_vbs);
+        }
+    } else if (stamp_mode == 2 && dc_only && pack->orig_order) {
+        /* Preserve exact stock InstArray[0..nElig-1] Sparse stamping order during DCOP/TRANOP */
+        for (int gi = 0; gi < nGroups; gi++) {
+            B4P(evalAppleGroupList)(pack, gi, NULL, pack->groups[gi].count,
+                                    InstArray, ckt, my_ax, my_rhs,
+                                    3, dc_only, force_aos,
+                                    l1_step_ok, l2_gmin_ok,
+                                    pack->eval_q, pack->eval_vds, pack->eval_vgs, pack->eval_vbs);
+        }
+        const int * restrict ord = pack->orig_order;
+        int nElig = pack->nElig;
+        for (int oi = 0; oi < nElig; oi++) {
+            int idx = ord[oi];
+            B4P(stampOneDirect)(&pack->checks[idx], &pack->stamps[idx], InstArray, my_ax, my_rhs, 2);
         }
     } else {
         for (int gi = 0; gi < nGroups; gi++) {
